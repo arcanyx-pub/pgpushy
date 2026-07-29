@@ -7,6 +7,7 @@
 
 use crate::approve::{self, Decision};
 use crate::cli::{PgschemaArgs, SourceArgs};
+use crate::config::{self, Loaded, Settings};
 use crate::conn::{ConnectionArgs, Resolved};
 use crate::inspect::{self, Inspection};
 use crate::plan_file::Plan;
@@ -38,12 +39,13 @@ impl Outcome {
 }
 
 /// `pgpushy validate` — the offline pipeline, and nothing else.
-pub fn validate(source: &SourceArgs, out: Option<&Path>) -> Result<Outcome> {
-    let Some(analysis) = analyze_source(source)? else {
+pub fn validate(source: &SourceArgs, loaded: &Loaded, out: Option<&Path>) -> Result<Outcome> {
+    let settings = Settings::resolve(source, loaded);
+    let Some(analysis) = analyze_source(&settings, loaded)? else {
         return Ok(Outcome::Failed);
     };
 
-    report::summary(source, &analysis);
+    report::summary(&settings, &analysis);
 
     // A cross-schema cycle is fatal here. `plan` treats it differently — it
     // shows the plans anyway, because those plans are what the operator needs
@@ -69,9 +71,10 @@ pub fn plan(
     source: &SourceArgs,
     connection: &ConnectionArgs,
     pgschema_args: &PgschemaArgs,
+    loaded: &Loaded,
     out: Option<&Path>,
 ) -> Result<Outcome> {
-    let Some(session) = Session::open(source, connection, pgschema_args, out)? else {
+    let Some(session) = Session::open(source, connection, pgschema_args, loaded, out)? else {
         return Ok(Outcome::Failed);
     };
 
@@ -107,10 +110,11 @@ pub fn apply(
     source: &SourceArgs,
     connection: &ConnectionArgs,
     pgschema_args: &PgschemaArgs,
+    loaded: &Loaded,
     out: Option<&Path>,
     auto_approve: bool,
 ) -> Result<Outcome> {
-    let Some(session) = Session::open(source, connection, pgschema_args, out)? else {
+    let Some(session) = Session::open(source, connection, pgschema_args, loaded, out)? else {
         return Ok(Outcome::Failed);
     };
 
@@ -171,20 +175,25 @@ impl Session {
         source: &SourceArgs,
         connection: &ConnectionArgs,
         pgschema_args: &PgschemaArgs,
+        loaded: &Loaded,
         out: Option<&Path>,
     ) -> Result<Option<Self>> {
-        let Some(analysis) = analyze_source(source)? else {
+        let settings = Settings::resolve(source, loaded);
+        let Some(analysis) = analyze_source(&settings, loaded)? else {
             return Ok(None);
         };
-        report::summary(source, &analysis);
+        report::summary(&settings, &analysis);
 
         let binary = Byo {
-            explicit: pgschema_args.pgschema_path.clone(),
+            explicit: config::pgschema_path(pgschema_args, loaded),
         }
         .resolve()?;
         report::pgschema(&binary);
 
-        let connection = Resolved::from(connection)?;
+        let connection = Resolved::from(connection, &loaded.file.connection)?;
+        // Spec §10: the warning fires on use, not on presence, and this is the
+        // moment the password is about to be used.
+        report::password_from_file(&connection, loaded);
         let inspection = inspect::inspect(&connection, &analysis.managed_schemas)?;
         report::target(&inspection.identity);
 
@@ -304,16 +313,19 @@ impl Session {
 
 /// Discover and analyze, printing diagnostics and returning `None` if the
 /// source tree was rejected.
-fn analyze_source(source: &SourceArgs) -> Result<Option<Analysis>> {
-    let root = canonical_root(&source.source_root)?;
-    let discovered = discovery::discover(&root, &source.exclude)?;
+fn analyze_source(settings: &Settings, loaded: &Loaded) -> Result<Option<Analysis>> {
+    let root = canonical_root(&settings.source_root)?;
+    let discovered = discovery::discover(&root, &settings.exclude)?;
 
     let options = Options {
-        default_schema: SchemaName::new(&source.default_schema),
-        managed_schemas: (!source.managed_schemas.is_empty())
-            .then(|| source.managed_schemas.iter().map(SchemaName::new).collect()),
+        default_schema: SchemaName::new(&settings.default_schema),
+        managed_schemas: settings
+            .managed_schemas
+            .as_ref()
+            .map(|schemas| schemas.iter().map(SchemaName::new).collect()),
     };
 
+    report::configuration(loaded);
     report::discovery(&root, &discovered);
 
     match analyze(&discovered.files, &options) {

@@ -12,7 +12,8 @@
 //! Progress and results go to stdout; diagnostics go to stderr, so that
 //! `--out`-style piping and error reporting do not interleave.
 
-use crate::cli::SourceArgs;
+use crate::config::{Loaded, Settings};
+use crate::conn::{PasswordSource, Resolved};
 use crate::discovery::Discovered;
 use crate::hazard::Hazard;
 use crate::inspect::Identity;
@@ -57,7 +58,7 @@ pub fn discovery(root: &Path, discovered: &Discovered) {
 }
 
 /// The managed-schema set and what the tree contains.
-pub fn summary(source: &SourceArgs, analysis: &Analysis) {
+pub fn summary(settings: &Settings, analysis: &Analysis) {
     let counts = &analysis.counts;
     let mut parts = vec![format!("{} table{}", counts.tables, s(counts.tables))];
     if counts.foreign_keys > 0 {
@@ -82,7 +83,7 @@ pub fn summary(source: &SourceArgs, analysis: &Analysis) {
     }
     println!("  {}", parts.join(", "));
 
-    let declared = if source.managed_schemas.is_empty() {
+    let declared = if settings.managed_schemas.is_none() {
         ""
     } else {
         " (declared)"
@@ -359,4 +360,37 @@ pub fn partial_apply(applied: &[SchemaName], failed: &SchemaName, unattempted: &
             "  apply is not atomic across schemas: the schemas listed as applied are\n               NOT rolled back. Fix the failure and run pgpushy apply again — the\n               already-applied schemas will plan as no-ops."
         );
     }
+}
+
+/// Which configuration file, if any, is in effect.
+///
+/// Worth a line: `pgpushy.toml` is only read from the working directory, so
+/// running from a subdirectory silently picks up nothing, and saying so is
+/// cheaper than explaining it later.
+pub fn configuration(loaded: &Loaded) {
+    if let Some(path) = &loaded.path {
+        println!("  config: {}", path.display());
+    }
+}
+
+/// Spec §10: a password read from a file that is easily committed.
+///
+/// Fires on *use*, not presence — a file password that PGPASSWORD or
+/// --password overrode is not a risk worth interrupting anyone about. Made
+/// deliberately hard to skim past, because the whole point is that the
+/// operator may not know the file has one.
+pub fn password_from_file(connection: &Resolved, loaded: &Loaded) {
+    if connection.password_source != PasswordSource::File {
+        return;
+    }
+    let path = loaded
+        .path
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "pgpushy.toml".to_owned());
+
+    eprintln!();
+    eprintln!("  \u{26a0} PASSWORD READ FROM {path}");
+    eprintln!("    That file is easily committed to version control. Prefer PGPASSWORD");
+    eprintln!("    in the environment, or --password, and remove it from the file.");
 }

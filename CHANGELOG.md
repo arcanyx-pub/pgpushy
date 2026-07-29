@@ -40,3 +40,9 @@ and [`docs/impl-plan.md`](docs/impl-plan.md) for the build plan.
   satisfy, with the two-step remedy spelled out and nothing applied.
 - Failure reporting for a partial apply: what landed, what broke, what was
   never attempted, and that the applied schemas are not rolled back.
+- Optional `pgpushy.toml`, with `--config` to name one explicitly. Holds the
+  source-tree layout, `managed_schemas`, `exclude`, the pgschema binary, and
+  connection defaults. Precedence is CLI flag, then `PG*`, then the file, then
+  the built-in default. Unknown keys are rejected rather than ignored.
+- A prominent warning when the password actually in use came from
+  `pgpushy.toml` — and silence when something else overrode it.

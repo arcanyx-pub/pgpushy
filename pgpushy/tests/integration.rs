@@ -14,6 +14,7 @@
 //! anything connects — so they use a stub script and always run.
 
 use assert_cmd::Command;
+use predicates::prelude::PredicateBooleanExt;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
@@ -812,4 +813,71 @@ fn a_partial_failure_reports_what_landed() {
         .expect("count")
         .get(0);
     assert_eq!(added, 1);
+}
+
+// ---------------------------------------------------------------------------
+// The password warning (spec §10)
+// ---------------------------------------------------------------------------
+//
+// No database needed: the warning fires when the resolved connection is about
+// to be used, which is before pgpushy connects. A stub pgschema gets past the
+// provider, and the connection then fails — after the warning has been said.
+
+#[cfg(unix)]
+fn password_warning_run(dir: &TempDir, stub: &Path) -> assert_cmd::assert::Assert {
+    Command::cargo_bin("pgpushy")
+        .expect("binary builds")
+        .arg("plan")
+        .current_dir(dir.path())
+        .arg("--pgschema-path")
+        .arg(stub)
+        .assert()
+        .failure()
+}
+
+/// A password read from a file that is easily committed is worth interrupting
+/// someone about.
+#[cfg(unix)]
+#[test]
+fn warns_when_the_password_comes_from_the_config_file() {
+    let dir = tree(&[("t.sql", "CREATE TABLE t (id int PRIMARY KEY);".to_owned())]);
+    let stub = stub_pgschema(&dir, "Version: 1.12.0@abc linux/amd64 2026-07-06 00:00:00");
+    std::fs::write(
+        dir.path().join("pgpushy.toml"),
+        "[connection]\nhost = \"127.0.0.1\"\nport = 1\ndb = \"nope\"\n\
+         user = \"nope\"\npassword = \"hunter2\"\n",
+    )
+    .expect("write config");
+
+    password_warning_run(&dir, &stub)
+        .stderr(predicates::str::contains("PASSWORD READ FROM"))
+        .stderr(predicates::str::contains("pgpushy.toml"))
+        // The warning must not become a new way to leak the password.
+        .stderr(predicates::str::contains("hunter2").not());
+}
+
+/// Spec §10 is explicit that the warning fires on *use*, not on presence: a
+/// file password something else overrode is not a risk worth interrupting for.
+#[cfg(unix)]
+#[test]
+fn does_not_warn_when_the_file_password_is_overridden() {
+    let dir = tree(&[("t.sql", "CREATE TABLE t (id int PRIMARY KEY);".to_owned())]);
+    let stub = stub_pgschema(&dir, "Version: 1.12.0@abc linux/amd64 2026-07-06 00:00:00");
+    std::fs::write(
+        dir.path().join("pgpushy.toml"),
+        "[connection]\nhost = \"127.0.0.1\"\nport = 1\ndb = \"nope\"\n\
+         user = \"nope\"\npassword = \"hunter2\"\n",
+    )
+    .expect("write config");
+
+    Command::cargo_bin("pgpushy")
+        .expect("binary builds")
+        .arg("plan")
+        .current_dir(dir.path())
+        .arg("--pgschema-path")
+        .arg(&stub)
+        .env("PGPASSWORD", "from-the-environment")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("PASSWORD READ FROM").not());
 }

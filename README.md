@@ -34,6 +34,46 @@ is a preprocessor and an orchestrator.
 | `pgpushy plan` | Show what would change, per schema. Read-only. |
 | `pgpushy apply` | Reconcile the database, after one approval. |
 
+`apply` plans every managed schema first and shows the lot, then asks once —
+so declining leaves the target untouched. It then applies the plans it just
+showed rather than recomputing them. Apply is not atomic across schemas; a
+failure partway reports exactly what landed and what did not.
+
+## Configuration
+
+Everything works with flags and `PG*` environment variables alone. A
+`pgpushy.toml` is optional convenience:
+
+```toml
+source_root    = "db/schema"      # relative to this file
+default_schema = "app"            # schema for unqualified objects
+exclude        = ["seeds/**", "**/*.test.sql"]
+
+# Optional, and authoritative when present: a schema the source tree uses but
+# this list omits becomes an error rather than being quietly reconciled.
+managed_schemas = ["app", "billing"]
+
+[pgschema]
+path = "/usr/local/bin/pgschema"  # otherwise looked up on PATH
+
+[connection]
+host    = "localhost"
+port    = 5432
+db      = "myapp"
+user    = "joe"
+sslmode = "prefer"
+# password = "..."   # permitted, but pgpushy warns loudly when it uses it
+```
+
+Precedence is **CLI flag → `PG*` environment → `pgpushy.toml` → default**. Note
+that the environment beats the file, matching `psql`: an ambient `PGHOST`
+outranks the project's configuration.
+
+The file is read from the working directory and is *not* searched for in parent
+directories; `--config <path>` names one explicitly, and paths inside it
+resolve relative to the file itself. List settings given as flags **replace**
+the file's rather than adding to them.
+
 ## Building
 
 pgpushy parses SQL with [libpg_query](https://github.com/pganalyze/libpg_query)

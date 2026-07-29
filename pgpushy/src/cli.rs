@@ -17,6 +17,13 @@ use std::path::PathBuf;
     long_about = None,
 )]
 pub struct Cli {
+    /// Path to a configuration file. [default: ./pgpushy.toml, if present]
+    ///
+    /// The default is looked for in the working directory only; it is not
+    /// searched for in parent directories.
+    #[arg(long, value_name = "PATH", global = true)]
+    pub config: Option<PathBuf>,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -84,32 +91,41 @@ pub enum Command {
     },
 }
 
+/// Flags describing the source tree.
+///
+/// Every optional setting here is an `Option` with no clap default, because
+/// `pgpushy.toml` sits between the flags and the built-in defaults (spec §10):
+/// a flag that clap had already filled in would be indistinguishable from one
+/// the user typed, and would silently outrank the file. Defaults are applied
+/// in [`crate::config::Settings::resolve`] instead.
 #[derive(Args, Debug)]
 pub struct SourceArgs {
-    /// Root of the source tree to read `*.sql` from.
-    #[arg(long, value_name = "PATH", default_value = ".")]
-    pub source_root: PathBuf,
+    /// Root of the source tree to read `*.sql` from. [default: .]
+    #[arg(long, value_name = "PATH")]
+    pub source_root: Option<PathBuf>,
 
-    /// Schema that unqualified objects belong to.
+    /// Schema that unqualified objects belong to. [default: public]
     ///
     /// This assigns objects; it does not make the schema managed. A default
     /// schema with no objects in it is not reconciled.
-    #[arg(long, value_name = "SCHEMA", default_value = "public")]
-    pub default_schema: String,
+    #[arg(long, value_name = "SCHEMA")]
+    pub default_schema: Option<String>,
 
     /// Restrict the schemas pgpushy may reconcile. Repeatable.
     ///
     /// When given, this is authoritative: a schema the source tree uses but
     /// this list omits is an error, and a schema listed here that the tree
     /// never mentions is managed with an empty desired state — which will plan
-    /// to drop whatever the target holds in it.
+    /// to drop whatever the target holds in it. Replaces the configuration
+    /// file's list rather than adding to it.
     #[arg(long = "managed-schema", value_name = "SCHEMA")]
     pub managed_schemas: Vec<String>,
 
     /// Glob of paths to exclude, relative to the source root. Repeatable.
     ///
     /// Excluded files are never read or parsed, so this is how a tree holds
-    /// seed data or fixtures alongside desired state.
+    /// seed data or fixtures alongside desired state. Replaces the
+    /// configuration file's list rather than adding to it.
     #[arg(long = "exclude", value_name = "GLOB")]
     pub exclude: Vec<String>,
 }

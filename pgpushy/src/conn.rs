@@ -12,6 +12,7 @@
 //! the subprocess environment instead of letting it through — an inherited
 //! variable is exactly the input that could make the child disagree.
 
+use crate::config;
 use anyhow::{Result, bail};
 use clap::Args;
 
@@ -52,7 +53,21 @@ pub struct Resolved {
     pub dbname: String,
     pub user: String,
     pub password: Option<String>,
+    pub password_source: PasswordSource,
     pub sslmode: String,
+}
+
+/// Where the password actually in use came from.
+///
+/// Tracked because spec §10 warns about a password read from `pgpushy.toml` —
+/// but only when it is the one being used. A file password that `PGPASSWORD`
+/// overrode is not a risk anyone needs telling about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasswordSource {
+    Flag,
+    Environment,
+    File,
+    None,
 }
 
 /// Environment variables libpq and pgx read, which must not reach the child
@@ -93,7 +108,13 @@ impl Resolved {
     ///
     /// Precedence is spec §10: CLI flag, then environment, then default. The
     /// configuration file joins between environment and default when it lands.
-    pub fn from(args: &ConnectionArgs) -> Result<Self> {
+    /// Fold CLI flags, `PG*`, and the configuration file into one answer.
+    ///
+    /// Precedence is spec §10: flag, then environment, then file, then
+    /// built-in default. Worth noticing that the environment beats the file —
+    /// an ambient `PGHOST` outranks the project's `pgpushy.toml`. That matches
+    /// `psql`, and it is the one ordering here that regularly surprises people.
+    pub fn from(args: &ConnectionArgs, file: &config::Connection) -> Result<Self> {
         // pgpushy does not interpret these, and passing them through would let
         // pgschema resolve a connection pgpushy never saw. Refusing is the
         // honest response: silently ignoring them would connect somewhere the
@@ -118,7 +139,7 @@ impl Resolved {
                 Some(value) => value
                     .parse()
                     .map_err(|_| anyhow::anyhow!("PGPORT is not a port number: {value:?}"))?,
-                None => 5432,
+                None => file.port.unwrap_or(5432),
             },
         };
 
@@ -126,6 +147,7 @@ impl Resolved {
             .user
             .clone()
             .or_else(|| env("PGUSER"))
+            .or_else(|| file.user.clone())
             .or_else(|| env("USER"))
             .unwrap_or_else(|| "postgres".to_owned());
 
@@ -135,22 +157,40 @@ impl Resolved {
             .dbname
             .clone()
             .or_else(|| env("PGDATABASE"))
+            .or_else(|| file.db.clone())
             .unwrap_or_else(|| user.clone());
+
+        // The *source* is tracked, not just the value: spec §10 warns only
+        // when the password actually used came from the file, so a file
+        // password that something else overrode stays silent.
+        let (password, password_source) = match args.password.clone() {
+            Some(password) => (Some(password), PasswordSource::Flag),
+            None => match env("PGPASSWORD") {
+                Some(password) => (Some(password), PasswordSource::Environment),
+                None => match file.password.clone() {
+                    Some(password) => (Some(password), PasswordSource::File),
+                    None => (None, PasswordSource::None),
+                },
+            },
+        };
 
         Ok(Self {
             host: args
                 .host
                 .clone()
                 .or_else(|| env("PGHOST"))
+                .or_else(|| file.host.clone())
                 .unwrap_or_else(|| "localhost".to_owned()),
             port,
             dbname,
             user,
-            password: args.password.clone().or_else(|| env("PGPASSWORD")),
+            password,
+            password_source,
             sslmode: args
                 .sslmode
                 .clone()
                 .or_else(|| env("PGSSLMODE"))
+                .or_else(|| file.sslmode.clone())
                 .unwrap_or_else(|| "prefer".to_owned()),
         })
     }
@@ -232,9 +272,17 @@ mod tests {
         }
     }
 
+    fn no_file() -> config::Connection {
+        config::Connection::default()
+    }
+
+    fn resolve(args: &ConnectionArgs) -> Resolved {
+        Resolved::from(args, &no_file()).unwrap()
+    }
+
     #[test]
     fn renders_a_conninfo_string() {
-        let resolved = Resolved::from(&args()).unwrap();
+        let resolved = resolve(&args());
         assert_eq!(
             resolved.conninfo(),
             "host=db.example port=6543 dbname=shop user=joe sslmode=require password=s3cret",
@@ -245,7 +293,7 @@ mod tests {
     /// left to work out for itself (spec §6.3).
     #[test]
     fn forwards_every_parameter_to_pgschema() {
-        let resolved = Resolved::from(&args()).unwrap();
+        let resolved = resolve(&args());
         let flags = resolved.pgschema_flags().join(" ");
         assert_eq!(
             flags,
@@ -267,8 +315,70 @@ mod tests {
 
     #[test]
     fn describes_the_target_without_the_password() {
-        let described = Resolved::from(&args()).unwrap().describe();
+        let described = resolve(&args()).describe();
         assert_eq!(described, "joe@db.example:6543/shop");
         assert!(!described.contains("s3cret"));
+    }
+}
+
+#[cfg(test)]
+mod precedence_tests {
+    use super::*;
+
+    fn empty_args() -> ConnectionArgs {
+        ConnectionArgs {
+            host: None,
+            port: None,
+            dbname: None,
+            user: None,
+            password: None,
+            sslmode: None,
+        }
+    }
+
+    fn file() -> config::Connection {
+        config::Connection {
+            host: Some("file.example".into()),
+            port: Some(7000),
+            db: Some("filedb".into()),
+            user: Some("fileuser".into()),
+            sslmode: Some("require".into()),
+            password: Some("from-file".into()),
+        }
+    }
+
+    /// With no flags and no environment, the file supplies everything.
+    #[test]
+    fn the_file_fills_in_what_nothing_else_does() {
+        let resolved = Resolved::from(&empty_args(), &file()).unwrap();
+        assert_eq!(resolved.host, "file.example");
+        assert_eq!(resolved.port, 7000);
+        assert_eq!(resolved.dbname, "filedb");
+        assert_eq!(resolved.user, "fileuser");
+        assert_eq!(resolved.sslmode, "require");
+        assert_eq!(resolved.password.as_deref(), Some("from-file"));
+        assert_eq!(resolved.password_source, PasswordSource::File);
+    }
+
+    #[test]
+    fn a_flag_beats_the_file() {
+        let mut args = empty_args();
+        args.host = Some("flag.example".into());
+        args.password = Some("from-flag".into());
+
+        let resolved = Resolved::from(&args, &file()).unwrap();
+        assert_eq!(resolved.host, "flag.example");
+        assert_eq!(resolved.password.as_deref(), Some("from-flag"));
+        // Overridden, so nothing to warn about.
+        assert_eq!(resolved.password_source, PasswordSource::Flag);
+    }
+
+    #[test]
+    fn built_in_defaults_apply_when_nothing_else_says() {
+        let resolved = Resolved::from(&empty_args(), &config::Connection::default()).unwrap();
+        assert_eq!(resolved.host, "localhost");
+        assert_eq!(resolved.port, 5432);
+        assert_eq!(resolved.sslmode, "prefer");
+        assert_eq!(resolved.password_source, PasswordSource::None);
     }
 }

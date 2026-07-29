@@ -6,6 +6,7 @@
 //! exists here, and none of it needs a database.
 
 use assert_cmd::Command;
+use predicates::prelude::PredicateBooleanExt;
 use std::path::Path;
 use tempfile::TempDir;
 
@@ -280,4 +281,205 @@ fn a_missing_source_root_is_an_error() {
         .assert()
         .failure()
         .stderr(predicates::str::contains("does not exist"));
+}
+
+// ---------------------------------------------------------------------------
+// pgpushy.toml (spec §10)
+// ---------------------------------------------------------------------------
+
+/// A project laid out the way the configuration file expects.
+fn project(config: &str, files: &[(&str, &str)]) -> TempDir {
+    let dir = TempDir::new().expect("temp dir");
+    std::fs::write(dir.path().join("pgpushy.toml"), config).expect("write config");
+    for (path, contents) in files {
+        let full = dir.path().join(path);
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent).expect("create dirs");
+        }
+        std::fs::write(&full, contents).expect("write file");
+    }
+    dir
+}
+
+/// `pgpushy validate` run from inside the project, with no flags at all.
+fn bare(root: &Path) -> Command {
+    let mut cmd = Command::cargo_bin("pgpushy").expect("binary builds");
+    cmd.arg("validate").current_dir(root);
+    cmd
+}
+
+#[test]
+fn a_config_file_supplies_everything_with_no_flags() {
+    let dir = project(
+        r#"
+        source_root = "db/schema"
+        default_schema = "app"
+        exclude = ["seeds/**"]
+        "#,
+        &[
+            ("db/schema/customers.sql", CUSTOMERS),
+            ("db/schema/orders.sql", ORDERS),
+            (
+                "db/schema/seeds/data.sql",
+                "INSERT INTO customers VALUES (1, 'joe');",
+            ),
+        ],
+    );
+
+    bare(dir.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("config: pgpushy.toml"))
+        .stdout(predicates::str::contains("2 files, 1 excluded"))
+        .stdout(predicates::str::contains("managed schemas: app"));
+}
+
+#[test]
+fn no_config_file_is_not_an_error() {
+    let dir = tree(&[("customers.sql", CUSTOMERS)]);
+
+    bare(dir.path())
+        .assert()
+        .success()
+        // Nothing to report when there was no file to read.
+        .stdout(predicates::str::contains("config:").not())
+        .stdout(predicates::str::contains("managed schemas: public"));
+}
+
+#[test]
+fn a_flag_beats_the_config_file() {
+    let dir = project(
+        "default_schema = \"from_file\"",
+        &[("customers.sql", CUSTOMERS)],
+    );
+
+    bare(dir.path())
+        .args(["--default-schema", "from_flag"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("managed schemas: from_flag"));
+}
+
+/// Spec §10 precedence is CLI over file, and for lists that means *replace*:
+/// otherwise a project's exclusions could never be narrowed for one run.
+#[test]
+fn an_exclude_flag_replaces_the_files_excludes() {
+    let files = &[
+        ("customers.sql", CUSTOMERS),
+        ("seeds/data.sql", "INSERT INTO customers VALUES (1, 'joe');"),
+    ];
+    let dir = project(r#"exclude = ["seeds/**"]"#, files);
+
+    // With the file's list, the seed file is excluded and all is well.
+    bare(dir.path()).assert().success();
+
+    // Replaced by a pattern that matches nothing, the seed file comes back —
+    // and the allow-list rejects it.
+    bare(dir.path())
+        .args(["--exclude", "no-such-dir/**"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("unsupported statement: INSERT"));
+}
+
+#[test]
+fn managed_schemas_can_be_declared_in_the_file() {
+    let dir = project(
+        r#"managed_schemas = ["public"]"#,
+        &[
+            ("customers.sql", CUSTOMERS),
+            (
+                "events.sql",
+                "CREATE TABLE analytics.events (id int PRIMARY KEY);",
+            ),
+        ],
+    );
+
+    bare(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("analytics"))
+        .stderr(predicates::str::contains("managed_schemas"));
+}
+
+/// Paths in the file are relative to the file, not to the working directory,
+/// so `--config` pointing elsewhere means what it looks like.
+#[test]
+fn file_paths_resolve_against_the_config_files_directory() {
+    let dir = project(
+        "source_root = \"db/schema\"",
+        &[("db/schema/customers.sql", CUSTOMERS)],
+    );
+    let elsewhere = TempDir::new().expect("temp dir");
+
+    let mut cmd = Command::cargo_bin("pgpushy").expect("binary builds");
+    cmd.arg("validate")
+        .current_dir(elsewhere.path())
+        .arg("--config")
+        .arg(dir.path().join("pgpushy.toml"))
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("1 table"));
+}
+
+/// A mistyped key would otherwise be invisible: pgpushy would simply behave as
+/// though the setting were absent.
+#[test]
+fn a_mistyped_key_is_rejected_with_the_valid_ones_listed() {
+    let dir = project(
+        r#"exclude_patterns = ["x"]"#,
+        &[("customers.sql", CUSTOMERS)],
+    );
+
+    bare(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "unknown field `exclude_patterns`",
+        ))
+        .stderr(predicates::str::contains("source_root"));
+}
+
+#[test]
+fn an_explicit_config_that_does_not_exist_is_an_error() {
+    let dir = tree(&[("customers.sql", CUSTOMERS)]);
+
+    bare(dir.path())
+        .args(["--config", "/nonexistent/pgpushy.toml"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("no configuration file at"));
+}
+
+/// The managed backend is in the spec but not built yet, so someone reading
+/// the spec will try it. "Unknown field" would be the wrong answer.
+#[test]
+fn settings_that_are_not_built_yet_say_so_plainly() {
+    let dir = project(
+        "[pgschema]\nbackend = \"managed\"",
+        &[("customers.sql", CUSTOMERS)],
+    );
+
+    bare(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("not available yet"))
+        .stderr(predicates::str::contains("fast-follow"));
+}
+
+/// Spec §10: the file is read from the working directory and *not* searched
+/// for in parent directories. Running from a subdirectory therefore picks up
+/// nothing — which is only safe because the absent `config:` line says so.
+#[test]
+fn the_config_file_is_not_searched_for_in_parent_directories() {
+    let dir = project(
+        "default_schema = \"app\"",
+        &[("db/customers.sql", CUSTOMERS)],
+    );
+
+    bare(&dir.path().join("db"))
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("config:").not())
+        .stdout(predicates::str::contains("managed schemas: public"));
 }
