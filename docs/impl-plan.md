@@ -244,13 +244,9 @@ machine — canonical/pretty form is irrelevant, only validity + correct desired
 state.** So deparse output quality is not a concern beyond "parses and means
 the same thing."
 
-> ⚠️ **Spike this first (§14, R1):** confirm `pg_query` parse → mutate →
-> deparse round-trips representative DDL (inline & table FKs, composite FKs,
-> multi-col PKs, `ON DELETE`, quoted/mixed-case idents, comments). Validate by
-> re-parsing the deparsed output and comparing fingerprints. If deparse proves
-> inadequate for some node, fall back to slicing original text via
-> `stmt_location`/`stmt_len` for the *unchanged* statements and only
-> deparse/synthesize the mutated ones.
+> ✅ **R1 is answered** — see `pgpushy-core/tests/spike_pg_query.rs` and §14.
+> AST-mutate + deparse works on all 13 representative fixtures; the text-slice
+> fallback is not needed.
 
 **Synthesis-file granularity** (spec §5.4): emit **one combined document**
 reused for every per-schema run (simplest, verified). Per-schema trimming to
@@ -489,6 +485,14 @@ logic lives, and `validate` makes it shippable and testable on its own.
   can't express cycles, lift can.
 - **Do not name author-unnamed FK constraints.** A stable name is not enough;
   it must be *Postgres's* name, or the plan churns forever. Emit no name.
+- **Never `..Default::default()` a synthesized libpg_query node.** Its deparser
+  maps protobuf enum values back to C enums through a `switch` that
+  `Assert(false)`s on anything unrecognized, and every such enum reserves 0 for
+  `Undefined` — which is exactly what `Default` supplies. The result is a
+  `SIGABRT` that kills the process, not a `Result::Err` you can handle. Set
+  every enum field on a synthesized node explicitly (`AlterTableCmd.behavior`
+  is the one that bit us: it must be `DropBehavior::DropRestrict`). Nodes that
+  came from a real parse are fine; only synthesized ones are at risk.
 - **Do not put indexes or comments in the same category as tables.** They
   depend on their table existing, and a `(schema, name)` sort will happily
   place an index before it.
@@ -510,15 +514,7 @@ logic lives, and `validate` makes it shippable and testable on its own.
 
 ## 14. Risks & open implementation questions
 
-- **R1 (highest) — pg_query deparse fidelity, and unnamed-FK naming.** The
-  whole synth approach assumes parse→mutate→deparse round-trips real DDL.
-  **Spike in M0.** Fallback: text-slice unchanged statements, synthesize only
-  mutated ones. The same spike must confirm the second half of spec §5.3: that
-  an unnamed `ALTER TABLE … ADD FOREIGN KEY` yields the *same* constraint name
-  Postgres assigns to the inline form — including the collision-suffix case
-  where two constraints on a table would compete for one name. If they diverge,
-  §5.3 needs revisiting. Also confirm the pg_query crate's bundled PG grammar
-  covers the PG version in use (PG18 seen in spikes; the crate may trail).
+- **~~R1~~ — RESOLVED (2026-07-29).** Both halves confirmed; see below.
 - **R2 — Managed download integrity.** pgschema ships no checksums; we self-pin
   SHA-256. Decide the update process when we bump the pinned version (recompute
   hashes for all four platforms). Consider verifying against GitHub's API
@@ -536,6 +532,50 @@ logic lives, and `validate` makes it shippable and testable on its own.
 removing the churn risk entirely) and `Other`-statement ordering (spec §4.3 now
 rejects unmodelled statements; confirmed acceptable — the real source trees
 this targets contain only tables, indexes, comments and foreign keys).
+
+### R1 spike results (2026-07-29)
+
+**Deparse fidelity — passes.** `pgpushy-core/tests/spike_pg_query.rs` runs FK-lift
+and qualification over 13 fixtures and checks that deparse output re-parses and
+re-deparses identically. All pass, including composite FKs, `ON DELETE CASCADE`
+/ `ON UPDATE RESTRICT`, `ON DELETE SET NULL (cols)`, `MATCH FULL DEFERRABLE
+INITIALLY DEFERRED`, quoted mixed-case identifiers, reserved words as quoted
+identifiers, generated and identity columns, arrays, and intervals with
+qualifiers. **The text-slice fallback is not needed.** `synth.rs` can be
+AST-mutate + deparse throughout.
+
+Deparse also emits an unnamed lifted constraint as `ALTER TABLE t ADD FOREIGN
+KEY (…)` — no `CONSTRAINT` clause — which is exactly what spec §5.3 requires.
+
+**Constraint naming — passes.** Against Postgres 18, the inline and lifted
+forms produce identical generated names in every case tried: single-column,
+composite (`child_x_y_fkey`), quoted mixed case (`Orders_customerId_fkey`),
+63-byte truncation, collision with another foreign key (`dual_ref_id_fkey` /
+`dual_ref_id_fkey1`), and collision with a `CHECK` constraint already holding
+the name (`blocked_ref_id_fkey1`). Zero divergences.
+
+The truncation case is worth seeing, because it shows how much work option "B"
+(replicating Postgres's algorithm in Rust) would have been: for a 65-character
+table name Postgres produces
+`a_very_long_table_name_that_will_a_rather_long_column_name_fkey` — it truncates
+the *table-name component* to make room for the column and the suffix, rather
+than truncating the finished string.
+
+**One caveat, now spec §12.4.** Suffix assignment follows *creation* order.
+Adding the same two competing foreign keys in the opposite order moves
+`dual_ref_id_fkey` from referencing `t1` to referencing `t2`. Since pgpushy's
+emission order comes from source content and need not match the order the
+target's constraints were created in, two *unnamed* foreign keys on the same
+table over the *identical* column set can swap names and churn the plan
+forever. Spec §12.4 requires detecting and rejecting exactly that shape;
+implement it in `validate.rs` alongside the duplicate check.
+
+**Grammar version.** `pg_query` 6.1.1 bundles the **PG17** grammar while the
+spikes ran PG18. Nothing in the tables-and-foreign-keys scope needs PG18-only
+syntax, and every fixture above parses. Revisit if the scope widens (spec §14).
+
+**Pitfall for synthesis:** see §13 on `Default::default()` — it aborts the
+process, it does not return an error.
 
 ---
 

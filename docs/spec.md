@@ -321,6 +321,14 @@ so the two agree by construction rather than by pgpushy imitating an internal
 it does not own. Determinism (§11.3) is unaffected: the name is simply absent
 from pgpushy's output.
 
+Verified against Postgres 18: the inline and lifted forms generate identical
+names for single-column, composite, quoted mixed-case, and 63-byte-truncated
+cases, and for both collision cases (a competing foreign key, and a competing
+constraint of another kind). One caveat follows from the same test — where two
+constraints compete for a name, Postgres assigns the numeric suffix in
+*creation* order. pgpushy MUST therefore detect the one configuration in which
+that is observable; see §12.4.
+
 > **Non-normative — why lift rather than sort.** A topological sort of tables
 > by their foreign keys fails on cycles: two tables that reference each other
 > have no linear creation order. FK-lift has no such failure mode, because
@@ -726,7 +734,27 @@ one-time manual `CREATE SCHEMA` before pgpushy can manage it, and removing a
 schema from management is likewise manual. Automatic handling of absent
 schemas is deferred (§14, option B).
 
-### 12.4 Object scope
+### 12.4 Colliding unnamed foreign keys
+
+Two foreign keys on the same table over the *identical* column set, both left
+unnamed by the author, compete for one generated name; Postgres gives the
+second a numeric suffix, assigned in creation order (§5.3). pgpushy's emission
+order (§11.3) is derived from source content and need not match the order in
+which the target's constraints were originally created, so the two names can
+attach to opposite constraints — which pgschema reads as two renames, and
+plans on every run.
+
+pgpushy MUST reject this configuration, naming both constraints and asking the
+author to name them explicitly, which resolves it completely. The check is
+exact: it applies only when the column sets are identical and both names are
+absent. Foreign keys differing in any column, or either one named, are
+unaffected.
+
+> **Non-normative.** Two unnamed foreign keys over the same columns to
+> different tables is a pathological schema; the check exists because the
+> failure is silent and permanent rather than because the case is common.
+
+### 12.5 Object scope
 
 pgpushy 0.x manages tables, indexes, table constraints, foreign keys, and
 comments (§4.3). A source tree containing any other object kind — a view, a
@@ -765,7 +793,7 @@ resolves table-to-table ordering only; see §14.
   functions, triggers, user-defined types, policies — e.g. a topological sort
   over all object kinds, or normalization through a throwaway Postgres +
   `pg_dump` (which orders all object kinds for free). This is the prerequisite
-  for widening §12.4.
+  for widening §12.5.
 - **References into unmanaged schemas** — for foreign keys targeting schemas
   pgpushy does not manage (extension schemas, an externally-owned `auth`,
   etc.), support pgschema's **external plan database** seeded with those
@@ -791,7 +819,7 @@ made after draft 2 of v0.1.
   and comments. **[0.2]** Anything else is **rejected** with a diagnostic
   rather than passed through, because pgpushy cannot qualify the interior of a
   statement it does not model, and §5.4 makes qualification normative.
-  (§4.3, §12.4)
+  (§4.3, §12.5)
 - **Schema-assignment mechanism** — schema-qualify **every** emitted
   identifier with its resolved schema, including `public`; an unqualified
   object would be misattributed to every schema the combined file is run
@@ -812,7 +840,10 @@ made after draft 2 of v0.1.
 - **[0.2] Constraint naming** — author-unnamed foreign keys are emitted with
   **no name**, so Postgres generates the same name in the plan database that
   it generated on the target. pgpushy does not synthesize constraint names.
-  (§5.3)
+  Verified against Postgres 18 across single-column, composite, quoted,
+  truncated, and both collision cases. The one residual hazard — two unnamed
+  foreign keys competing for a name, whose suffix follows creation order — is
+  detected and rejected. (§5.3, §12.4)
 - **[0.2] Approval** — one database-level approval after a full plan pass;
   pgschema is always invoked with `--auto-approve`. Declining touches nothing.
   (§8.6)
