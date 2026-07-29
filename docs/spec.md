@@ -189,7 +189,27 @@ Two properties motivate rejection rather than pass-through:
 (`CREATE SCHEMA s CREATE TABLE t (…)`, whose elements Postgres permits inline)
 and the name-from-role form (`CREATE SCHEMA AUTHORIZATION <role>`, whose schema
 name pgpushy cannot resolve offline) MUST both be rejected, with a diagnostic
-showing the accepted form.
+showing the accepted form. `AUTHORIZATION` on a *named* schema MUST likewise be
+rejected: pgpushy does not manage ownership, and silently discarding the clause
+would make the synthesized state say something the author did not write (G4).
+
+Three further restrictions apply within the allowed statements, each for the
+same reason the allow-list exists at all:
+
+- `CREATE TABLE … INHERITS`, `… PARTITION OF`, `… PARTITION BY`, and
+  `CREATE TABLE … OF <type>` MUST be rejected. Each makes a table's *creation*
+  depend on another object, and FK-lift resolves table-to-table foreign-key
+  ordering only — this is exactly the class of dependency §12.5 keeps out of
+  0.x.
+- `CREATE INDEX CONCURRENTLY` MUST be rejected. It cannot run inside a
+  transaction block, and it describes a strategy for reaching a state rather
+  than the state itself; how an index is built is pgschema's decision.
+- `CREATE INDEX` without an explicit index name MUST be rejected. Postgres
+  would generate one from the table and the indexed expressions, and pgpushy
+  needs a stable name to detect duplicates against and to attach comments to.
+  This is the opposite of the foreign-key rule in §5.3 only in appearance: a
+  foreign key can be left unnamed precisely *because* pgpushy never needs to
+  refer to it by name.
 
 ### 4.4 Schema assignment and the managed-schema set
 

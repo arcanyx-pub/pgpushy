@@ -435,10 +435,13 @@ touches nothing. `--auto-approve` skips the prompt; a non-TTY stdin without
 - **M0 — Skeleton & spike.** Workspace, justfile, CI. **Do the pg_query
   round-trip spike (R1) first** — it de-risks everything. R1 now also covers
   the unnamed-FK naming question (§14).
-- **M1 — `pgpushy validate`.** discover → parse → allow-list → resolve →
-  duplicate/referent checks → graph → synth, plus the CLI. **No database and no
-  pgschema binary**, so it is fully testable in CI from day one and exercises
-  every line of `pgpushy-core`. Fixtures 12 and the offline half of 6.
+- **M1 — `pgpushy validate`. ✅ Done.** discover → parse → allow-list → resolve
+  → duplicate/referent/collision checks → graph → synth, plus the CLI. **No
+  database and no pgschema binary**, so it is fully testable in CI from day one
+  and exercises every line of `pgpushy-core`. Fixtures 12 and the offline half
+  of 6. Source-tree flags (`--source-root`, `--default-schema`,
+  `--managed-schema`, `--exclude`) are CLI-only until M4 adds the file under the
+  same precedence.
 - **M2 — Single-schema `plan` (BYO).** BYO provider + version check, connection
   resolution, target inspection, `pgschema plan --schema <default>`. Fixtures
   1–3, 7, 9.
