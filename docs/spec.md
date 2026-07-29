@@ -779,8 +779,18 @@ unaffected.
 pgpushy 0.x manages tables, indexes, table constraints, foreign keys, and
 comments (§4.3). A source tree containing any other object kind — a view, a
 function, a trigger, a user-defined type — is rejected, not partially managed.
-Extending the scope requires general dependency resolution, since FK-lift
-resolves table-to-table ordering only; see §14.
+
+This is a starting point, not the destination. **The goal is parity with the
+statement set pgschema itself supports** (§14): `CREATE TABLE`, `CREATE INDEX`,
+`CREATE VIEW`, `CREATE MATERIALIZED VIEW`, `CREATE FUNCTION`,
+`CREATE PROCEDURE`, `CREATE AGGREGATE`, `CREATE TRIGGER`, `CREATE TYPE`,
+`CREATE DOMAIN`, `CREATE SEQUENCE`, `CREATE POLICY`, `COMMENT ON`,
+`GRANT`/`REVOKE`, and `ALTER DEFAULT PRIVILEGES`. Anything pgschema cannot
+manage — `CREATE EXTENSION`, `CREATE ROLE`, `CREATE SCHEMA` itself — is
+permanently out of scope for pgpushy too, since pgpushy delegates the work.
+
+Widening is staged by how much new machinery each kind needs, not by how
+useful it is (§14).
 
 ## 13. Dependencies and Compatibility
 
@@ -809,11 +819,39 @@ resolves table-to-table ordering only; see §14.
   managed schema missing from the target, reporting it as new and its contents
   as fully-created (without mutating the target), rather than failing. This is
   the preferred future direction over having pgpushy create schemas itself.
-- **General dependency resolution** for the object kinds §4.3 rejects — views,
-  functions, triggers, user-defined types, policies — e.g. a topological sort
-  over all object kinds, or normalization through a throwaway Postgres +
-  `pg_dump` (which orders all object kinds for free). This is the prerequisite
-  for widening §12.5.
+- **Parity with pgschema's statement set** (§12.5) — the main direction of
+  travel. pgschema's own `dump` orders its output by category — *types → tables
+  → views → functions → indexes* — and its documentation states that "most
+  objects resolve regardless of order, but some objects depend on others
+  existing at creation time". That is the same mechanism as §5.1, which is why
+  widening is mostly adding categories rather than redesigning synthesis.
+  Staged by the machinery each kind needs:
+
+  1. **Sequences, types, domains.** Structured names that qualify exactly as a
+     table's does, and no body referencing other objects. Category additions
+     and nothing more.
+  2. **Functions, procedures, aggregates, triggers, policies.** pgschema treats
+     function bodies as opaque dollar-quoted text rather than parsing them, and
+     Postgres does not resolve a plpgsql body at creation time — so the name is
+     qualified and the body passes through byte-for-byte. Trigger and policy
+     references are structured AST fields. One question to settle first:
+     SQL-standard `BEGIN ATOMIC` bodies (PG14+) *are* resolved at creation,
+     unlike dollar-quoted ones.
+  3. **Views and materialized views.** A view's query *is* resolved at creation
+     time, so unqualified references inside it are a live problem, and views
+     need a topological sort *within* their category, because a view over a
+     view is a genuine creation-time dependency that category order cannot
+     express. Before building an AST-walking qualifier — which would have to
+     track scope, since CTE names and subquery aliases are `RangeVar`s too and
+     qualifying those would break the view — settle whether a **per-schema
+     document** removes the need. With objects of schema `S` qualified as `S`,
+     which pgschema strips, an unqualified reference inside a view body would
+     resolve to the scratch schema standing in for `S`, which is the correct
+     answer. If that holds, only genuinely cross-schema references need
+     rewriting, and an author must write those qualified regardless.
+  4. **`GRANT`/`REVOKE` and `ALTER DEFAULT PRIVILEGES`.** Permissions rather
+     than shape; needs a decision on how they attribute to the managed-schema
+     set, since a grant is not owned by a schema the way a table is.
 - **References into unmanaged schemas** — for foreign keys targeting schemas
   pgpushy does not manage (extension schemas, an externally-owned `auth`,
   etc.), support pgschema's **external plan database** seeded with those

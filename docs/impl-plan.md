@@ -69,6 +69,33 @@ commands are in [Appendix A](#appendix-a-reproduction-harness).
   writes only the diff (it does **not** emit `CREATE SCHEMA` — it assumes the
   schema exists).
 
+**What pgschema itself manages** (from its docs, 2026-07-29)
+- Fifteen statement types: `CREATE TABLE`, `CREATE INDEX`, `CREATE VIEW`,
+  `CREATE MATERIALIZED VIEW`, `CREATE FUNCTION`, `CREATE PROCEDURE`,
+  `CREATE AGGREGATE`, `CREATE TRIGGER`, `CREATE TYPE`, `CREATE DOMAIN`,
+  `CREATE SEQUENCE`, `CREATE POLICY`, `COMMENT ON`, `GRANT`/`REVOKE`,
+  `ALTER DEFAULT PRIVILEGES`. This is pgpushy's eventual target (spec §12.5).
+- **`CREATE SCHEMA` is on pgschema's own unsupported list**, independently
+  confirming the §6.1 precondition. Also unsupported and therefore permanently
+  out of pgpushy's scope: `CREATE EXTENSION`, `CREATE ROLE`, `CREATE DATABASE`,
+  `CREATE TABLESPACE`, `CREATE CAST`, `CREATE COLLATION`, `CREATE OPERATOR`,
+  `CREATE PUBLICATION`/`SUBSCRIPTION`, `CREATE SERVER`, event triggers,
+  text search objects, and `RENAME`.
+- **pgschema's own answer to ordering is a fixed category order.** Its `dump`
+  emits *types → tables → views → functions → indexes*, and the docs say "most
+  objects resolve regardless of order, but some objects depend on others
+  existing **at creation time**" — e.g. a function whose parameter uses a
+  table's row type must follow that table. That is the same mechanism as spec
+  §5.1, so widening pgpushy's scope is mostly adding categories.
+- **Function bodies are not parsed** — "intelligent dollar-quoting with
+  automatic tag generation". So pgpushy can qualify a function's *name* and
+  pass its body through untouched. Caveat to check: SQL-standard `BEGIN ATOMIC`
+  bodies (PG14+) are resolved at creation time, unlike dollar-quoted ones.
+- pgschema supports **PG 14–17**, which matches `pg_query` 6.1.1's PG17
+  grammar; the PG18 target in our spikes is outside pgschema's stated range.
+- pgschema has its own `.pgschemaignore` (for target objects) — unrelated to
+  pgpushy's `exclude` (source files), but worth not confusing.
+
 **Release/distribution facts (for the provider, §7)**
 - Assets are **standalone per-platform binaries**: `pgschema-<ver>-{darwin,
   linux}-{amd64,arm64}` (~18 MB static Go), plus `.deb`/`.rpm`. **No Windows
@@ -454,9 +481,27 @@ touches nothing. `--auto-approve` skips the prompt; a non-TTY stdin without
   line, docs.
 - **M6 — Managed provider (0.x fast-follow, then default).** download/cache/
   verify; SHA-256 table; make managed the default backend.
-- **Later (spec §14):** non-table objects via general ordering or shadow-DB
-  `pg_dump`; `pgpushy dump`; references into unmanaged schemas via external
-  plan DB; cross-schema-cycle and single-pass-removal support; schema-drop.
+
+**Widening to pgschema parity** (spec §12.5, §14). Deliberately *after* the
+vertical slice: until `plan` and `apply` work, a new object kind cannot be
+tested end to end, so every one added early is code resting on unverified
+assumptions. Once M3 lands, each kind below gets a real regression test the day
+it is written.
+
+- **W1 — Sequences, types, domains.** Structured names, no bodies. Category
+  additions: types and domains before tables, sequences alongside.
+- **W2 — Functions, procedures, aggregates, triggers, policies.** Qualify the
+  name, pass the body through. Spike `BEGIN ATOMIC` first.
+- **W3 — Views and materialized views.** The real work: bodies are resolved at
+  creation, and views need a topological sort within their category. Spike the
+  per-schema-document question before writing an AST-walking qualifier — it may
+  remove the need entirely (spec §14).
+- **W4 — `GRANT`/`REVOKE`, `ALTER DEFAULT PRIVILEGES`.** Needs a decision on
+  how a grant attributes to the managed-schema set.
+
+- **Later (spec §14):** `pgpushy dump`; references into unmanaged schemas via
+  external plan DB; cross-schema-cycle and single-pass-removal support;
+  schema-drop.
 
 Note M1 comes before any pgschema or Postgres dependency — a deliberate change
 from the v0.1 ordering. The offline pipeline is where all the spec's novel
