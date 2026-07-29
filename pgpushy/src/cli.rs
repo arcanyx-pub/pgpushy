@@ -1,10 +1,11 @@
 //! Command-line interface.
 //!
-//! Only `validate` exists so far; `plan` and `apply` arrive with the target
-//! connection and the pgschema provider. The flags that describe the *source
-//! tree* are shared by all three, so they live on the top level rather than on
-//! the subcommand.
+//! `apply` arrives with the approval gate and the cross-schema removal check.
+//! Flags are grouped by what they describe — the source tree, the connection,
+//! the pgschema binary — so the groups can be shared across subcommands
+//! without repeating them.
 
+use crate::conn::ConnectionArgs;
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -31,6 +32,26 @@ pub enum Command {
     Validate {
         #[command(flatten)]
         source: SourceArgs,
+
+        /// Write the synthesized desired state to a file.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+    },
+
+    /// Show what would change, one plan per managed schema.
+    ///
+    /// Read-only: pgschema reads the target and builds its comparison model in
+    /// a separate plan database, and pgpushy's own inspection is a single
+    /// read-only query. Nothing here modifies the target.
+    Plan {
+        #[command(flatten)]
+        source: SourceArgs,
+
+        #[command(flatten)]
+        connection: ConnectionArgs,
+
+        #[command(flatten)]
+        pgschema: PgschemaArgs,
 
         /// Write the synthesized desired state to a file.
         #[arg(long, value_name = "PATH")]
@@ -66,4 +87,11 @@ pub struct SourceArgs {
     /// seed data or fixtures alongside desired state.
     #[arg(long = "exclude", value_name = "GLOB")]
     pub exclude: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct PgschemaArgs {
+    /// Path to the pgschema binary. Defaults to looking on `PATH`.
+    #[arg(long, value_name = "PATH")]
+    pub pgschema_path: Option<PathBuf>,
 }

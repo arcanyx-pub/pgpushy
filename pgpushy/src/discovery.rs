@@ -16,7 +16,7 @@
 
 use anyhow::{Context, Result};
 use globset::{Glob, GlobMatcher};
-use pgpushy_core::SourceFile;
+use pgpushy_core::{GENERATED_MARKER, SourceFile};
 use std::path::{Path, PathBuf};
 
 /// What discovery found.
@@ -27,18 +27,13 @@ pub struct Discovered {
     /// Reported so that an over-broad pattern quietly swallowing real tables
     /// is visible rather than mysterious (spec §4.1).
     pub excluded: Vec<(String, usize)>,
+    /// How many files were skipped for being pgpushy's own output.
+    pub generated: usize,
 }
 
 /// Walk a source tree, honoring exclusions.
-///
-/// `ignore` names a file that must never be read even though it lives in the
-/// tree — pgpushy's own `--out` document. Writing the desired state into the
-/// source root is a natural thing to do, and without this the next run would
-/// discover that output as input and report every object in it as a duplicate
-/// of itself.
-pub fn discover(root: &Path, exclude: &[String], ignore: Option<&Path>) -> Result<Discovered> {
+pub fn discover(root: &Path, exclude: &[String]) -> Result<Discovered> {
     let matchers = compile(exclude)?;
-    let ignore = ignore.and_then(|path| path.canonicalize().ok());
     let mut counts = vec![0usize; matchers.len()];
     let mut paths = Vec::new();
 
@@ -51,13 +46,8 @@ pub fn discover(root: &Path, exclude: &[String], ignore: Option<&Path>) -> Resul
     paths.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
 
     let mut files = Vec::with_capacity(paths.len());
+    let mut generated = 0usize;
     'next: for (relative, absolute) in paths {
-        if ignore
-            .as_ref()
-            .is_some_and(|ignored| absolute.canonicalize().ok().as_ref() == Some(ignored))
-        {
-            continue;
-        }
         for (index, matcher) in matchers.iter().enumerate() {
             if matcher.is_match(&relative) {
                 counts[index] += 1;
@@ -66,6 +56,17 @@ pub fn discover(root: &Path, exclude: &[String], ignore: Option<&Path>) -> Resul
         }
         let contents = std::fs::read_to_string(&absolute)
             .with_context(|| format!("reading {}", absolute.display()))?;
+
+        // pgpushy never reads a document it wrote. Writing the desired state
+        // into the source root with `--out` is a natural thing to do, and
+        // without this every later run would report every object in it as a
+        // duplicate of itself — a failure that outlives the run that caused it
+        // and gives no hint where the extra file came from.
+        if contents.starts_with(GENERATED_MARKER) {
+            generated += 1;
+            continue;
+        }
+
         files.push(SourceFile {
             path: relative,
             contents,
@@ -75,6 +76,7 @@ pub fn discover(root: &Path, exclude: &[String], ignore: Option<&Path>) -> Resul
     Ok(Discovered {
         files,
         excluded: exclude.iter().cloned().zip(counts).collect(),
+        generated,
     })
 }
 

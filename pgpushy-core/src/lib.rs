@@ -37,6 +37,7 @@ pub use error::{CoreError, Diagnostic, DiagnosticKind};
 pub use graph::{Cycle, CycleEdge};
 pub use model::{Origin, QualifiedName, SchemaName};
 pub use parse::SourceFile;
+pub use synth::GENERATED_MARKER;
 
 /// How to interpret a source tree.
 #[derive(Clone, Debug)]

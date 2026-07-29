@@ -469,9 +469,10 @@ touches nothing. `--auto-approve` skips the prompt; a non-TTY stdin without
   of 6. Source-tree flags (`--source-root`, `--default-schema`,
   `--managed-schema`, `--exclude`) are CLI-only until M4 adds the file under the
   same precedence.
-- **M2 — Single-schema `plan` (BYO).** BYO provider + version check, connection
-  resolution, target inspection, `pgschema plan --schema <default>`. Fixtures
-  1–3, 7, 9.
+- **M2 — `plan` (BYO). ✅ Done.** BYO provider + version check, connection
+  resolution, target inspection, and `pgschema plan` per managed schema in
+  dependency order — the multi-schema loop came free, since `pgpushy-core`
+  already produces the order. Fixtures 1–3, 5, 7, 8 (via plan), 9.
 - **M3 — Multi-schema + `apply`.** Graph ordering in anger, cross-schema FK
   removal detection, plan pass + single approval, stop-at-first-failure
   reporting. Fixtures 4–6, 8, 10, 11.

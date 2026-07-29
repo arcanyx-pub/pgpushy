@@ -15,8 +15,13 @@ pgpushy-core = { version = "0.1.0", path = "../pgpushy-core" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 globset = "0.4"
+postgres = "0.19"
+semver = "1"
+tempfile = "3"
+which = "8"
 
 [dev-dependencies]
 assert_cmd = "2"
+postgres = "0.19"
 predicates = "3"
 tempfile = "3"
