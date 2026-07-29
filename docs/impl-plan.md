@@ -1,8 +1,8 @@
 # pgpushy Implementation Plan
 
 **Status:** Draft — build guidance (non-normative)
-**Date:** 2026-07-28
-**Companion to:** [`docs/spec.md`](./spec.md) (normative)
+**Date:** 2026-07-29
+**Companion to:** [`docs/spec.md`](./spec.md) v0.2 (normative)
 
 This plan says *how* to build what `spec.md` defines. Where they disagree, the
 spec wins. It is written to be read cold: §1 distills everything we learned
@@ -93,17 +93,28 @@ Mirror `snowdrop-id-rs`:
   `PGPUSHY_TEST_PGSCHEMA` (path to a pgschema binary).
 
 **Crate dependencies (proposed)**
+
+*Core (`pgpushy-core`, no IO):*
 - `pg_query` — parse/deparse via libpg_query (the real PG parser). **Pin a
   version whose bundled Postgres grammar covers the PG features in use** (PG18
   in our spikes; pg_query trails PG majors — verify before relying on
   PG18-only syntax). This is the highest-risk dependency (see §14).
+- `thiserror` — typed errors carrying source locations.
+
+*Binary (`pgpushy`):*
 - `clap` (derive) — CLI. `serde` + `toml` — config. `semver` — version floor.
+- `globset` — `exclude` patterns (spec §4.1). `walkdir` — discovery.
+- `postgres` (sync rust-postgres) — the read-only target inspection
+  (spec §6). Sync, not async: pgpushy issues one query and shells out; a
+  runtime would be pure overhead. Its connection-string parsing is
+  libpq-compatible, which spec §6.4 relies on.
 - `which` — PATH lookup (BYO). `tempfile` — the synthesized file.
 - `tracing` + `tracing-subscriber` — logging and the password warning.
-- `thiserror` (library errors) / `anyhow` (binary). `camino` (UTF-8 paths, opt).
+- `anyhow` — binary-level error context. `camino` (UTF-8 paths, opt).
 - Later (managed provider): `ureq` or `reqwest` (blocking, rustls) + `sha2`.
-- Dev: `insta` (snapshot the synthesized SQL), `assert_cmd` + `predicates`
-  (CLI), `testcontainers` (hermetic Postgres) — with an env-URL fallback.
+
+*Dev:* `insta` (snapshot the synthesized SQL), `assert_cmd` + `predicates`
+(CLI), `testcontainers` (hermetic Postgres) — with an env-URL fallback.
 
 ---
 
@@ -120,57 +131,79 @@ pgpushy/
   docs/spec.md  docs/impl-plan.md
   pgpushy-core/             # pure, deterministic, no IO — the heart
     src/lib.rs
-    src/discovery.rs        # walk a source tree → ordered set of .sql paths (§4)
-    src/parse.rs            # pg_query parse → statements; classify (§5)
-    src/model.rs            # Schema, Table, ForeignKey, Object ids (§4-data)
-    src/synth.rs            # FK-lift + qualify + CREATE SCHEMA + deterministic order → String (§5-spec)
-    src/graph.rs            # cross-schema FK graph, topo order, cycle detection (§7-spec)
-    src/error.rs
+    src/model.rs            # SchemaName, QualifiedName, Table, ForeignKey, Statement
+    src/parse.rs            # pg_query parse → classify; allow-list enforcement (spec §4.2-4.3)
+    src/resolve.rs          # schema assignment; managed-schema set derive/verify (spec §4.4)
+    src/validate.rs         # duplicates, unresolvable FK referents (spec §4.5)
+    src/synth.rs            # FK-lift + qualify + 5-category emission → String (spec §5)
+    src/graph.rs            # cross-schema FK graph, topo order, cycle detection (spec §7)
+    src/error.rs            # diagnostics carrying file + line
   pgpushy/                  # the `pgpushy` binary — IO shell
     src/main.rs             # clap dispatch
-    src/cli.rs              # arg/flag definitions; owns --schema/--file? NO (see §8-spec)
-    src/config.rs           # pgpushy.toml load + precedence + password warning (§9-spec)
+    src/cli.rs              # arg/flag definitions
+    src/config.rs           # pgpushy.toml load + precedence + password warning (spec §10)
+    src/discovery.rs        # walk source tree, apply excludes, deterministic order (spec §4.1)
+    src/conn.rs             # connection resolution → conninfo; forward to pgschema (spec §6.3-6.4)
+    src/inspect.rs          # read-only target inspection: schemas, cross-schema FKs, identity (spec §6)
     src/provider/mod.rs     # trait PgschemaProvider
     src/provider/byo.rs     # PATH/explicit path + version check (ship first)
     src/provider/managed.rs # download+cache+verify (fast-follow)
     src/pgschema.rs         # build/run pgschema commands; stream output
-    src/precondition.rs     # read-only: verify managed schemas exist on target
-    src/run.rs              # orchestrates plan/apply over the schema order
+    src/approve.rs          # plan presentation + single database-level prompt (spec §8.6)
+    src/run.rs              # orchestrates validate/plan/apply
     tests/                  # integration (real pgschema + Postgres)
 ```
 
 Binary target name **`pgpushy`**; library crate **`pgpushy-core`**.
 
+Note the split: **discovery lives in the binary** (it touches the filesystem),
+while everything from parsing onward is pure. `pgpushy-core` takes
+`Vec<(RelPath, String)>` — path plus contents — and returns either a
+synthesized document plus a schema order, or a list of diagnostics. That makes
+the entire offline pipeline (spec §3 stages 2–6) unit-testable from string
+literals with no fixtures on disk.
+
 ---
 
 ## 4. Data model (`pgpushy-core::model`)
 
-Minimal for the tables+FK scope (spec §5.1). Grow later for views/functions.
+Minimal for the tables+FK scope (spec §4.3). Grow later per spec §14.
 
 ```rust
-struct SourceTree { root: Utf8PathBuf, files: Vec<SourceFile> }
-struct SourceFile { path: Utf8PathBuf, statements: Vec<Statement> }
+struct SchemaName(String);                    // always resolved, never empty
+struct QualifiedName { schema: SchemaName, name: String }
 
-enum Statement {                 // classified from the parse (§5)
+enum Statement {                              // the allow-list, and nothing else
     CreateSchema(SchemaName),
-    CreateTable(Table),          // FKs pulled out into `foreign_keys`
-    ForeignKey(ForeignKey),      // from inline OR standalone ALTER … ADD CONSTRAINT
-    Other(RawStmt),              // pass-through, kept in source order (v0.x: indexes, comments…)
+    CreateTable(Table),                       // FKs pulled out into ForeignKey
+    CreateIndex(Index),
+    TableConstraint(TableConstraint),         // standalone non-FK ADD CONSTRAINT
+    ForeignKey(ForeignKey),                   // from inline OR standalone ADD CONSTRAINT
+    Comment(Comment),
 }
 
-struct Table { schema: SchemaName, name: String, /* body needed to re-emit */ ast: CreateStmt }
+struct Table { name: QualifiedName, ast: CreateStmt }   // ast: FKs already removed
 struct ForeignKey {
-    schema: SchemaName, table: String,      // the referencing table
-    name: Option<String>,                   // author name or None → generated (§5.3)
-    referenced: QualifiedName,              // (schema, table) — schema resolved!
-    ast: Constraint,                        // full FK definition to re-emit unchanged
+    table: QualifiedName,                     // the referencing table
+    name: Option<String>,                     // author's name, or None → emit unnamed
+    referenced: QualifiedName,                // schema resolved
+    ast: Constraint,                          // full FK definition, re-emitted unchanged
 }
-// SchemaName resolves unqualified → default schema (config, default "public").
+struct Origin { file: RelPath, line: u32 }    // on every statement, for diagnostics
 ```
 
-Key invariant: after parsing, **every object and every FK referent carries an
-explicit schema** (resolved from qualifier or default). The managed-schema set
-(spec §4.3) is the schemas that appear here — public is NOT auto-included.
+Key invariants after parse + resolve:
+
+- **Every object and every FK referent carries an explicit schema**, resolved
+  from a qualifier or from the default schema.
+- **Every statement carries an `Origin`.** Spec §4.5 and §4.3 diagnostics name
+  file and line; a statement that cannot say where it came from cannot produce
+  a compliant error message. Thread `Origin` from the start rather than
+  retrofitting it.
+- **There is no `Other` variant.** Spec §4.3 rejects everything outside the
+  allow-list, so an unmatched statement produces an error, never a pass-through
+  bucket. This is a change from the v0.1 plan and it simplifies synthesis
+  considerably: no unmodelled text to place, order, or fail to qualify.
 
 ---
 
@@ -178,37 +211,42 @@ explicit schema** (resolved from qualifier or default). The managed-schema set
 
 Produce one desired-state document (spec §5). Steps:
 
-1. **Collect** all statements across files into three buckets in category
-   order (spec §5.1): `CreateSchema` → `CreateTable` (FKs removed) → all
-   `ForeignKey` as `ALTER TABLE … ADD CONSTRAINT`. `Other` statements ride with
-   their table's category/position (v0.x: keep source order among them).
+1. **Bucket** every statement into the five categories of spec §5.1:
+   schemas → tables → table-dependent objects (indexes, non-FK constraints) →
+   foreign keys → comments. The category boundaries are what make the output
+   executable; do not intermix.
 2. **FK-lift** (spec §5.3): move every FK — inline column constraint
-   (`Constraint` contype `CONSTR_FOREIGN` on a column) and table-level FK and
-   standalone `ALTER … ADD CONSTRAINT` — into the trailing category. Preserve
-   the constraint definition **exactly** (no added `NOT VALID`, spec §5.5).
-3. **Qualify everything** (spec §5.4): set the schema on every emitted object
+   (`Constraint` with contype `CONSTR_FOREIGN`), table-level FK, and standalone
+   `ALTER … ADD CONSTRAINT` — into category 4. Preserve the constraint
+   definition **exactly** (no added `NOT VALID`, spec §5.5).
+3. **Constraint names** (spec §5.3): keep the author's name if there is one;
+   otherwise emit **no name** and let Postgres generate it in the plan DB. Do
+   **not** synthesize names — a synthesized name differs from the one the
+   target already holds and churns the plan forever.
+4. **Qualify everything** (spec §5.4): set the schema on every emitted object
    *and* every FK referent, including `public`. Emit
    `CREATE SCHEMA IF NOT EXISTS <s>` for each managed schema first (runs only
-   in the plan DB — never the target; spec §5.2/§6).
-4. **Deterministic order & names** (spec §10.3): stable sort within each
-   category (e.g. by `(schema, name)`); generate missing FK names the pg_dump
-   way — `<table>_<col1>[_<col2>…]_fkey`, de-duplicated with a numeric suffix —
-   deterministically. Output must be **byte-identical across runs/platforms**.
+   in the plan DB — never the target; spec §5.2/§6.1).
+5. **Deterministic order** (spec §11.3): stable sort within each category by
+   `(schema, name)`. Output must be **byte-identical across runs and
+   platforms**, and must not depend on filesystem enumeration order.
 
 **Implementation approach — AST-mutate + deparse.** `pg_query` gives a protobuf
 AST and a `deparse()`. The transforms are targeted edits:
 - FK-lift: remove FK `Constraint` nodes from `CreateStmt`; build
-  `AlterTableStmt { cmds: [AT_AddConstraint(fk)] }` nodes for them.
-- Qualify: set `schemaname` on each relation `RangeVar` (the table, and the FK
-  `pktable`).
+  `AlterTableStmt { cmds: [AT_AddConstraint(fk)] }` nodes for them, with
+  `conname` left empty for author-unnamed constraints.
+- Qualify: set `schemaname` on each relation `RangeVar` (the table, the index's
+  table, the FK's `pktable`, the comment's object).
+
 Then `deparse()` each statement. **pgpushy's output is consumed by pgschema, a
 machine — canonical/pretty form is irrelevant, only validity + correct desired
 state.** So deparse output quality is not a concern beyond "parses and means
 the same thing."
 
-> ⚠️ **Spike this first (§14, R1):** confirm `pg_query` parse → mutate → deparse
-> round-trips representative DDL (inline & table FKs, composite FKs, multi-col
-> PKs, `ON DELETE`, quoted/mixed-case idents, comments). Validate by
+> ⚠️ **Spike this first (§14, R1):** confirm `pg_query` parse → mutate →
+> deparse round-trips representative DDL (inline & table FKs, composite FKs,
+> multi-col PKs, `ON DELETE`, quoted/mixed-case idents, comments). Validate by
 > re-parsing the deparsed output and comparing fingerprints. If deparse proves
 > inadequate for some node, fall back to slicing original text via
 > `stmt_location`/`stmt_len` for the *unchanged* statements and only
@@ -225,9 +263,15 @@ the cross-schema closure is a possible large-DB optimization — not v0.x.
 Spec §7. Build a digraph over managed schemas: edge `A → B` when a table in `A`
 has a FK referencing a table in `B` (same-schema FKs create no edge — pgschema
 handles those, §5.3/PR#156). Process schemas in **reverse-dependency order**
-(a schema after every schema it references). Detect cycles (Tarjan/Kahn); a
-cross-schema FK cycle is a **hard error naming the schemas**, before any apply
-(spec §11.1). Deterministic tie-break (e.g. name order) for reproducible plans.
+(a schema after every schema it references). Tie-break by schema name so the
+order is reproducible.
+
+Cycle detection (Tarjan/Kahn) must report **the schemas in the cycle and the
+foreign keys forming it** — enough for the operator to break it. The
+*consequence* differs by command and belongs in `run.rs`, not here: `apply` and
+`validate` fail; `plan` reports and continues. So `graph.rs` returns a
+`Result<SchemaOrder, Cycle>`-shaped value where `Cycle` is data the caller
+decides about, not an error the library raises.
 
 ---
 
@@ -237,14 +281,15 @@ Spec §8.5. Trait that yields a runnable binary:
 
 ```rust
 trait PgschemaProvider { fn resolve(&self) -> Result<PgschemaBin>; }
-struct PgschemaBin { path: Utf8PathBuf, version: Version }
+struct PgschemaBin { path: Utf8PathBuf, version: Option<Version> }
 ```
 
 - **`byo.rs` (ship first).** Resolve an explicit path (config/flag) or
   `which("pgschema")`. Run `pgschema --help`, parse the `Version:` line
   (`^Version:\s*(\d+\.\d+\.\d+)`), compare with the floor via `semver`.
-  **Below floor → hard error** naming found vs required. **Unparseable version
-  → warn, proceed** (the line is not a stability contract).
+  **Below floor → hard error** naming found vs required, with **no override**
+  (spec §13). **Unparseable version → warn, proceed** (the line is not a
+  stability contract) — hence `Option<Version>`.
 - **`managed.rs` (fast-follow, becomes default).** Resolve version (pinned to
   tested version, config-overridable) → map `(version, os, arch)` to the
   GitHub release asset URL `…/releases/download/v<ver>/pgschema-<ver>-<os>-<arch>`
@@ -260,50 +305,108 @@ supported floor. Bump `MIN_PGSCHEMA` as CI tests newer releases.
 
 ---
 
-## 8. Invocation, precondition, orchestration
+## 8. Connection, inspection, orchestration
 
-- **`precondition.rs`** — before delegating, open one target connection and
-  read `pg_namespace` (or `information_schema.schemata`) to confirm **every
-  managed schema exists**; else fail listing all missing ones (spec §6). This
-  is pgpushy's only *direct* target access, and it is **read-only**.
-- **`pgschema.rs`** — build the argv: `pgschema <plan|apply> --schema <S>
-  --file <synth> <connection flags> [--auto-approve for apply]`. pgpushy
-  **owns** `--schema` and `--file`; the user cannot set them (spec §8.3).
-  Stream pgschema stdout/stderr through (do **not** parse plan output — thin
-  wrapper). Write the synthesized doc to a `tempfile` (or a debuggable path
-  under a `--keep`/`--out` flag).
-- **`run.rs`** — `plan`: synth → precondition → for each schema in order, run
-  `pgschema plan`, present each. `apply`: synth → precondition → run full plan
-  pass (fail-fast) → for each schema in order, `pgschema apply`. Report which
-  schemas were applied on partial failure (spec §10.2 — apply is **not**
-  atomic across schemas; say so in output).
+### `conn.rs` — one resolution, forwarded (spec §6.3, §6.4)
+
+Fold CLI flags, `PG*` env, and `pgpushy.toml` into a single resolved parameter
+set, then produce two things from it: a libpq connection string for pgpushy's
+own driver, and an explicit flag list for pgschema. **pgschema must never
+resolve anything itself** — pass `--host --port --db --user --sslmode`
+explicitly and supply the password through the child's environment. Do not let
+ambient `PG*` reach the child unresolved.
+
+This is how spec §6.3's identity guarantee is delivered: not by comparing two
+resolutions afterwards, but by ensuring there is only one.
+
+### `inspect.rs` — one read-only round trip (spec §6)
+
+A single connection answering three questions:
+
+1. **Which managed schemas exist?** `SELECT nspname FROM pg_namespace` filtered
+   to the managed set; report *all* missing ones (spec §6.1).
+2. **What cross-schema FKs does the target hold?** Join `pg_constraint`
+   (`contype = 'f'`) to `pg_class`/`pg_namespace` on both sides, keeping rows
+   where the two namespaces differ and both are managed. Compare against the
+   desired state; a target FK absent from desired, whose removal the §7 order
+   cannot accommodate, is a hard error with the two-step remedy (spec §6.2).
+3. **What database is this?** `current_database()`, `inet_server_addr()`,
+   `inet_server_port()`, and `system_identifier` from `pg_control_system()`,
+   for the identity line in output (spec §6.3).
+
+Everything here is `SELECT`. Assert that in review: this module is the only
+direct target access, and spec §6 hangs the "pgpushy issues no DDL" guarantee
+on it.
+
+### `pgschema.rs`
+
+Build the argv: `pgschema <plan|apply> --schema <S> --file <synth>
+<connection flags> [--auto-approve]`. pgpushy owns `--schema`, `--file`, and
+`--auto-approve` (spec §8.3). Stream pgschema stdout/stderr through — do
+**not** parse plan output (thin wrapper). Write the synthesized doc to a
+`tempfile`, or to a debuggable path under `--out`.
+
+### `approve.rs` (spec §8.6)
+
+Full plan pass → present all schemas' plans as one unit with a change summary
+→ call out destructive changes and any schema reconciling to an empty desired
+state → state that apply is not atomic across schemas → prompt once. Decline
+touches nothing. `--auto-approve` skips the prompt; a non-TTY stdin without
+`--auto-approve` is a failure, not an implicit yes.
+
+### `run.rs`
+
+- `validate`: offline pipeline only, no connection. Report managed set, counts,
+  exclusions, apply order. Fail on any §4.3/§4.5/§7 condition.
+- `plan`: offline pipeline → inspect → per-schema `pgschema plan`. A cross-schema
+  cycle is reported but does **not** suppress the plans; exit non-zero.
+- `apply`: offline pipeline (cycle is fatal here) → inspect → plan pass →
+  approval → per-schema `pgschema apply` in order. **Stop at the first
+  failure**; report applied / failed / not-attempted, and say the applied ones
+  are not rolled back (spec §9).
 
 ---
 
 ## 9. Config & CLI
 
-- **`pgpushy.toml`** (TOML, project root, optional). Sections: project
-  structure (source root, default schema), `[pgschema]` provider (backend,
-  version, path), `[connection]` (host/port/db/user/sslmode, and `password`).
-  Precedence **CLI > `PG*`/env > file > default**; default schema `public`.
-- **Password warning** (spec §9): when the *effective* password is sourced from
+- **`pgpushy.toml`** (TOML, **current working directory only**, optional;
+  `--config <path>` for an explicit path — it is *not* searched for in parent
+  directories, spec §10). Sections: project structure (`source_root`,
+  `default_schema`, `exclude`), `managed_schemas`, `[pgschema]` provider
+  (backend, version, path), `[connection]` (host/port/db/user/sslmode, and
+  `password`). Precedence **CLI > `PG*`/env > file > default**; default schema
+  `public`.
+- **`managed_schemas`** (spec §4.4): when present it is authoritative — a
+  mentioned-but-unlisted schema is an error naming the file and line that
+  enlisted it; a listed-but-unmentioned schema is managed **and empty**, which
+  is destructive and must be called out in the plan presentation.
+- **`exclude`** (spec §4.1): globs via `globset`, matched against source-root-
+  relative paths, applied during discovery so excluded files are never parsed.
+  Report the excluded count per pattern.
+- **Password warning** (spec §10): when the *effective* password is sourced from
   the file (not overridden by `PGPASSWORD`/`--password`), emit a prominent
   `tracing::warn!` — "password read from pgpushy.toml, which is easily
   committed to version control; prefer PGPASSWORD or --password." Fires on
   actual use, not mere presence.
-- **CLI** (`clap` derive): `pgpushy plan`, `pgpushy apply`, plus global
-  connection flags (mirroring pgschema names), `--config`, `--source-root`,
-  `--default-schema`, `--pgschema-path`, `-v/--verbose`. `--auto-approve` for
-  apply. (Future: `pgpushy dump`, spec §13.)
+- **CLI** (`clap` derive): `pgpushy validate`, `pgpushy plan`, `pgpushy apply`,
+  plus global connection flags (mirroring pgschema names), `--config`,
+  `--source-root`, `--default-schema`, `--pgschema-path`, `-v/--verbose`.
+  `--out <path>` to keep the synthesized document. `--auto-approve` for apply.
+  (Future: `pgpushy dump`, spec §14.)
 
 ---
 
 ## 10. Testing strategy
 
-- **Unit (`pgpushy-core`)** — parse/classify, FK-lift, qualification, name
-  generation, graph ordering, cycle detection. **Snapshot the synthesized SQL
-  with `insta`** (golden files). Add a **determinism test**: synth twice →
-  byte-identical.
+- **Unit (`pgpushy-core`)** — parse/classify, allow-list rejection, schema
+  resolution, duplicate detection, unresolvable-referent detection, FK-lift,
+  qualification, category bucketing, graph ordering, cycle detection. Because
+  core takes `(path, contents)` pairs, every one of these is a string-literal
+  test. **Snapshot the synthesized SQL with `insta`** (golden files). Add a
+  **determinism test**: synth twice → byte-identical, and synth with the input
+  file list shuffled → byte-identical.
+- **CLI (`assert_cmd`)** — `pgpushy validate` end-to-end on fixture trees, with
+  no database anywhere. This covers most of the spec's diagnostics cheaply.
 - **Integration (`pgpushy/tests`)** — against a **real pgschema + Postgres**.
   Use `testcontainers` to spin `postgres:18`, and a pgschema binary resolved
   from `PGPUSHY_TEST_PGSCHEMA` (download in a `just` setup step, or run the
@@ -316,42 +419,65 @@ supported floor. Bump `MIN_PGSCHEMA` as CI tests newer releases.
   3. same-schema FK cycle → succeeds.
   4. multi-schema qualification: no misattribution across `--schema` runs.
   5. cross-schema non-cyclic → applies in dependency order, converges.
-  6. cross-schema cycle → rejected with a clear error.
-  7. absent target schema → precondition fails cleanly (lists the schema).
+  6. cross-schema cycle → `apply` and `validate` reject; `plan` shows plans and
+     exits non-zero.
+  7. absent target schema → inspection fails cleanly, naming every missing one.
   8. idempotence: second `apply` is a no-op / empty plans.
   9. BYO version check: below-floor pgschema → hard error; unparseable → warn.
+  10. **author-unnamed FK → empty re-plan** (spec §5.3, §11.1). Create a table
+      with an unnamed inline FK, apply, then plan again: must be empty. This is
+      the test that proves omitting the name matches Postgres's own naming.
+  11. **cross-schema FK removal** → detected before apply, with the two-step
+      message; neither schema is touched.
+  12. disallowed statement (a `CREATE VIEW`, an `INSERT`) → rejected with file
+      and line, no connection attempted.
 
 ---
 
 ## 11. Milestones (phased; each shippable)
 
-- **M0 — Skeleton & spike.** Workspace, justfile, CI, `LICENSE`. **Do the
-  pg_query round-trip spike (R1) first** — it de-risks everything.
-- **M1 — Single-schema `plan` (BYO).** discover → parse → FK-lift → qualify →
-  synth → BYO provider + version check → `pgschema plan --schema <default>`.
-  Covers fixtures 1–3, 9.
-- **M2 — Multi-schema + `apply`.** qualify-all, graph ordering, cycle
-  detection, precondition check, `apply` with fail-fast plan pass. Fixtures
-  4–8.
-- **M3 — `pgpushy.toml`.** config + precedence + password warning.
-- **M4 — UX polish.** error messages, output formatting, `--keep`/`--out`,
-  `--auto-approve` ergonomics, docs.
-- **M5 — Managed provider (0.x fast-follow, then default).** download/cache/
+- **M0 — Skeleton & spike.** Workspace, justfile, CI. **Do the pg_query
+  round-trip spike (R1) first** — it de-risks everything. R1 now also covers
+  the unnamed-FK naming question (§14).
+- **M1 — `pgpushy validate`.** discover → parse → allow-list → resolve →
+  duplicate/referent checks → graph → synth, plus the CLI. **No database and no
+  pgschema binary**, so it is fully testable in CI from day one and exercises
+  every line of `pgpushy-core`. Fixtures 12 and the offline half of 6.
+- **M2 — Single-schema `plan` (BYO).** BYO provider + version check, connection
+  resolution, target inspection, `pgschema plan --schema <default>`. Fixtures
+  1–3, 7, 9.
+- **M3 — Multi-schema + `apply`.** Graph ordering in anger, cross-schema FK
+  removal detection, plan pass + single approval, stop-at-first-failure
+  reporting. Fixtures 4–6, 8, 10, 11.
+- **M4 — `pgpushy.toml`.** config + precedence + `managed_schemas` + `exclude`
+  + password warning.
+- **M5 — UX polish.** error messages, plan presentation, `--out`, identity
+  line, docs.
+- **M6 — Managed provider (0.x fast-follow, then default).** download/cache/
   verify; SHA-256 table; make managed the default backend.
-- **Later (spec §13):** non-table objects (views/functions/types) via general
-  ordering or shadow-DB `pg_dump`; `pgpushy dump`; references into unmanaged
-  schemas via external plan DB; cross-schema-cycle support; schema-drop.
+- **Later (spec §14):** non-table objects via general ordering or shadow-DB
+  `pg_dump`; `pgpushy dump`; references into unmanaged schemas via external
+  plan DB; cross-schema-cycle and single-pass-removal support; schema-drop.
+
+Note M1 comes before any pgschema or Postgres dependency — a deliberate change
+from the v0.1 ordering. The offline pipeline is where all the spec's novel
+logic lives, and `validate` makes it shippable and testable on its own.
 
 ---
 
 ## 12. Output & error conventions
 
 - Human-first stderr via `tracing`; keep pgschema's own output visible
-  (passthrough). Non-zero exit on any failure; distinguish precondition/version
-  failures (pgpushy) from pgschema failures in the message.
-- On partial `apply` failure, clearly list applied vs unapplied schemas
-  (spec §10.2). Cross-schema cycle and missing-schema errors must name the
-  schemas involved.
+  (passthrough). Non-zero exit on any failure; distinguish pgpushy failures
+  (validation, inspection, version) from pgschema failures in the message.
+- Diagnostics name **file and line** for anything sourced from the tree
+  (spec §4.3, §4.5), and **name every instance**, not just the first — missing
+  schemas, duplicate objects, and disallowed statements are all reported as
+  complete lists.
+- On partial `apply` failure, list applied / failed / not-attempted schemas and
+  state that applied schemas are not rolled back (spec §9, §11.2).
+- Cross-schema cycle and removal errors must name the schemas *and* the foreign
+  keys involved.
 
 ---
 
@@ -361,38 +487,55 @@ supported floor. Bump `MIN_PGSCHEMA` as CI tests newer releases.
   every `--schema` run (verified misattribution). Qualify all, incl. `public`.
 - **Do not topologically sort tables** to fix ordering — FK-lift instead; sort
   can't express cycles, lift can.
+- **Do not name author-unnamed FK constraints.** A stable name is not enough;
+  it must be *Postgres's* name, or the plan churns forever. Emit no name.
+- **Do not put indexes or comments in the same category as tables.** They
+  depend on their table existing, and a `(schema, name)` sort will happily
+  place an index before it.
 - **`CREATE SCHEMA` in the synth file is for the plan DB only.** It never
   reaches the target; the target schema must pre-exist (v0.x precondition).
 - **External plan DB does not help absent target schemas** — current state is
   always read from the target.
 - **Managed-schema set must exclude public unless it has objects** — otherwise
   an empty desired `public` plans a **drop of everything** in the target's
-  public schema.
+  public schema. The same hazard is what makes a listed-but-unmentioned
+  `managed_schemas` entry destructive on purpose.
 - **pgschema apply is per-schema-transactional** — no cross-schema atomicity;
-  order schemas by cross-schema FKs; cross-schema cycles are unsupported.
+  order schemas by cross-schema FKs; cross-schema cycles are unsupported, and
+  cross-schema FK *removal* needs the reverse order (spec §6.2).
+- **Let pgschema resolve nothing.** Two independent connection resolutions is a
+  latent wrong-database bug; pass everything explicitly (spec §6.3).
 
 ---
 
 ## 14. Risks & open implementation questions
 
-- **R1 (highest) — pg_query deparse fidelity.** The whole synth approach
-  assumes parse→mutate→deparse round-trips real DDL. **Spike in M0.** Fallback:
-  text-slice unchanged statements, synthesize only mutated ones. Also confirm
-  the pg_query crate's bundled PG grammar covers the PG version/features in use
-  (PG18 seen in spikes; the crate may trail).
-- **R2 — Generated FK constraint names** must match nothing pgschema would name
-  differently, or plans churn. Verify our generated names produce empty
-  re-plans (idempotence) against pgschema's own naming. Mirror pg_dump's scheme
-  and test.
-- **R3 — Managed download integrity.** pgschema ships no checksums; we self-pin
+- **R1 (highest) — pg_query deparse fidelity, and unnamed-FK naming.** The
+  whole synth approach assumes parse→mutate→deparse round-trips real DDL.
+  **Spike in M0.** Fallback: text-slice unchanged statements, synthesize only
+  mutated ones. The same spike must confirm the second half of spec §5.3: that
+  an unnamed `ALTER TABLE … ADD FOREIGN KEY` yields the *same* constraint name
+  Postgres assigns to the inline form — including the collision-suffix case
+  where two constraints on a table would compete for one name. If they diverge,
+  §5.3 needs revisiting. Also confirm the pg_query crate's bundled PG grammar
+  covers the PG version in use (PG18 seen in spikes; the crate may trail).
+- **R2 — Managed download integrity.** pgschema ships no checksums; we self-pin
   SHA-256. Decide the update process when we bump the pinned version (recompute
   hashes for all four platforms). Consider verifying against GitHub's API
   digest too.
-- **R4 — `Other` statements ordering.** v0.x keeps source order for indexes/
-  comments/etc. Confirm none of Joe's real schemas rely on cross-file non-FK
-  ordering (spec §11.2); if they do, pull M-later general ordering forward.
-- **R5 — testcontainers vs. image wrapper** for pgschema in CI, and how to get
+- **R3 — Cross-schema FK removal detection precision.** Spec §6.2 must reject
+  the genuinely unorderable case without rejecting benign ones (e.g. an FK
+  removed while its referenced table survives, which applies fine in either
+  order). Getting this wrong in the strict direction blocks legitimate changes.
+  Model it explicitly: an error only when the removed FK's referenced *object*
+  is also being dropped, or the §7 order otherwise cannot satisfy both.
+- **R4 — testcontainers vs. image wrapper** for pgschema in CI, and how to get
   a pgschema binary into CI hermetically (download in `just setup`).
+
+*Resolved since v0.1:* generated FK constraint names (spec §5.3 now omits them,
+removing the churn risk entirely) and `Other`-statement ordering (spec §4.3 now
+rejects unmodelled statements; confirmed acceptable — the real source trees
+this targets contain only tables, indexes, comments and foreign keys).
 
 ---
 
@@ -436,7 +579,9 @@ authored under `~/workspace/pgspike-tests/` during design; reproduce them as
 CREATE TABLE orders (id int PRIMARY KEY, customer_id int NOT NULL REFERENCES customers(id));
 CREATE TABLE customers (id int PRIMARY KEY, name text NOT NULL);
 
--- FK-lifted form (pgschema plan == the correctly-ordered inline plan)
+-- FK-lifted form (pgschema plan == the correctly-ordered inline plan).
+-- Note: pgpushy emits the constraint UNNAMED (spec §5.3); the name below is
+-- what Postgres generates, shown for clarity.
 CREATE TABLE orders (id int PRIMARY KEY, customer_id int NOT NULL);
 CREATE TABLE customers (id int PRIMARY KEY, name text NOT NULL);
 ALTER TABLE orders ADD CONSTRAINT orders_customer_id_fkey
@@ -454,8 +599,13 @@ CREATE SCHEMA IF NOT EXISTS snowdrop;
 CREATE TABLE public.customers (id int PRIMARY KEY, name text NOT NULL);
 CREATE TABLE snowdrop.machine_ids (machine_id int PRIMARY KEY, hostname text NOT NULL);
 
--- Cross-schema cycle (UNSUPPORTED — pgpushy must detect & reject before apply):
+-- Cross-schema cycle (UNSUPPORTED — apply/validate reject; plan shows plans):
 --   public.customers → billing.accounts AND billing.accounts → public.customers
+
+-- Cross-schema FK removal (spec §6.2 — must be detected before apply):
+--   target holds public.orders → billing.accounts;
+--   source tree drops BOTH the FK and billing.accounts.
+--   Creation order (billing first) cannot apply this; needs public first.
 ```
 
 Verified outcomes are catalogued in §1; the memory file
