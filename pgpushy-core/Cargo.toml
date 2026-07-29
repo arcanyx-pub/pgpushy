@@ -1,0 +1,18 @@
+[package]
+name = "pgpushy-core"
+description = "Order-free desired-state synthesis for pgpushy: parse a tree of Postgres DDL, lift foreign keys, qualify every identifier, and emit a single deterministic document"
+readme = "../README.md"
+keywords = ["postgres", "schema", "migration", "declarative", "pgschema"]
+categories = ["database"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+pg_query = "6"
+thiserror = "2"
+
+[dev-dependencies]
+insta = "1"

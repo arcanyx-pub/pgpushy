@@ -1,0 +1,18 @@
+[package]
+name = "pgpushy"
+description = "Declarative Postgres schema management at the database level, powered by pgschema"
+readme = "../README.md"
+keywords = ["postgres", "schema", "migration", "declarative", "pgschema"]
+categories = ["database", "command-line-utilities"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+pgpushy-core = { version = "0.1.0", path = "../pgpushy-core" }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
