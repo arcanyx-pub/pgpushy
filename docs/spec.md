@@ -431,9 +431,12 @@ Before delegating, `plan` and `apply` MUST perform a single **read-only**
 inspection of the target over pgpushy's own connection (§6.4). `validate` MUST
 NOT connect at all.
 
-The inspection answers three questions (§6.1–§6.3). Any failure MUST abort
-before pgschema is invoked, naming everything that is wrong rather than only
-the first problem found (G5).
+The inspection gathers what §6.1–§6.3 need in one round trip. Two of those
+checks conclude immediately and MUST abort before pgschema is invoked at all;
+the third (§6.2) needs the plans, so it reads the target here and concludes
+after the plan pass — still before any change reaches the target. Every check
+MUST name everything that is wrong rather than only the first problem found
+(G5).
 
 A consequence of this section is that **pgpushy issues no DDL of its own to
 the target** in 0.x: schema *and* content changes all flow through pgschema
@@ -465,22 +468,43 @@ database** to make qualified references resolvable, never against the target.
 
 pgpushy processes schemas in the order §7 derives from the **desired** state:
 a referenced schema before the schema referencing it. That order is correct for
-*creating* a cross-schema foreign key and is the reverse of what *removing* one
-requires.
+*creating* a cross-schema foreign key and is the reverse of what *removing* the
+thing one points at requires.
 
-Concretely: `public.orders` has a foreign key to `billing.accounts`. Both the
-foreign key and `billing.accounts` are deleted from the source tree in one
-change. §7 orders `billing` first, whose apply issues `DROP TABLE accounts`
-while the target still holds `public.orders`' foreign key — and Postgres
-refuses. The order this change needs is `public` first.
+Which removals actually break was established empirically against pgschema
+1.12.0 and Postgres 18, and is narrower than it first appears, because
+pgschema does not generate every drop the same way:
 
-pgpushy MUST therefore read the target's current cross-schema foreign keys and
-compare them against the desired state. If any cross-schema foreign key present
-on the target is absent from the desired state, and the single §7 pass cannot
-satisfy both its removal and the rest of the change, pgpushy MUST fail before
-applying anything, naming the constraint, the two schemas, and the two-step
-resolution: remove the foreign key in one apply, then remove the referenced
-object in the next.
+| The referenced schema's plan drops | pgschema emits | Referenced-schema-first |
+|---|---|---|
+| the referenced **table** | `DROP TABLE … CASCADE` | **succeeds** — the CASCADE takes the dependent foreign key with it |
+| the referenced **column** | `ALTER TABLE … DROP COLUMN c` | **fails**: `cannot drop column … because other objects depend on it` |
+| the referenced **unique or primary key constraint** | `ALTER TABLE … DROP CONSTRAINT k` | **fails**: `cannot drop constraint … because other objects depend on it` |
+
+So dropping the whole table is safe in any order, and the hazard is precisely a
+plan that removes a *column* a cross-schema foreign key points at, or the
+unique constraint that foreign key depends on, while leaving the table in
+place. Applying the referencing schema first resolves it — the foreign key goes
+before the thing it depends on — which is exactly the order §7 does not
+produce.
+
+pgpushy MUST detect this and refuse before applying anything. Detection uses
+the plan pass §8.6 already performs, and needs no diffing of its own (G3): for
+each cross-schema foreign key the target holds, if the *referenced* schema's
+plan contains a drop of the column or the constraint that foreign key depends
+on, **and** the referencing schema is ordered after it, pgpushy MUST fail,
+naming the constraint, both schemas, the object being dropped, and the two-step
+resolution — remove the foreign key in one apply, then remove what it pointed
+at in the next.
+
+> **Non-normative.** Reordering the affected pair automatically is possible in
+> principle, but a run that both creates and removes cross-schema references
+> between the same two schemas has no single valid order at all, so refusing is
+> the honest general answer; §14 records reordering the unambiguous cases as
+> future work. Note also that the `DROP TABLE … CASCADE` above will remove
+> dependent objects pgpushy does not manage — a foreign key from an unmanaged
+> schema, for instance. That is pgschema's behavior and is no different without
+> pgpushy in front of it.
 
 ### 6.3 Target identity
 
@@ -643,16 +667,31 @@ is touched — not per schema as each apply begins.
 
 pgpushy MUST:
 
-1. run a full `plan` pass over every managed schema first;
+1. run a full `plan` pass over every managed schema first, **retaining each
+   plan** (pgschema writes one as JSON with `--output-json`);
 2. present those plans together as one reviewable unit, including a summary of
    how many schemas change, and MUST call out destructive changes and any
    schema being reconciled to an empty desired state (§4.4);
-3. state that apply is not atomic across schemas;
-4. prompt once, and abort without touching the target if the answer is no;
-5. on approval, invoke every `pgschema apply` with `--auto-approve`, so that
-   pgschema does not prompt again.
+3. perform the §6.2 check against those plans, and refuse if it finds a
+   cross-schema removal the apply order cannot satisfy;
+4. state that apply is not atomic across schemas;
+5. prompt once, and abort without touching the target if the answer is no;
+6. on approval, apply **the plans it just showed** — `pgschema apply --plan
+   <plan.json>` — rather than recomputing them from the desired state.
 
-`pgpushy apply --auto-approve` skips step 4 for non-interactive use. When
+Step 6 matters for more than efficiency: it makes the change that is applied
+the same one that was reviewed, closing the window in which the target could
+drift between the plan pass and the apply. pgschema fingerprints the state a
+plan was computed against and refuses a plan whose target has since changed
+(verified), so that window fails loudly rather than silently applying something
+nobody approved.
+
+A summary of "how many schemas change" and which changes are destructive is
+read from those plans — each step carries its own operation — and not derived
+by pgpushy comparing anything, which would be reimplementing the diffing G3
+reserves for pgschema.
+
+`pgpushy apply --auto-approve` skips step 5 for non-interactive use. When
 standard input is not a terminal and `--auto-approve` was not given, pgpushy
 MUST fail rather than proceed unapproved.
 
@@ -740,11 +779,12 @@ to be rare; the common deployment shares one schema across services.)*
 
 ### 12.2 Cross-schema foreign-key removal
 
-Removing a cross-schema foreign key and the object it references in a single
-change cannot be applied in one pass, because creation order and removal order
-are reverses of each other (§6.2). pgpushy detects this and directs the
-operator to a two-step apply. Automating it would require pgpushy to issue DDL
-directly to the target, which 0.x does not do (§6).
+Removing, in a single change, a cross-schema foreign key *and* the column or
+unique constraint it points at cannot be applied in one pass: creation order
+and removal order are reverses of each other (§6.2). pgpushy detects this and
+directs the operator to a two-step apply. Dropping the referenced **table** is
+not affected — pgschema drops tables with `CASCADE`, which takes the dependent
+foreign key with it.
 
 ### 12.3 Managed schemas must pre-exist; pgpushy issues no schema DDL
 
@@ -860,9 +900,12 @@ useful it is (§14).
   those, §5.4).
 - **`pgpushy dump`** — the inverse: read an existing database and emit a
   per-object source tree, to bootstrap adoption.
-- **Cross-schema FK cycle support** (§12.1) and **single-pass cross-schema FK
-  removal** (§12.2), both by managing the affected foreign keys directly
-  against the target around the pgschema runs.
+- **Cross-schema FK cycle support** (§12.1). **Single-pass cross-schema FK
+  removal** (§12.2) has a cheaper route than the cycle case: where a run only
+  *removes* references between a pair of schemas and adds none, the pair can
+  simply be applied in the reverse order, with no target DDL from pgpushy at
+  all. Refusing is only the general answer, for runs that both add and remove
+  between the same pair.
 - **Per-schema synthesis** trimmed to the cross-schema closure (§5.4), for
   databases where re-executing the full document per schema is too costly.
 - **Richer configuration** (§10): per-schema overrides, multiple environments.
@@ -891,10 +934,13 @@ made after draft 2 of v0.1.
   `apply` and `validate`; `plan` reports the cycle, still shows the plans, and
   exits non-zero, because the plans are what the operator needs to break the
   cycle. (§7, §12.1)
-- **[0.2] Cross-schema FK removal** — detected before apply by comparing the
-  target's current cross-schema foreign keys against the desired state, and
-  rejected with a two-step resolution, rather than failing mid-apply on a
-  Postgres dependency error. (§6.2, §12.2)
+- **[0.2] Cross-schema FK removal** — detected before apply and rejected with
+  a two-step resolution, rather than failing mid-apply on a Postgres dependency
+  error. Verified against pgschema 1.12.0: the hazard is *not* dropping the
+  referenced table, which pgschema does with `CASCADE`, but dropping the
+  referenced **column** or **unique constraint**, which it does without. The
+  check reads the drop steps of the plan pass rather than diffing anything.
+  (§6.2, §12.2)
 - **[0.2] Constraint naming** — author-unnamed foreign keys are emitted with
   **no name**, so Postgres generates the same name in the plan database that
   it generated on the target. pgpushy does not synthesize constraint names.
