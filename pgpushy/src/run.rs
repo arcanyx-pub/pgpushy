@@ -6,9 +6,9 @@
 //! pgschema.
 
 use crate::approve::{self, Decision};
-use crate::cli::{PgschemaArgs, SourceArgs};
-use crate::config::{self, Loaded, Settings};
-use crate::conn::{ConnectionArgs, Resolved};
+use crate::cli::{PgschemaArgs, TargetArgs};
+use crate::config::{Loaded, Settings};
+use crate::conn::Resolved;
 use crate::inspect::{self, Inspection};
 use crate::plan_file::Plan;
 use crate::provider::{PgschemaBin, PgschemaProvider, byo::Byo};
@@ -39,8 +39,8 @@ impl Outcome {
 }
 
 /// `pgpushy validate` — the offline pipeline, and nothing else.
-pub fn validate(source: &SourceArgs, loaded: &Loaded, out: Option<&Path>) -> Result<Outcome> {
-    let settings = Settings::resolve(source, loaded);
+pub fn validate(loaded: &Loaded, out: Option<&Path>) -> Result<Outcome> {
+    let settings = loaded.settings();
     let Some(analysis) = analyze_source(&settings, loaded)? else {
         return Ok(Outcome::Failed);
     };
@@ -68,13 +68,12 @@ pub fn validate(source: &SourceArgs, loaded: &Loaded, out: Option<&Path>) -> Res
 
 /// `pgpushy plan` — the offline pipeline, then one pgschema plan per schema.
 pub fn plan(
-    source: &SourceArgs,
-    connection: &ConnectionArgs,
+    target: &TargetArgs,
     pgschema_args: &PgschemaArgs,
     loaded: &Loaded,
     out: Option<&Path>,
 ) -> Result<Outcome> {
-    let Some(session) = Session::open(source, connection, pgschema_args, loaded, out)? else {
+    let Some(session) = Session::open(target, pgschema_args, loaded, out)? else {
         return Ok(Outcome::Failed);
     };
 
@@ -107,14 +106,13 @@ pub fn plan(
 
 /// `pgpushy apply` — plan, review, approve, then apply the reviewed plans.
 pub fn apply(
-    source: &SourceArgs,
-    connection: &ConnectionArgs,
+    target: &TargetArgs,
     pgschema_args: &PgschemaArgs,
     loaded: &Loaded,
     out: Option<&Path>,
     auto_approve: bool,
 ) -> Result<Outcome> {
-    let Some(session) = Session::open(source, connection, pgschema_args, loaded, out)? else {
+    let Some(session) = Session::open(target, pgschema_args, loaded, out)? else {
         return Ok(Outcome::Failed);
     };
 
@@ -172,30 +170,33 @@ impl Session {
     /// delegating. `None` means the problem has already been reported and the
     /// command should fail.
     fn open(
-        source: &SourceArgs,
-        connection: &ConnectionArgs,
+        target: &TargetArgs,
         pgschema_args: &PgschemaArgs,
         loaded: &Loaded,
         out: Option<&Path>,
     ) -> Result<Option<Self>> {
-        let settings = Settings::resolve(source, loaded);
+        // The target is resolved before anything else runs: naming a database
+        // that does not exist in the configuration should fail immediately,
+        // not after a source tree has been parsed and synthesized.
+        let connection = Resolved::from(&loaded.environment(&target.env)?)?;
+
+        let settings = loaded.settings();
         let Some(analysis) = analyze_source(&settings, loaded)? else {
             return Ok(None);
         };
         report::summary(&settings, &analysis);
 
         let binary = Byo {
-            explicit: config::pgschema_path(pgschema_args, loaded),
+            explicit: loaded.pgschema_path(pgschema_args.pgschema_path.as_deref()),
         }
         .resolve()?;
         report::pgschema(&binary);
 
-        let connection = Resolved::from(connection, &loaded.file.connection)?;
-        // Spec §10: the warning fires on use, not on presence, and this is the
-        // moment the password is about to be used.
+        // Spec §10.2: the warning fires on use, not on presence, and this is
+        // the moment the password is about to be used.
         report::password_from_file(&connection, loaded);
         let inspection = inspect::inspect(&connection, &analysis.managed_schemas)?;
-        report::target(&inspection.identity);
+        report::target(&connection, &inspection.identity);
 
         if !inspection.missing_schemas.is_empty() {
             report::missing_schemas(&inspection.missing_schemas);

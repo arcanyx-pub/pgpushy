@@ -191,8 +191,11 @@ pub fn pgschema(binary: &PgschemaBin) {
 }
 
 /// Which database pgpushy actually reached (spec §6.3).
-pub fn target(identity: &Identity) {
-    println!("  target {identity}");
+pub fn target(connection: &Resolved, identity: &Identity) {
+    // The environment name as well as the database: "prod" and "the database
+    // called myapp" are different facts, and a mismatch between them is
+    // exactly what an operator wants to catch before approving anything.
+    println!("  env {}: {identity}", connection.env);
 }
 
 /// Spec §6.1: every managed schema must already exist, and the operator needs
@@ -368,9 +371,7 @@ pub fn partial_apply(applied: &[SchemaName], failed: &SchemaName, unattempted: &
 /// running from a subdirectory silently picks up nothing, and saying so is
 /// cheaper than explaining it later.
 pub fn configuration(loaded: &Loaded) {
-    if let Some(path) = &loaded.path {
-        println!("  config: {}", path.display());
-    }
+    println!("  config: {}", loaded.path.display());
 }
 
 /// Spec §10: a password read from a file that is easily committed.
@@ -383,11 +384,7 @@ pub fn password_from_file(connection: &Resolved, loaded: &Loaded) {
     if connection.password_source != PasswordSource::File {
         return;
     }
-    let path = loaded
-        .path
-        .as_ref()
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| "pgpushy.toml".to_owned());
+    let path = loaded.path.display();
 
     eprintln!();
     eprintln!("  \u{26a0} PASSWORD READ FROM {path}");

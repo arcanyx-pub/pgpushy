@@ -37,27 +37,18 @@ fn main() -> std::process::ExitCode {
     };
 
     let result = match &cli.command {
-        Command::Validate { source, out } => run::validate(source, &loaded, out.as_deref()),
+        Command::Validate { out } => run::validate(&loaded, out.as_deref()),
         Command::Plan {
-            source,
-            connection,
+            target,
             pgschema,
             out,
-        } => run::plan(source, connection, pgschema, &loaded, out.as_deref()),
+        } => run::plan(target, pgschema, &loaded, out.as_deref()),
         Command::Apply {
-            source,
-            connection,
+            target,
             pgschema,
             out,
             auto_approve,
-        } => run::apply(
-            source,
-            connection,
-            pgschema,
-            &loaded,
-            out.as_deref(),
-            *auto_approve,
-        ),
+        } => run::apply(target, pgschema, &loaded, out.as_deref(), *auto_approve),
     };
 
     match result {

@@ -1,4 +1,4 @@
-//! `pgpushy plan` against a real pgschema and a real Postgres.
+//! `pgpushy plan` and `apply` against a real pgschema and a real Postgres.
 //!
 //! These need two things, and **skip rather than fail** when either is absent,
 //! mirroring how `snowdrop-id-rs` gates its Postgres tests:
@@ -10,8 +10,8 @@
 //! Each test works in its own uniquely-named schema and drops it afterwards,
 //! so they neither collide with each other nor touch `public`.
 //!
-//! The version-floor tests need neither, because the provider resolves before
-//! anything connects — so they use a stub script and always run.
+//! The version-floor and password tests need neither, because they fail before
+//! anything connects — so they use a stub pgschema and always run.
 
 use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;
@@ -108,39 +108,48 @@ impl Target {
         postgres::Client::connect(&conninfo, postgres::NoTls).expect("connect to the test target")
     }
 
-    /// A `pgpushy validate` invocation. Takes no connection flags — the whole
-    /// point of the command is that it connects to nothing.
-    fn validate(&self, root: &Path) -> Command {
-        let mut cmd = Command::cargo_bin("pgpushy").expect("binary builds");
-        cmd.arg("validate").arg("--source-root").arg(root);
-        cmd
-    }
-
-    /// A `pgpushy` invocation wired to this target.
-    fn pgpushy(&self, subcommand: &str, root: &Path) -> Command {
+    /// A project wired to this target, with `[env.test]` pointing at it.
+    ///
+    /// `extra` is prepended to the generated configuration, for tests that need
+    /// `default_schema`, `exclude`, and so on.
+    fn project(&self, extra: &str, files: &[(&str, String)]) -> Project {
         let parts = parse(&self.url);
-        let mut cmd = Command::cargo_bin("pgpushy").expect("binary builds");
-        cmd.arg(subcommand)
-            .arg("--source-root")
-            .arg(root)
-            .arg("--pgschema-path")
-            .arg(&self.pgschema)
-            .args(["--host", &parts.host])
-            .args(["--port", &parts.port])
-            .args(["--db", &parts.dbname])
-            .args(["--user", &parts.user])
-            .args(["--sslmode", "disable"]);
-        if let Some(password) = &parts.password {
-            cmd.env("PGPASSWORD", password);
+        let dir = TempDir::new().expect("temp dir");
+
+        let config = format!(
+            "{extra}\n\
+             [pgschema]\n\
+             path = \"{}\"\n\
+             \n\
+             [env.test]\n\
+             host = \"{}\"\n\
+             port = {}\n\
+             db = \"{}\"\n\
+             user = \"{}\"\n\
+             sslmode = \"disable\"\n",
+            self.pgschema.display(),
+            parts.host,
+            parts.port,
+            parts.dbname,
+            parts.user,
+        );
+        std::fs::write(dir.path().join("pgpushy.toml"), config).expect("write config");
+
+        for (path, contents) in files {
+            write(&dir, path, contents);
         }
-        cmd
+
+        Project {
+            dir,
+            password: parts.password,
+        }
     }
 
     /// Apply the desired state with pgschema directly.
     ///
-    /// `pgpushy apply` does not exist yet, but idempotence cannot be tested
-    /// without getting the target into the reconciled state somehow.
-    fn apply(&self, document: &Path, schemas: &[&str]) {
+    /// Used only where a test needs the target in a known state without going
+    /// through the code under test.
+    fn apply_directly(&self, document: &Path, schemas: &[&str]) {
         let parts = parse(&self.url);
         for schema in schemas {
             let mut cmd = std::process::Command::new(&self.pgschema);
@@ -163,10 +172,44 @@ impl Target {
     }
 }
 
+/// A configured project directory.
+struct Project {
+    dir: TempDir,
+    password: Option<String>,
+}
+
+impl Project {
+    fn command(&self, subcommand: &str) -> Command {
+        let mut cmd = Command::cargo_bin("pgpushy").expect("binary builds");
+        cmd.arg(subcommand)
+            .arg("--config")
+            .arg(self.dir.path().join("pgpushy.toml"));
+        if subcommand != "validate" {
+            cmd.args(["--env", "test"]);
+        }
+        // The secret comes from the environment, so the generated config has
+        // none — and no test trips the file-password warning by accident.
+        if let Some(password) = &self.password {
+            cmd.env("PGPASSWORD", password);
+        }
+        cmd
+    }
+
+    fn write(&self, path: &str, contents: &str) {
+        write(&self.dir, path, contents);
+    }
+}
+
+fn write(dir: &TempDir, path: &str, contents: &str) {
+    let full = dir.path().join(path);
+    if let Some(parent) = full.parent() {
+        std::fs::create_dir_all(parent).expect("create dirs");
+    }
+    std::fs::write(&full, contents).expect("write file");
+}
+
 /// A schema name unique to this test, so tests never collide.
 fn unique_schema(label: &str) -> String {
-    // Test names are unique within the binary, and the process id separates
-    // concurrent runs against a shared database.
     format!("pgpushy_t_{label}_{}", std::process::id())
 }
 
@@ -202,17 +245,9 @@ impl Drop for Schemas<'_> {
     }
 }
 
-fn tree(files: &[(&str, String)]) -> TempDir {
-    let dir = TempDir::new().expect("temp dir");
-    for (path, contents) in files {
-        let full = dir.path().join(path);
-        if let Some(parent) = full.parent() {
-            std::fs::create_dir_all(parent).expect("create dirs");
-        }
-        std::fs::write(&full, contents).expect("write file");
-    }
-    dir
-}
+const ORDERS_UNORDERED: &str =
+    "CREATE TABLE orders (id int PRIMARY KEY, customer_id int REFERENCES customers(id));";
+const CUSTOMERS: &str = "CREATE TABLE customers (id int PRIMARY KEY);";
 
 // ---------------------------------------------------------------------------
 // Plan
@@ -226,28 +261,26 @@ fn plans_an_unordered_unqualified_tree() {
     let schema = unique_schema("plan");
     let _schemas = Schemas::create(&target, std::slice::from_ref(&schema));
 
-    let dir = tree(&[
-        // The child is defined before the parent, and in a file that sorts
-        // first — raw pgschema cannot build desired state from this.
-        (
-            "a_orders.sql",
-            "CREATE TABLE orders (id int PRIMARY KEY, customer_id int REFERENCES customers(id));"
-                .to_owned(),
-        ),
-        (
-            "z_customers.sql",
-            "CREATE TABLE customers (id int PRIMARY KEY);".to_owned(),
-        ),
-    ]);
+    let project = target.project(
+        &format!("default_schema = \"{schema}\""),
+        &[
+            // The child is defined before the parent, and in a file that sorts
+            // first — raw pgschema cannot build desired state from this.
+            ("a_orders.sql", ORDERS_UNORDERED.to_owned()),
+            ("z_customers.sql", CUSTOMERS.to_owned()),
+        ],
+    );
 
-    target
-        .pgpushy("plan", dir.path())
-        .args(["--default-schema", &schema])
+    project
+        .command("plan")
         .assert()
         .success()
         .stdout(predicates::str::contains("2 to add"))
         .stdout(predicates::str::contains("customers"))
-        .stdout(predicates::str::contains("orders"));
+        .stdout(predicates::str::contains("orders"))
+        // The environment is named in the output, so a mismatch between "which
+        // env" and "which database" is visible before anything is approved.
+        .stdout(predicates::str::contains("env test:"));
 }
 
 /// Spec §11.1, and the real proof of the §5.3 naming decision: after applying,
@@ -259,33 +292,35 @@ fn an_applied_tree_replans_empty() {
     let schema = unique_schema("idem");
     let _schemas = Schemas::create(&target, std::slice::from_ref(&schema));
 
-    let dir = tree(&[(
-        "schema.sql",
-        "CREATE TABLE customers (id int PRIMARY KEY, name text NOT NULL);
-         CREATE TABLE orders (
-             id int PRIMARY KEY,
-             customer_id int NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
-             total numeric CHECK (total >= 0)
-         );
-         CREATE INDEX orders_customer_idx ON orders (customer_id);
-         COMMENT ON TABLE orders IS 'one row per purchase';"
-            .to_owned(),
-    )]);
+    let project = target.project(
+        &format!("default_schema = \"{schema}\""),
+        &[(
+            "schema.sql",
+            "CREATE TABLE customers (id int PRIMARY KEY, name text NOT NULL);
+             CREATE TABLE orders (
+                 id int PRIMARY KEY,
+                 customer_id int NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+                 total numeric CHECK (total >= 0)
+             );
+             CREATE INDEX orders_customer_idx ON orders (customer_id);
+             COMMENT ON TABLE orders IS 'one row per purchase';"
+                .to_owned(),
+        )],
+    );
 
-    let document = dir.path().join("desired.sql");
-    target
-        .validate(dir.path())
-        .args(["--default-schema", &schema])
+    let outputs = TempDir::new().expect("temp dir");
+    let document = outputs.path().join("desired.sql");
+    project
+        .command("validate")
         .arg("--out")
         .arg(&document)
         .assert()
         .success();
 
-    target.apply(&document, &[&schema]);
+    target.apply_directly(&document, &[&schema]);
 
-    target
-        .pgpushy("plan", dir.path())
-        .args(["--default-schema", &schema])
+    project
+        .command("plan")
         .assert()
         .success()
         .stdout(predicates::str::contains("No changes detected"));
@@ -315,20 +350,22 @@ fn orders_schemas_by_their_cross_schema_foreign_keys() {
     let downstream = unique_schema("down");
     let _schemas = Schemas::create(&target, &[upstream.clone(), downstream.clone()]);
 
-    let dir = tree(&[(
-        "schema.sql",
-        format!(
-            "CREATE TABLE {upstream}.customers (id int PRIMARY KEY);
-             CREATE TABLE {downstream}.invoices (
-                 id int PRIMARY KEY,
-                 customer_id int REFERENCES {upstream}.customers(id)
-             );"
-        ),
-    )]);
+    let project = target.project(
+        &format!("default_schema = \"{upstream}\""),
+        &[(
+            "schema.sql",
+            format!(
+                "CREATE TABLE {upstream}.customers (id int PRIMARY KEY);
+                 CREATE TABLE {downstream}.invoices (
+                     id int PRIMARY KEY,
+                     customer_id int REFERENCES {upstream}.customers(id)
+                 );"
+            ),
+        )],
+    );
 
-    let output = target
-        .pgpushy("plan", dir.path())
-        .args(["--default-schema", &upstream])
+    let output = project
+        .command("plan")
         .assert()
         .success()
         .get_output()
@@ -355,13 +392,16 @@ fn a_missing_schema_fails_before_delegating() {
     let target = require_target!();
     let absent = unique_schema("absent");
 
-    let dir = tree(&[(
-        "schema.sql",
-        format!("CREATE TABLE {absent}.customers (id int PRIMARY KEY);"),
-    )]);
+    let project = target.project(
+        "",
+        &[(
+            "schema.sql",
+            format!("CREATE TABLE {absent}.customers (id int PRIMARY KEY);"),
+        )],
+    );
 
-    target
-        .pgpushy("plan", dir.path())
+    project
+        .command("plan")
         .assert()
         .failure()
         .stderr(predicates::str::contains("missing from the target"))
@@ -369,101 +409,6 @@ fn a_missing_schema_fails_before_delegating() {
         .stderr(predicates::str::contains(format!(
             "CREATE SCHEMA {absent};"
         )));
-}
-
-// ---------------------------------------------------------------------------
-// The pgschema version floor (spec §8.5, §13)
-// ---------------------------------------------------------------------------
-//
-// No database and no real pgschema needed: the provider resolves before
-// anything connects, so a stub that prints a version line is enough.
-
-#[cfg(unix)]
-fn stub_pgschema(dir: &TempDir, help: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-
-    let path = dir.path().join("pgschema-stub");
-    std::fs::write(&path, format!("#!/bin/sh\ncat <<'EOF'\n{help}\nEOF\n")).expect("write stub");
-    let mut permissions = std::fs::metadata(&path).expect("stat stub").permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&path, permissions).expect("chmod stub");
-    path
-}
-
-#[cfg(unix)]
-#[test]
-fn a_below_floor_pgschema_is_a_hard_error() {
-    let dir = tree(&[(
-        "schema.sql",
-        "CREATE TABLE t (id int PRIMARY KEY);".to_owned(),
-    )]);
-    let stub = stub_pgschema(&dir, "Version: 1.4.2@abc linux/amd64 2025-11-14 00:00:00");
-
-    Command::cargo_bin("pgpushy")
-        .expect("binary builds")
-        .arg("plan")
-        .arg("--source-root")
-        .arg(dir.path())
-        .arg("--pgschema-path")
-        .arg(&stub)
-        .assert()
-        .failure()
-        .stderr(predicates::str::contains("1.4.2"))
-        .stderr(predicates::str::contains("below the minimum 1.12.0"));
-}
-
-/// Spec §8.5: the `Version:` line is a human-readable string, not a stability
-/// contract, so an unreadable one warns rather than refusing to run.
-#[cfg(unix)]
-#[test]
-fn an_unreadable_version_warns_and_proceeds() {
-    let dir = tree(&[(
-        "schema.sql",
-        "CREATE TABLE t (id int PRIMARY KEY);".to_owned(),
-    )]);
-    let stub = stub_pgschema(&dir, "pgschema, the schema tool\n(no version line here)");
-
-    // It gets past the version check and fails later, at the connection —
-    // which is the point: the version did not stop it.
-    let assert = Command::cargo_bin("pgpushy")
-        .expect("binary builds")
-        .arg("plan")
-        .arg("--source-root")
-        .arg(dir.path())
-        .arg("--pgschema-path")
-        .arg(&stub)
-        .args([
-            "--host",
-            "127.0.0.1",
-            "--port",
-            "1",
-            "--db",
-            "nope",
-            "--user",
-            "nope",
-        ])
-        .assert()
-        .failure();
-
-    assert.stderr(predicates::str::contains("could not read a version"));
-}
-
-#[test]
-fn a_missing_pgschema_says_how_to_get_one() {
-    let dir = tree(&[(
-        "schema.sql",
-        "CREATE TABLE t (id int PRIMARY KEY);".to_owned(),
-    )]);
-
-    Command::cargo_bin("pgpushy")
-        .expect("binary builds")
-        .arg("plan")
-        .arg("--source-root")
-        .arg(dir.path())
-        .args(["--pgschema-path", "/nonexistent/pgschema"])
-        .assert()
-        .failure()
-        .stderr(predicates::str::contains("no pgschema binary at"));
 }
 
 // ---------------------------------------------------------------------------
@@ -478,32 +423,29 @@ fn applies_and_then_converges() {
     let schema = unique_schema("apply");
     let _schemas = Schemas::create(&target, std::slice::from_ref(&schema));
 
-    let dir = tree(&[
-        ("b_orders.sql", ORDERS_UNORDERED.to_owned()),
-        (
-            "a_customers.sql",
-            "CREATE TABLE customers (id int PRIMARY KEY);".to_owned(),
-        ),
-    ]);
+    let project = target.project(
+        &format!("default_schema = \"{schema}\""),
+        &[
+            ("b_orders.sql", ORDERS_UNORDERED.to_owned()),
+            ("a_customers.sql", CUSTOMERS.to_owned()),
+        ],
+    );
 
-    target
-        .pgpushy("apply", dir.path())
-        .args(["--default-schema", &schema, "--auto-approve"])
+    project
+        .command("apply")
+        .arg("--auto-approve")
         .assert()
         .success()
         .stdout(predicates::str::contains("2 changes"))
         .stdout(predicates::str::contains("Applied 1 schema"));
 
-    target
-        .pgpushy("apply", dir.path())
-        .args(["--default-schema", &schema, "--auto-approve"])
+    project
+        .command("apply")
+        .arg("--auto-approve")
         .assert()
         .success()
         .stdout(predicates::str::contains("Nothing to apply"));
 }
-
-const ORDERS_UNORDERED: &str =
-    "CREATE TABLE orders (id int PRIMARY KEY, customer_id int REFERENCES customers(id));";
 
 /// Spec §8.6: approval is required, and a run that cannot ask must not assume
 /// the answer is yes. Test processes never have a terminal, so this is exactly
@@ -514,11 +456,13 @@ fn refuses_to_apply_unattended_without_auto_approve() {
     let schema = unique_schema("noapprove");
     let _schemas = Schemas::create(&target, std::slice::from_ref(&schema));
 
-    let dir = tree(&[("t.sql", "CREATE TABLE t (id int PRIMARY KEY);".to_owned())]);
+    let project = target.project(
+        &format!("default_schema = \"{schema}\""),
+        &[("t.sql", "CREATE TABLE t (id int PRIMARY KEY);".to_owned())],
+    );
 
-    target
-        .pgpushy("apply", dir.path())
-        .args(["--default-schema", &schema])
+    project
+        .command("apply")
         .assert()
         .failure()
         .stderr(predicates::str::contains(
@@ -526,7 +470,6 @@ fn refuses_to_apply_unattended_without_auto_approve() {
         ))
         .stderr(predicates::str::contains("--auto-approve"));
 
-    // And nothing was applied.
     let tables: i64 = target
         .client()
         .query_one(
@@ -550,25 +493,24 @@ fn names_each_destructive_change_before_asking() {
     let schema = unique_schema("destr");
     let _schemas = Schemas::create(&target, std::slice::from_ref(&schema));
 
-    let dir = tree(&[(
-        "t.sql",
-        "CREATE TABLE t (id int PRIMARY KEY, doomed text);".to_owned(),
-    )]);
-    target
-        .pgpushy("apply", dir.path())
-        .args(["--default-schema", &schema, "--auto-approve"])
+    let project = target.project(
+        &format!("default_schema = \"{schema}\""),
+        &[(
+            "t.sql",
+            "CREATE TABLE t (id int PRIMARY KEY, doomed text);".to_owned(),
+        )],
+    );
+    project
+        .command("apply")
+        .arg("--auto-approve")
         .assert()
         .success();
 
-    std::fs::write(
-        dir.path().join("t.sql"),
-        "CREATE TABLE t (id int PRIMARY KEY);",
-    )
-    .expect("rewrite");
+    project.write("t.sql", "CREATE TABLE t (id int PRIMARY KEY);");
 
-    target
-        .pgpushy("apply", dir.path())
-        .args(["--default-schema", &schema, "--auto-approve"])
+    project
+        .command("apply")
+        .arg("--auto-approve")
         .assert()
         .success()
         .stdout(predicates::str::contains("1 destructive"))
@@ -591,43 +533,44 @@ fn refuses_a_cross_schema_removal_the_order_cannot_satisfy() {
     let referencing = format!("pgpushy_t_zz_down_{id}");
     let _schemas = Schemas::create(&target, &[referenced.clone(), referencing.clone()]);
 
-    let dir = tree(&[
-        (
-            "a.sql",
-            format!(
-                "CREATE TABLE {referenced}.parent \
-                 (id int PRIMARY KEY, alt int, CONSTRAINT parent_alt_key UNIQUE (alt));"
+    let project = target.project(
+        "",
+        &[
+            (
+                "a.sql",
+                format!(
+                    "CREATE TABLE {referenced}.parent \
+                     (id int PRIMARY KEY, alt int, CONSTRAINT parent_alt_key UNIQUE (alt));"
+                ),
             ),
-        ),
-        (
-            "z.sql",
-            format!(
-                "CREATE TABLE {referencing}.child (id int PRIMARY KEY, alt_ref int);
-                 ALTER TABLE {referencing}.child ADD CONSTRAINT child_parent_fk
-                     FOREIGN KEY (alt_ref) REFERENCES {referenced}.parent (alt);"
+            (
+                "z.sql",
+                format!(
+                    "CREATE TABLE {referencing}.child (id int PRIMARY KEY, alt_ref int);
+                     ALTER TABLE {referencing}.child ADD CONSTRAINT child_parent_fk
+                         FOREIGN KEY (alt_ref) REFERENCES {referenced}.parent (alt);"
+                ),
             ),
-        ),
-    ]);
-    target
-        .pgpushy("apply", dir.path())
+        ],
+    );
+    project
+        .command("apply")
         .arg("--auto-approve")
         .assert()
         .success();
 
     // Now remove both the foreign key and the column it depends on.
-    std::fs::write(
-        dir.path().join("a.sql"),
-        format!("CREATE TABLE {referenced}.parent (id int PRIMARY KEY);"),
-    )
-    .expect("rewrite");
-    std::fs::write(
-        dir.path().join("z.sql"),
-        format!("CREATE TABLE {referencing}.child (id int PRIMARY KEY, alt_ref int);"),
-    )
-    .expect("rewrite");
+    project.write(
+        "a.sql",
+        &format!("CREATE TABLE {referenced}.parent (id int PRIMARY KEY);"),
+    );
+    project.write(
+        "z.sql",
+        &format!("CREATE TABLE {referencing}.child (id int PRIMARY KEY, alt_ref int);"),
+    );
 
-    target
-        .pgpushy("apply", dir.path())
+    project
+        .command("apply")
         .arg("--auto-approve")
         .assert()
         .failure()
@@ -636,9 +579,9 @@ fn refuses_a_cross_schema_removal_the_order_cannot_satisfy() {
         .stderr(predicates::str::contains("apply this in two steps"))
         .stderr(predicates::str::contains("no schemas were applied"));
 
-    // Refused means refused: the foreign key is still there. Scoped to this
-    // test's own schema — constraint names are per-table, so an unscoped count
-    // would also see the identically-named constraint another test created.
+    // Refused means refused. Scoped to this test's own schema — constraint
+    // names are per-table, so an unscoped count would also see the
+    // identically-named constraint another test created.
     let remaining: i64 = target
         .client()
         .query_one(
@@ -662,53 +605,56 @@ fn the_two_step_remedy_converges() {
     let referencing = format!("pgpushy_t_zz_down2_{id}");
     let _schemas = Schemas::create(&target, &[referenced.clone(), referencing.clone()]);
 
-    let with_column = format!(
-        "CREATE TABLE {referenced}.parent \
-         (id int PRIMARY KEY, alt int, CONSTRAINT parent_alt_key UNIQUE (alt));"
-    );
-    let dir = tree(&[
-        ("a.sql", with_column.clone()),
-        (
-            "z.sql",
-            format!(
-                "CREATE TABLE {referencing}.child (id int PRIMARY KEY, alt_ref int);
-                 ALTER TABLE {referencing}.child ADD CONSTRAINT child_parent_fk
-                     FOREIGN KEY (alt_ref) REFERENCES {referenced}.parent (alt);"
+    let project = target.project(
+        "",
+        &[
+            (
+                "a.sql",
+                format!(
+                    "CREATE TABLE {referenced}.parent \
+                     (id int PRIMARY KEY, alt int, CONSTRAINT parent_alt_key UNIQUE (alt));"
+                ),
             ),
-        ),
-    ]);
-    target
-        .pgpushy("apply", dir.path())
+            (
+                "z.sql",
+                format!(
+                    "CREATE TABLE {referencing}.child (id int PRIMARY KEY, alt_ref int);
+                     ALTER TABLE {referencing}.child ADD CONSTRAINT child_parent_fk
+                         FOREIGN KEY (alt_ref) REFERENCES {referenced}.parent (alt);"
+                ),
+            ),
+        ],
+    );
+    project
+        .command("apply")
         .arg("--auto-approve")
         .assert()
         .success();
 
     // Step 1: remove only the foreign key, keeping the column.
-    std::fs::write(
-        dir.path().join("z.sql"),
-        format!("CREATE TABLE {referencing}.child (id int PRIMARY KEY, alt_ref int);"),
-    )
-    .expect("rewrite");
-    target
-        .pgpushy("apply", dir.path())
+    project.write(
+        "z.sql",
+        &format!("CREATE TABLE {referencing}.child (id int PRIMARY KEY, alt_ref int);"),
+    );
+    project
+        .command("apply")
         .arg("--auto-approve")
         .assert()
         .success();
 
     // Step 2: now the column can go.
-    std::fs::write(
-        dir.path().join("a.sql"),
-        format!("CREATE TABLE {referenced}.parent (id int PRIMARY KEY);"),
-    )
-    .expect("rewrite");
-    target
-        .pgpushy("apply", dir.path())
+    project.write(
+        "a.sql",
+        &format!("CREATE TABLE {referenced}.parent (id int PRIMARY KEY);"),
+    );
+    project
+        .command("apply")
         .arg("--auto-approve")
         .assert()
         .success();
 
-    target
-        .pgpushy("apply", dir.path())
+    project
+        .command("apply")
         .arg("--auto-approve")
         .assert()
         .success()
@@ -725,16 +671,19 @@ fn a_cycle_blocks_apply_entirely() {
     let two = format!("pgpushy_t_cyc2_{id}");
     let _schemas = Schemas::create(&target, &[one.clone(), two.clone()]);
 
-    let dir = tree(&[(
-        "cycle.sql",
-        format!(
-            "CREATE TABLE {one}.a (id int PRIMARY KEY, r int REFERENCES {two}.b(id));
-             CREATE TABLE {two}.b (id int PRIMARY KEY, r int REFERENCES {one}.a(id));"
-        ),
-    )]);
+    let project = target.project(
+        "",
+        &[(
+            "cycle.sql",
+            format!(
+                "CREATE TABLE {one}.a (id int PRIMARY KEY, r int REFERENCES {two}.b(id));
+                 CREATE TABLE {two}.b (id int PRIMARY KEY, r int REFERENCES {one}.a(id));"
+            ),
+        )],
+    );
 
-    target
-        .pgpushy("apply", dir.path())
+    project
+        .command("apply")
         .arg("--auto-approve")
         .assert()
         .failure()
@@ -753,18 +702,21 @@ fn a_partial_failure_reports_what_landed() {
     let bad = format!("pgpushy_t_p2bad_{id}");
     let _schemas = Schemas::create(&target, &[good.clone(), bad.clone()]);
 
-    let dir = tree(&[
-        (
-            "good.sql",
-            format!("CREATE TABLE {good}.t (id int PRIMARY KEY);"),
-        ),
-        (
-            "bad.sql",
-            format!("CREATE TABLE {bad}.t (id int PRIMARY KEY, amount int);"),
-        ),
-    ]);
-    target
-        .pgpushy("apply", dir.path())
+    let project = target.project(
+        "",
+        &[
+            (
+                "good.sql",
+                format!("CREATE TABLE {good}.t (id int PRIMARY KEY);"),
+            ),
+            (
+                "bad.sql",
+                format!("CREATE TABLE {bad}.t (id int PRIMARY KEY, amount int);"),
+            ),
+        ],
+    );
+    project
+        .command("apply")
         .arg("--auto-approve")
         .assert()
         .success();
@@ -776,22 +728,20 @@ fn a_partial_failure_reports_what_landed() {
         .batch_execute(&format!("INSERT INTO {bad}.t (id, amount) VALUES (1, -5)"))
         .expect("insert violating row");
 
-    std::fs::write(
-        dir.path().join("good.sql"),
-        format!("CREATE TABLE {good}.t (id int PRIMARY KEY, added text);"),
-    )
-    .expect("rewrite");
-    std::fs::write(
-        dir.path().join("bad.sql"),
-        format!(
+    project.write(
+        "good.sql",
+        &format!("CREATE TABLE {good}.t (id int PRIMARY KEY, added text);"),
+    );
+    project.write(
+        "bad.sql",
+        &format!(
             "CREATE TABLE {bad}.t (id int PRIMARY KEY, amount int,
                  CONSTRAINT amount_positive CHECK (amount > 0));"
         ),
-    )
-    .expect("rewrite");
+    );
 
-    target
-        .pgpushy("apply", dir.path())
+    project
+        .command("apply")
         .arg("--auto-approve")
         .assert()
         .failure()
@@ -816,68 +766,159 @@ fn a_partial_failure_reports_what_landed() {
 }
 
 // ---------------------------------------------------------------------------
-// The password warning (spec §10)
+// The pgschema version floor and the password warning
 // ---------------------------------------------------------------------------
 //
-// No database needed: the warning fires when the resolved connection is about
-// to be used, which is before pgpushy connects. A stub pgschema gets past the
-// provider, and the connection then fails — after the warning has been said.
+// No database and no real pgschema needed: both are decided before pgpushy
+// connects, so a stub that prints a version line is enough.
 
 #[cfg(unix)]
-fn password_warning_run(dir: &TempDir, stub: &Path) -> assert_cmd::assert::Assert {
-    Command::cargo_bin("pgpushy")
-        .expect("binary builds")
-        .arg("plan")
-        .current_dir(dir.path())
-        .arg("--pgschema-path")
-        .arg(stub)
+fn stub_project(config_extra: &str, help: &str) -> TempDir {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().expect("temp dir");
+    let stub = dir.path().join("pgschema-stub");
+    std::fs::write(&stub, format!("#!/bin/sh\ncat <<'EOF'\n{help}\nEOF\n")).expect("write stub");
+    let mut permissions = std::fs::metadata(&stub).expect("stat stub").permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&stub, permissions).expect("chmod stub");
+
+    std::fs::write(
+        dir.path().join("pgpushy.toml"),
+        format!(
+            "{config_extra}\n\
+             [pgschema]\n\
+             path = \"{}\"\n\
+             \n\
+             [env.test]\n\
+             host = \"127.0.0.1\"\n\
+             port = 1\n\
+             db = \"nope\"\n\
+             user = \"nope\"\n",
+            stub.display(),
+        ),
+    )
+    .expect("write config");
+    write(&dir, "t.sql", "CREATE TABLE t (id int PRIMARY KEY);");
+    dir
+}
+
+#[cfg(unix)]
+fn stub_plan(dir: &TempDir) -> Command {
+    let mut cmd = Command::cargo_bin("pgpushy").expect("binary builds");
+    cmd.args(["plan", "--env", "test"])
+        .arg("--config")
+        .arg(dir.path().join("pgpushy.toml"));
+    cmd
+}
+
+#[cfg(unix)]
+#[test]
+fn a_below_floor_pgschema_is_a_hard_error() {
+    let dir = stub_project("", "Version: 1.4.2@abc linux/amd64 2025-11-14 00:00:00");
+
+    stub_plan(&dir)
         .assert()
         .failure()
+        .stderr(predicates::str::contains("1.4.2"))
+        .stderr(predicates::str::contains("below the minimum 1.12.0"));
+}
+
+/// Spec §8.5: the `Version:` line is a human-readable string, not a stability
+/// contract, so an unreadable one warns rather than refusing to run.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_version_warns_and_proceeds() {
+    let dir = stub_project("", "pgschema, the schema tool\n(no version line here)");
+
+    // It gets past the version check and fails later, at the connection —
+    // which is the point: the version did not stop it.
+    stub_plan(&dir)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("could not read a version"));
+}
+
+#[test]
+fn a_missing_pgschema_says_how_to_get_one() {
+    let dir = TempDir::new().expect("temp dir");
+    std::fs::write(
+        dir.path().join("pgpushy.toml"),
+        "[env.test]\ndb = \"nope\"\nuser = \"nope\"\n",
+    )
+    .expect("write config");
+    write(&dir, "t.sql", "CREATE TABLE t (id int PRIMARY KEY);");
+
+    Command::cargo_bin("pgpushy")
+        .expect("binary builds")
+        .args([
+            "plan",
+            "--env",
+            "test",
+            "--pgschema-path",
+            "/nonexistent/pgschema",
+        ])
+        .arg("--config")
+        .arg(dir.path().join("pgpushy.toml"))
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("no pgschema binary at"));
 }
 
 /// A password read from a file that is easily committed is worth interrupting
-/// someone about.
+/// someone about (spec §10.2).
 #[cfg(unix)]
 #[test]
 fn warns_when_the_password_comes_from_the_config_file() {
-    let dir = tree(&[("t.sql", "CREATE TABLE t (id int PRIMARY KEY);".to_owned())]);
-    let stub = stub_pgschema(&dir, "Version: 1.12.0@abc linux/amd64 2026-07-06 00:00:00");
-    std::fs::write(
-        dir.path().join("pgpushy.toml"),
-        "[connection]\nhost = \"127.0.0.1\"\nport = 1\ndb = \"nope\"\n\
-         user = \"nope\"\npassword = \"hunter2\"\n",
-    )
-    .expect("write config");
+    let dir = stub_project("", "Version: 1.12.0@abc linux/amd64 2026-07-06 00:00:00");
+    // Append a password to the generated [env.test] block.
+    let config = dir.path().join("pgpushy.toml");
+    let mut text = std::fs::read_to_string(&config).expect("read config");
+    text.push_str("password = \"hunter2\"\n");
+    std::fs::write(&config, text).expect("write config");
 
-    password_warning_run(&dir, &stub)
+    stub_plan(&dir)
+        .env_remove("PGPASSWORD")
+        .assert()
+        .failure()
         .stderr(predicates::str::contains("PASSWORD READ FROM"))
         .stderr(predicates::str::contains("pgpushy.toml"))
         // The warning must not become a new way to leak the password.
         .stderr(predicates::str::contains("hunter2").not());
 }
 
-/// Spec §10 is explicit that the warning fires on *use*, not on presence: a
-/// file password something else overrode is not a risk worth interrupting for.
+/// Spec §10.2 is explicit that the warning fires on *use*, not on presence: a
+/// file password `PGPASSWORD` overrode is not worth interrupting for.
 #[cfg(unix)]
 #[test]
 fn does_not_warn_when_the_file_password_is_overridden() {
-    let dir = tree(&[("t.sql", "CREATE TABLE t (id int PRIMARY KEY);".to_owned())]);
-    let stub = stub_pgschema(&dir, "Version: 1.12.0@abc linux/amd64 2026-07-06 00:00:00");
-    std::fs::write(
-        dir.path().join("pgpushy.toml"),
-        "[connection]\nhost = \"127.0.0.1\"\nport = 1\ndb = \"nope\"\n\
-         user = \"nope\"\npassword = \"hunter2\"\n",
-    )
-    .expect("write config");
+    let dir = stub_project("", "Version: 1.12.0@abc linux/amd64 2026-07-06 00:00:00");
+    let config = dir.path().join("pgpushy.toml");
+    let mut text = std::fs::read_to_string(&config).expect("read config");
+    text.push_str("password = \"hunter2\"\n");
+    std::fs::write(&config, text).expect("write config");
 
-    Command::cargo_bin("pgpushy")
-        .expect("binary builds")
-        .arg("plan")
-        .current_dir(dir.path())
-        .arg("--pgschema-path")
-        .arg(&stub)
+    stub_plan(&dir)
         .env("PGPASSWORD", "from-the-environment")
         .assert()
         .failure()
         .stderr(predicates::str::contains("PASSWORD READ FROM").not());
+}
+
+/// Spec §10.2: an ambient `PGHOST` must not redirect a named environment —
+/// the point of naming the target is that it is unambiguous.
+#[cfg(unix)]
+#[test]
+fn an_ambient_pghost_does_not_redirect_a_named_environment() {
+    let dir = stub_project("", "Version: 1.12.0@abc linux/amd64 2026-07-06 00:00:00");
+
+    stub_plan(&dir)
+        .env("PGHOST", "somewhere.else.example")
+        .env("PGDATABASE", "some_other_database")
+        .assert()
+        .failure()
+        // The failure is the connection to what the environment block named,
+        // not to what the ambient variables said.
+        .stderr(predicates::str::contains("127.0.0.1"))
+        .stderr(predicates::str::contains("somewhere.else.example").not());
 }

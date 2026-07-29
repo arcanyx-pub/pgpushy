@@ -41,11 +41,14 @@ failure partway reports exactly what landed and what did not.
 
 ## Configuration
 
-Everything works with flags and `PG*` environment variables alone. A
-`pgpushy.toml` is optional convenience:
+pgpushy requires a `pgpushy.toml`. It reconciles a whole database, so it will
+not guess which files are desired state or which server to reconcile them
+against — running from the wrong directory would otherwise treat part of a
+source tree as all of it, and plan to drop everything else.
 
 ```toml
-source_root    = "db/schema"      # relative to this file
+# source_root defaults to this file's directory
+source_root    = "db/schema"
 default_schema = "app"            # schema for unqualified objects
 exclude        = ["seeds/**", "**/*.test.sql"]
 
@@ -56,23 +59,36 @@ managed_schemas = ["app", "billing"]
 [pgschema]
 path = "/usr/local/bin/pgschema"  # otherwise looked up on PATH
 
-[connection]
-host    = "localhost"
-port    = 5432
+[env.local]
+db   = "myapp_dev"
+user = "joe"
+
+[env.prod]
+host    = "db.internal"
 db      = "myapp"
-user    = "joe"
-sslmode = "prefer"
-# password = "..."   # permitted, but pgpushy warns loudly when it uses it
+user    = "deploy"
+sslmode = "require"
 ```
 
-Precedence is **CLI flag → `PG*` environment → `pgpushy.toml` → default**. Note
-that the environment beats the file, matching `psql`: an ambient `PGHOST`
-outranks the project's configuration.
+`plan` and `apply` take `--env <name>`, and it is **required** — even when only
+one environment is defined, because selecting the sole one automatically would
+make adding a second silently change what an existing command reconciles.
+`validate` takes no `--env`; it connects to nothing.
 
-The file is read from the working directory and is *not* searched for in parent
-directories; `--config <path>` names one explicitly, and paths inside it
-resolve relative to the file itself. List settings given as flags **replace**
-the file's rather than adding to them.
+Everything that decides *what* gets reconciled lives in the file, not in flags.
+The source root, default schema, managed-schema declaration and exclusions each
+describe the project, and a flag that silently narrowed the desired state would
+be the same hazard as guessing at a missing file. Paths inside the file resolve
+against the file's own directory, so the source tree is anchored to the project
+rather than to wherever you happen to be standing.
+
+The file is read from the working directory and is **not** searched for in
+parent directories; `-c`/`--config <path>` names one anywhere.
+
+`PG*` deliberately does not override a named environment's target: the point of
+`--env prod` is that it is unambiguous. `PGPASSWORD` is the exception, since a
+secret should not live in a version-controlled file — and pgpushy warns loudly
+if the password it ends up using came from the file.
 
 ## Building
 

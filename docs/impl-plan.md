@@ -491,10 +491,13 @@ touches nothing. `--auto-approve` skips the prompt; a non-TTY stdin without
 - **M3 — `apply`. ✅ Done.** Plan pass retaining each plan as JSON, single
   database-level approval, cross-schema FK removal detection, apply via
   `--plan`, stop-at-first-failure reporting. Fixtures 4–6, 8, 10, 11.
-- **M4 — `pgpushy.toml`. ✅ Done.** config + precedence + `managed_schemas` +
-  `exclude` + password warning. Note the CLI carries `Option`s with no clap
-  defaults: a flag clap had already filled in is indistinguishable from one the
-  user typed, and would silently outrank the file.
+- **M4 — `pgpushy.toml`. ✅ Done.** A **required** configuration file holding
+  everything that decides what gets reconciled, named environments with a
+  required `--env`, and the password warning. Project structure is deliberately
+  not settable by flag, which also means there is no CLI-vs-file precedence to
+  get wrong — the earlier design had both, and the interaction between an
+  optional file and a source root defaulting to the working directory was the
+  hazard that prompted the change (spec §10.1).
 - **M5 — UX polish.** error messages, plan presentation, `--out`, identity
   line, docs.
 - **M6 — Managed provider (0.x fast-follow, then default).** download/cache/

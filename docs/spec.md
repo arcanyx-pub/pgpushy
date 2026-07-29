@@ -1,6 +1,6 @@
 # pgpushy Specification
 
-**Version:** 0.2
+**Version:** 0.3
 **Date:** 2026-07-29
 **Status:** Draft — all 0.x design decisions resolved (§15)
 
@@ -78,7 +78,7 @@ tested against (§13).
 - **Managed schema** — a Postgres schema that pgpushy reconciles. The set of
   managed schemas is derived from the source tree, or declared (§4.4).
 - **Default schema** — the schema to which an unqualified object belongs.
-  Defaults to `public`; configurable (§10).
+  Defaults to `public`; configurable (§10.1).
 - **Desired state** — the single synthesized SQL document pgpushy produces
   from the source tree and passes to pgschema as `--file` (§5).
 - **FK-lift** — the transform that moves foreign-key constraints out of table
@@ -134,7 +134,7 @@ collation. Nothing in the synthesized output depends on discovery order
 (§5.1), but a deterministic order makes diagnostics and reporting stable
 (§11.3).
 
-**Exclusions.** Configuration (§10) MAY supply a list of glob patterns matched
+**Exclusions.** Configuration (§10.1) MAY supply a list of glob patterns matched
 against source-root-relative paths. A file matching any pattern is not
 discovered and is never parsed. pgpushy MUST report the number of excluded
 files, and SHOULD report the count matched by each pattern, so that an
@@ -218,7 +218,7 @@ Every object is assigned to exactly one schema:
 - An object written with a schema-qualified name (`billing.invoices`) belongs
   to that schema.
 - An object written unqualified (`invoices`) belongs to the **default
-  schema** (§10).
+  schema** (§10.1).
 
 **Derived set (default).** Absent an explicit declaration, the managed-schema
 set is the union of:
@@ -233,7 +233,7 @@ pgpushy never reconciles it and therefore never empties it. (Were an
 unmentioned schema treated as managed, its empty desired state would plan a
 drop of everything the target holds in it.)
 
-**Declared set.** Configuration (§10) MAY declare `managed_schemas`. When
+**Declared set.** Configuration (§10.1) MAY declare `managed_schemas`. When
 present it is authoritative:
 
 - A schema the source tree mentions but the declaration omits MUST be a hard
@@ -528,11 +528,15 @@ the record of any change.
 
 ### 6.4 Connection resolution
 
-pgpushy MUST resolve its connection from the sources and precedence of §10
-into a single libpq-compatible connection string, and MUST rely on that
-string's standard interpretation — including `.pgpass`, `sslmode`, and
-`PGSERVICE` — rather than reimplementing those semantics. The resolved
-parameters are what §6.3 forwards to pgschema.
+pgpushy MUST resolve its connection from the named environment (§10.2) into a
+single libpq-compatible connection string, and MUST rely on that string's
+standard interpretation of `sslmode` and the like rather than reimplementing
+those semantics. The resolved parameters are what §6.3 forwards to pgschema.
+
+Settings that would let the *environment* rather than the configuration decide
+the target — `PGSERVICE`, `PGSERVICEFILE` — MUST be refused rather than
+silently ignored, since pgpushy cannot interpret them and a dropped one would
+mean connecting somewhere the operator did not name.
 
 This is the only place pgpushy accesses the target directly, and every
 statement it issues there MUST be read-only.
@@ -602,12 +606,15 @@ from the target (§6.1).
 
 ### 8.3 Pass-through and owned flags
 
-Connection and apply-tuning flags MUST be forwarded to pgschema, including at
-least: `--host`, `--port`, `--db`, `--user`, `--password`, `--sslmode`,
-`--lock-timeout`, and the `--plan-*` family. Standard `PG*` environment
-variables MUST be honored as pgschema honors them, subject to §6.3: pgpushy
-resolves them and forwards the resolved values, rather than letting pgschema
-resolve them independently.
+The connection pgpushy resolved (§6.4) MUST be forwarded to pgschema in full —
+`--host`, `--port`, `--db`, `--user`, `--sslmode`, with the password through
+the environment — so that pgschema resolves nothing for itself (§6.3).
+Apply-tuning flags pgpushy does not model, such as `--lock-timeout` and the
+`--plan-*` family, MUST be forwarded when given.
+
+Note that pgpushy does **not** honor `PG*` for the target's identity: the
+target comes from the named environment and nowhere else (§10.2). `PGPASSWORD`
+is the exception, and is forwarded as the resolved password.
 
 pgpushy **owns** the following, which MUST NOT be settable by the user on the
 pgschema invocation:
@@ -631,7 +638,7 @@ managed backend is the intended default; the BYO backend is permanent (see
 Rollout).
 
 **Managed backend.** pgpushy downloads a pinned pgschema version — the version
-its release was tested against (§13), overridable via configuration (§10) — from
+its release was tested against (§13), overridable via configuration (§10.1) — from
 pgschema's official GitHub release assets, which are standalone per-platform
 binaries. It caches the binary per version under the user's cache home (e.g.
 `$XDG_CACHE_HOME/pgpushy/pgschema/<version>/`), reusing it on later runs.
@@ -644,7 +651,7 @@ The managed backend serves the platforms pgschema publishes binaries for:
 Linux and macOS, amd64 and arm64.
 
 **Bring-your-own (BYO) backend.** pgpushy uses an operator-provided binary — an
-explicit path or a `PATH` lookup (§10). In this mode pgpushy MUST read the
+explicit path or a `PATH` lookup (§10.3). In this mode pgpushy MUST read the
 binary's version and enforce the minimum (§13). Version is read by parsing the
 `Version:` line of `pgschema --help`; there is no machine-readable version
 output. A version **below the floor** MUST be a hard error naming both the
@@ -706,35 +713,99 @@ applied schemas are not rolled back (§11.2).
 
 ## 10. Configuration
 
-pgpushy MUST be usable with CLI flags and `PG*` environment variables alone; a
-configuration file is optional convenience, never required.
+pgpushy reconciles an entire database. Everything it does — which files are
+desired state, which schemas are managed, which server is reconciled against
+them — determines what gets dropped as much as what gets created, and a wrong
+answer to any of them is destructive. So configuration is **required and
+explicit**, not inferred from where the command happened to be run.
 
-**File.** pgpushy reads an optional **`pgpushy.toml`** from the current working
-directory. It is not searched for in parent directories; `--config <path>`
-supplies an explicit path from anywhere. It MAY hold:
+Two consequences follow, and both cost convenience deliberately.
 
-- **Project structure** — the source-tree root, the default schema (§4.4), and
-  the `exclude` glob patterns (§4.1).
+### 10.1 A configuration file is required
+
+pgpushy MUST refuse to run without a **`pgpushy.toml`**. It is read from the
+current working directory and MUST NOT be searched for in parent directories;
+`--config <path>` names one anywhere. When no file is found, pgpushy MUST say
+so plainly and show the minimum a working one contains, rather than falling
+back to defaults.
+
+The reason is the interaction, not the file. A tool whose source root defaulted
+to the working directory *and* whose configuration was optional would, when run
+from the wrong directory, silently treat a fragment of the source tree as the
+whole desired state — and every object outside that fragment is then
+desired-state-absent, which is to say scheduled for deletion. Failing is the
+only safe response to not knowing what the source tree is.
+
+**Project structure MUST NOT be settable from the command line.** The source
+root, the default schema, the managed-schema declaration, and the exclusions
+all describe *the project*, and each is a way to change what gets reconciled.
+They live in the file, where they are reviewable and version-controlled,
+because a flag that silently narrows the desired state is the same hazard in a
+different shape. `--config` selects which project; nothing else about the
+project is a flag.
+
+The file MAY hold:
+
+- **Project structure** — `source_root`, defaulting to the directory containing
+  the file itself; `default_schema` (§4.4), defaulting to `public`; and
+  `exclude` glob patterns (§4.1). Relative paths resolve against the file's own
+  directory.
 - **`managed_schemas`** (§4.4) — the authoritative managed-schema declaration.
-- **pgschema provider** (§8.5) — the backend (managed vs. BYO), the pinned
-  pgschema version (managed), and the binary path (BYO).
-- **Connection defaults** — `host`, `port`, `db`, `user`, `sslmode`, and —
-  permitted but discouraged — `password`.
+- **pgschema provider** (§8.5) — the backend, the pinned version (managed), and
+  the binary path (BYO).
+- **Environments** (§10.2).
 
-**Precedence** (highest first): CLI flag → `PG*` / pgschema environment
-variable → `pgpushy.toml` → built-in default. The default schema defaults to
-`public`.
+Unknown keys MUST be rejected. A mistyped key is invisible from behavior —
+pgpushy would act as though the setting were absent — so silence is the one
+response that cannot be recovered from.
 
-**Password handling.** A `password` MAY be set in `pgpushy.toml`, but when the
-effective connection password is *sourced from the file* — i.e. not overridden
-by `PGPASSWORD` or `--password` — pgpushy MUST emit a prominent warning that a
-password is being read from a file that is easily committed to version control.
-Supplying it via `PGPASSWORD` or `--password` is the intended path and MUST NOT
-warn. (The warning fires on actual use from the file, not on mere presence, so
-an overridden file password is silent.)
+### 10.2 The target is named, never inferred
 
-Rich configuration (per-schema overrides, multiple target environments) is
-future work (§14) and MUST NOT be required for the core workflow.
+Connection settings live in **named environments**, and `plan` and `apply` MUST
+require `--env <name>` to select one. `validate` MUST NOT accept it, because it
+connects to nothing.
+
+```toml
+[env.local]
+db   = "myapp_dev"
+user = "joe"
+
+[env.prod]
+host = "db.internal"
+db   = "myapp"
+user = "deploy"
+```
+
+`--env` is required **even when only one environment is defined**. Selecting
+the sole environment automatically would make adding a second one silently
+change what an existing command reconciles.
+
+An environment MUST specify `db` and `user`, which have no safe default.
+`host` defaults to `localhost`, `port` to `5432`, and `sslmode` to `prefer`.
+
+**`PG*` environment variables MUST NOT override a named environment's target.**
+This reverses the ordinary precedence, and deliberately: the entire purpose of
+`--env prod` is to name a target unambiguously, and an ambient `PGHOST` that
+silently redirected it would defeat that at exactly the moment it matters.
+pgpushy already strips `PG*` from pgschema's environment (§6.3); it now
+declines to read them for its own targeting too.
+
+The password is the exception, because a secret does not belong in a
+version-controlled file. `PGPASSWORD` MAY supply it, and takes precedence over
+the environment's `password`.
+
+**Password handling.** A `password` MAY be set in an environment, but when the
+effective password is *sourced from the file* — not overridden by `PGPASSWORD`
+— pgpushy MUST emit a prominent warning that a password is being read from a
+file that is easily committed to version control. The warning fires on actual
+use, so an overridden file password is silent, and it MUST NOT echo the
+password.
+
+### 10.3 What remains a flag
+
+Only things that describe *this run* or *this machine*, never the project or
+the target: `--config`, `--env`, `--pgschema-path` (which differs per machine
+and cannot affect what is reconciled), `--out`, and `--auto-approve`.
 
 ## 11. Properties
 
@@ -908,7 +979,10 @@ useful it is (§14).
   between the same pair.
 - **Per-schema synthesis** trimmed to the cross-schema closure (§5.4), for
   databases where re-executing the full document per schema is too costly.
-- **Richer configuration** (§10): per-schema overrides, multiple environments.
+- **Richer configuration** (§10): per-schema overrides, and variable
+  interpolation in environments so that a target can be assembled from the
+  process environment (Atlas does this with `--var`) rather than written out
+  statically.
 - **Schema-drop management** (§12.3), behind an explicit opt-in.
 
 ## 15. Decision Log
@@ -970,12 +1044,27 @@ made after draft 2 of v0.1.
   default, pinned + SHA-256-verified) with a permanent BYO override that
   parses `pgschema --help` and enforces the floor. First 0.x release ships
   BYO + version check; managed is a fast-follow. (§8.5, §13)
-- **Configuration file** — optional `pgpushy.toml` at the **current working
-  directory** (**[0.2]** not searched upward; `--config` for an explicit
-  path), holding project structure, `managed_schemas`, exclusions,
-  pgschema-provider, and connection defaults; precedence CLI > env > file >
-  default. `password` is permitted in the file but triggers a prominent
-  warning when it is the effective source. (§10)
+- **Configuration file** — **[0.3]** `pgpushy.toml` is **required**, read from
+  the working directory only (not searched upward; `--config` for an explicit
+  path), and holds everything about the project: structure, `managed_schemas`,
+  exclusions, pgschema-provider, and named environments. Project structure is
+  deliberately **not** settable by flag.
+
+  This replaces the earlier "optional convenience" decision. The two defaults
+  interacted badly: an optional file plus a source root defaulting to the
+  working directory meant that running from the wrong directory silently
+  treated a fragment of the tree as the whole desired state, scheduling
+  everything outside it for deletion. Atlas and pgschema both read their config
+  from the working directory only, and get away with it because their input is
+  explicitly named — pgschema requires `--file`. pgpushy's blast radius is the
+  whole database, so it names its input explicitly too. (§10.1)
+- **[0.3] Named environments** — connection settings live in `[env.<name>]`
+  blocks and `--env` is required for `plan` and `apply`, even with only one
+  environment defined. `PG*` no longer overrides a named environment's target,
+  because an ambient `PGHOST` silently redirecting `--env prod` would defeat
+  the point of naming it; `PGPASSWORD` remains, since a secret should not be in
+  the file. `password` is permitted in an environment but triggers a prominent
+  warning when it is the effective source. (§10.2)
 - **[0.2] `CREATE SCHEMA` forms** — only the bare
   `CREATE SCHEMA [IF NOT EXISTS] <name>` form is accepted; the nested-element
   form and the `AUTHORIZATION`-only form are rejected. (§4.3)

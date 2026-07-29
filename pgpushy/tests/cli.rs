@@ -1,18 +1,26 @@
-//! `pgpushy validate` end to end.
+//! `pgpushy validate` and the configuration file, end to end.
 //!
 //! These run the real binary against real directories, which is what makes
 //! them worth having on top of the core crate's string-literal tests: the
-//! filesystem behavior — hidden files, symlinks, exclusions, ordering — only
-//! exists here, and none of it needs a database.
+//! filesystem behavior — hidden files, symlinks, exclusions, ordering,
+//! configuration discovery — only exists here, and none of it needs a database.
 
 use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;
 use std::path::Path;
 use tempfile::TempDir;
 
-/// Build a source tree from `(relative path, contents)` pairs.
-fn tree(files: &[(&str, &str)]) -> TempDir {
+const ORDERS: &str =
+    "CREATE TABLE orders (id int PRIMARY KEY, customer_id int REFERENCES customers(id));";
+const CUSTOMERS: &str = "CREATE TABLE customers (id int PRIMARY KEY, name text NOT NULL);";
+
+/// A project: a `pgpushy.toml` plus the files around it.
+///
+/// Every test needs one, because configuration is required (spec §10.1) —
+/// which is itself the point, so the tests exercise the only real user path.
+fn project(config: &str, files: &[(&str, &str)]) -> TempDir {
     let dir = TempDir::new().expect("temp dir");
+    std::fs::write(dir.path().join("pgpushy.toml"), config).expect("write config");
     for (path, contents) in files {
         let full = dir.path().join(path);
         if let Some(parent) = full.parent() {
@@ -23,15 +31,34 @@ fn tree(files: &[(&str, &str)]) -> TempDir {
     dir
 }
 
+/// A project with nothing configured: `source_root` then defaults to the
+/// directory holding the file.
+fn tree(files: &[(&str, &str)]) -> TempDir {
+    project("", files)
+}
+
+/// `pgpushy validate` pointed at a project, from anywhere.
 fn validate(root: &Path) -> Command {
     let mut cmd = Command::cargo_bin("pgpushy").expect("binary builds");
-    cmd.args(["validate", "--source-root"]).arg(root);
+    cmd.arg("validate")
+        .arg("--config")
+        .arg(root.join("pgpushy.toml"));
     cmd
 }
 
-const ORDERS: &str =
-    "CREATE TABLE orders (id int PRIMARY KEY, customer_id int REFERENCES customers(id));";
-const CUSTOMERS: &str = "CREATE TABLE customers (id int PRIMARY KEY, name text NOT NULL);";
+/// `pgpushy plan` pointed at a project. Used only for the tests that never get
+/// as far as connecting.
+fn plan(root: &Path, env: &str) -> Command {
+    let mut cmd = Command::cargo_bin("pgpushy").expect("binary builds");
+    cmd.args(["plan", "--env", env])
+        .arg("--config")
+        .arg(root.join("pgpushy.toml"));
+    cmd
+}
+
+// ---------------------------------------------------------------------------
+// The source tree
+// ---------------------------------------------------------------------------
 
 #[test]
 fn accepts_a_valid_tree() {
@@ -64,17 +91,19 @@ fn rejects_a_statement_outside_the_allow_list_naming_file_and_line() {
 
 #[test]
 fn exclusions_keep_non_schema_sql_out_of_the_tree() {
-    let dir = tree(&[
-        ("schema/customers.sql", CUSTOMERS),
-        ("seeds/data.sql", "INSERT INTO customers VALUES (1, 'joe');"),
-        (
-            "schema/customers.test.sql",
-            "INSERT INTO customers VALUES (2, 'ann');",
-        ),
-    ]);
+    let dir = project(
+        r#"exclude = ["seeds/**", "**/*.test.sql"]"#,
+        &[
+            ("schema/customers.sql", CUSTOMERS),
+            ("seeds/data.sql", "INSERT INTO customers VALUES (1, 'joe');"),
+            (
+                "schema/customers.test.sql",
+                "INSERT INTO customers VALUES (2, 'ann');",
+            ),
+        ],
+    );
 
     validate(dir.path())
-        .args(["--exclude", "seeds/**", "--exclude", "**/*.test.sql"])
         .assert()
         .success()
         .stdout(predicates::str::contains("2 excluded"))
@@ -102,8 +131,11 @@ fn ignores_hidden_files_and_directories() {
 #[cfg(unix)]
 #[test]
 fn does_not_follow_symlinked_directories() {
-    let dir = tree(&[("schema/customers.sql", CUSTOMERS)]);
-    std::os::unix::fs::symlink(dir.path().join("schema"), dir.path().join("loop"))
+    let dir = project(
+        "source_root = \"schema\"",
+        &[("schema/customers.sql", CUSTOMERS)],
+    );
+    std::os::unix::fs::symlink(dir.path().join("schema"), dir.path().join("schema/loop"))
         .expect("create symlink");
 
     validate(dir.path())
@@ -117,7 +149,8 @@ fn does_not_follow_symlinked_directories() {
 #[test]
 fn writes_the_desired_state_with_out() {
     let dir = tree(&[("orders.sql", ORDERS), ("customers.sql", CUSTOMERS)]);
-    let out = dir.path().join("desired.sql");
+    let outputs = TempDir::new().expect("temp dir");
+    let out = outputs.path().join("desired.sql");
 
     validate(dir.path())
         .arg("--out")
@@ -143,8 +176,10 @@ fn writes_the_desired_state_with_out() {
 }
 
 /// Writing the desired state into the source root is a natural thing to do,
-/// and pgpushy's own output must not come back as input on the next run — every
-/// object in it would be reported as a duplicate of itself.
+/// and pgpushy's own output must not come back as input — every object in it
+/// would be reported as a duplicate of itself. The generated document is
+/// recognized by its first line, so this holds on later runs too, whether or
+/// not they pass `--out`.
 #[test]
 fn does_not_read_back_its_own_output() {
     let dir = tree(&[("orders.sql", ORDERS), ("customers.sql", CUSTOMERS)]);
@@ -155,12 +190,21 @@ fn does_not_read_back_its_own_output() {
         .arg(&out)
         .assert()
         .success();
+
     validate(dir.path())
         .arg("--out")
         .arg(&out)
         .assert()
         .success()
         .stdout(predicates::str::contains("2 tables"));
+
+    validate(dir.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("2 tables"))
+        .stdout(predicates::str::contains(
+            "1 previously generated by pgpushy",
+        ));
 }
 
 /// Spec §11.3, from the outside: the same tree must produce the same bytes.
@@ -233,41 +277,9 @@ fn reports_both_definitions_of_a_duplicate() {
         .stderr(predicates::str::contains("b/orders.sql"));
 }
 
-/// A declared schema the tree never mentions reconciles to empty, which is
-/// destructive. It must be said out loud rather than left to the reader.
-#[test]
-fn warns_when_a_managed_schema_has_no_source() {
-    let dir = tree(&[("customers.sql", CUSTOMERS)]);
-
-    validate(dir.path())
-        .args(["--managed-schema", "public", "--managed-schema", "legacy"])
-        .assert()
-        .success()
-        .stdout(predicates::str::contains("WARNING"))
-        .stdout(predicates::str::contains("legacy"));
-}
-
-#[test]
-fn rejects_an_object_in_an_undeclared_schema() {
-    let dir = tree(&[
-        ("customers.sql", CUSTOMERS),
-        (
-            "events.sql",
-            "CREATE TABLE analytics.events (id int PRIMARY KEY);",
-        ),
-    ]);
-
-    validate(dir.path())
-        .args(["--managed-schema", "public"])
-        .assert()
-        .failure()
-        .stderr(predicates::str::contains("analytics"))
-        .stderr(predicates::str::contains("events.sql"));
-}
-
 #[test]
 fn an_empty_tree_is_not_an_error() {
-    let dir = TempDir::new().expect("temp dir");
+    let dir = tree(&[]);
     validate(dir.path())
         .assert()
         .success()
@@ -276,110 +288,92 @@ fn an_empty_tree_is_not_an_error() {
 
 #[test]
 fn a_missing_source_root_is_an_error() {
-    let mut cmd = Command::cargo_bin("pgpushy").expect("binary builds");
-    cmd.args(["validate", "--source-root", "/nonexistent/path/for/a/test"])
+    let dir = project(
+        "source_root = \"no-such-directory\"",
+        &[("customers.sql", CUSTOMERS)],
+    );
+
+    validate(dir.path())
         .assert()
         .failure()
         .stderr(predicates::str::contains("does not exist"));
 }
 
 // ---------------------------------------------------------------------------
-// pgpushy.toml (spec §10)
+// Configuration (spec §10.1)
 // ---------------------------------------------------------------------------
 
-/// A project laid out the way the configuration file expects.
-fn project(config: &str, files: &[(&str, &str)]) -> TempDir {
+/// The reason configuration is required: without it, a run from the wrong
+/// directory would treat a fragment of the tree as the whole desired state.
+#[test]
+fn refuses_to_run_without_a_configuration_file() {
     let dir = TempDir::new().expect("temp dir");
-    std::fs::write(dir.path().join("pgpushy.toml"), config).expect("write config");
-    for (path, contents) in files {
-        let full = dir.path().join(path);
-        if let Some(parent) = full.parent() {
-            std::fs::create_dir_all(parent).expect("create dirs");
-        }
-        std::fs::write(&full, contents).expect("write file");
-    }
-    dir
-}
+    std::fs::write(dir.path().join("customers.sql"), CUSTOMERS).expect("write");
 
-/// `pgpushy validate` run from inside the project, with no flags at all.
-fn bare(root: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("pgpushy").expect("binary builds");
-    cmd.arg("validate").current_dir(root);
-    cmd
+    Command::cargo_bin("pgpushy")
+        .expect("binary builds")
+        .arg("validate")
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("no pgpushy.toml"))
+        // The message must explain itself and show a working starting point.
+        .stderr(predicates::str::contains("plan to drop everything else"))
+        .stderr(predicates::str::contains("[env.local]"));
 }
 
 #[test]
-fn a_config_file_supplies_everything_with_no_flags() {
-    let dir = project(
-        r#"
-        source_root = "db/schema"
-        default_schema = "app"
-        exclude = ["seeds/**"]
-        "#,
-        &[
-            ("db/schema/customers.sql", CUSTOMERS),
-            ("db/schema/orders.sql", ORDERS),
-            (
-                "db/schema/seeds/data.sql",
-                "INSERT INTO customers VALUES (1, 'joe');",
-            ),
-        ],
-    );
+fn finds_the_config_in_the_working_directory() {
+    let dir = project("default_schema = \"app\"", &[("customers.sql", CUSTOMERS)]);
 
-    bare(dir.path())
+    Command::cargo_bin("pgpushy")
+        .expect("binary builds")
+        .arg("validate")
+        .current_dir(dir.path())
         .assert()
         .success()
         .stdout(predicates::str::contains("config: pgpushy.toml"))
-        .stdout(predicates::str::contains("2 files, 1 excluded"))
         .stdout(predicates::str::contains("managed schemas: app"));
 }
 
+/// Spec §10.1: not searched for in parent directories. Running from a
+/// subdirectory therefore fails outright rather than silently reconciling a
+/// fragment of the tree — which is the whole reason the file is required.
 #[test]
-fn no_config_file_is_not_an_error() {
-    let dir = tree(&[("customers.sql", CUSTOMERS)]);
-
-    bare(dir.path())
-        .assert()
-        .success()
-        // Nothing to report when there was no file to read.
-        .stdout(predicates::str::contains("config:").not())
-        .stdout(predicates::str::contains("managed schemas: public"));
-}
-
-#[test]
-fn a_flag_beats_the_config_file() {
+fn the_config_file_is_not_searched_for_in_parent_directories() {
     let dir = project(
-        "default_schema = \"from_file\"",
-        &[("customers.sql", CUSTOMERS)],
+        "default_schema = \"app\"",
+        &[("db/customers.sql", CUSTOMERS)],
     );
 
-    bare(dir.path())
-        .args(["--default-schema", "from_flag"])
-        .assert()
-        .success()
-        .stdout(predicates::str::contains("managed schemas: from_flag"));
-}
-
-/// Spec §10 precedence is CLI over file, and for lists that means *replace*:
-/// otherwise a project's exclusions could never be narrowed for one run.
-#[test]
-fn an_exclude_flag_replaces_the_files_excludes() {
-    let files = &[
-        ("customers.sql", CUSTOMERS),
-        ("seeds/data.sql", "INSERT INTO customers VALUES (1, 'joe');"),
-    ];
-    let dir = project(r#"exclude = ["seeds/**"]"#, files);
-
-    // With the file's list, the seed file is excluded and all is well.
-    bare(dir.path()).assert().success();
-
-    // Replaced by a pattern that matches nothing, the seed file comes back —
-    // and the allow-list rejects it.
-    bare(dir.path())
-        .args(["--exclude", "no-such-dir/**"])
+    Command::cargo_bin("pgpushy")
+        .expect("binary builds")
+        .arg("validate")
+        .current_dir(dir.path().join("db"))
         .assert()
         .failure()
-        .stderr(predicates::str::contains("unsupported statement: INSERT"));
+        .stderr(predicates::str::contains("no pgpushy.toml"));
+}
+
+/// The source tree is anchored to the project, not to the caller — so where
+/// pgpushy runs from cannot change what it reconciles.
+#[test]
+fn the_source_root_is_relative_to_the_config_file() {
+    let dir = project(
+        "source_root = \"db/schema\"",
+        &[("db/schema/customers.sql", CUSTOMERS)],
+    );
+    let elsewhere = TempDir::new().expect("temp dir");
+
+    Command::cargo_bin("pgpushy")
+        .expect("binary builds")
+        .arg("validate")
+        .current_dir(elsewhere.path())
+        .arg("--config")
+        .arg(dir.path().join("pgpushy.toml"))
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("1 table"));
 }
 
 #[test]
@@ -395,31 +389,27 @@ fn managed_schemas_can_be_declared_in_the_file() {
         ],
     );
 
-    bare(dir.path())
+    validate(dir.path())
         .assert()
         .failure()
         .stderr(predicates::str::contains("analytics"))
         .stderr(predicates::str::contains("managed_schemas"));
 }
 
-/// Paths in the file are relative to the file, not to the working directory,
-/// so `--config` pointing elsewhere means what it looks like.
+/// A declared schema the tree never mentions reconciles to empty, which is
+/// destructive. It must be said out loud rather than left to the reader.
 #[test]
-fn file_paths_resolve_against_the_config_files_directory() {
+fn warns_when_a_managed_schema_has_no_source() {
     let dir = project(
-        "source_root = \"db/schema\"",
-        &[("db/schema/customers.sql", CUSTOMERS)],
+        r#"managed_schemas = ["public", "legacy"]"#,
+        &[("c.sql", CUSTOMERS)],
     );
-    let elsewhere = TempDir::new().expect("temp dir");
 
-    let mut cmd = Command::cargo_bin("pgpushy").expect("binary builds");
-    cmd.arg("validate")
-        .current_dir(elsewhere.path())
-        .arg("--config")
-        .arg(dir.path().join("pgpushy.toml"))
+    validate(dir.path())
         .assert()
         .success()
-        .stdout(predicates::str::contains("1 table"));
+        .stdout(predicates::str::contains("WARNING"))
+        .stdout(predicates::str::contains("legacy"));
 }
 
 /// A mistyped key would otherwise be invisible: pgpushy would simply behave as
@@ -431,7 +421,7 @@ fn a_mistyped_key_is_rejected_with_the_valid_ones_listed() {
         &[("customers.sql", CUSTOMERS)],
     );
 
-    bare(dir.path())
+    validate(dir.path())
         .assert()
         .failure()
         .stderr(predicates::str::contains(
@@ -442,10 +432,9 @@ fn a_mistyped_key_is_rejected_with_the_valid_ones_listed() {
 
 #[test]
 fn an_explicit_config_that_does_not_exist_is_an_error() {
-    let dir = tree(&[("customers.sql", CUSTOMERS)]);
-
-    bare(dir.path())
-        .args(["--config", "/nonexistent/pgpushy.toml"])
+    Command::cargo_bin("pgpushy")
+        .expect("binary builds")
+        .args(["validate", "--config", "/nonexistent/pgpushy.toml"])
         .assert()
         .failure()
         .stderr(predicates::str::contains("no configuration file at"));
@@ -460,26 +449,98 @@ fn settings_that_are_not_built_yet_say_so_plainly() {
         &[("customers.sql", CUSTOMERS)],
     );
 
-    bare(dir.path())
+    validate(dir.path())
         .assert()
         .failure()
         .stderr(predicates::str::contains("not available yet"))
         .stderr(predicates::str::contains("fast-follow"));
 }
 
-/// Spec §10: the file is read from the working directory and *not* searched
-/// for in parent directories. Running from a subdirectory therefore picks up
-/// nothing — which is only safe because the absent `config:` line says so.
+// ---------------------------------------------------------------------------
+// Environments (spec §10.2)
+// ---------------------------------------------------------------------------
+
+/// `plan` and `apply` name their target; `validate` has none, and must not
+/// pretend otherwise.
 #[test]
-fn the_config_file_is_not_searched_for_in_parent_directories() {
+fn validate_takes_no_env() {
+    let dir = tree(&[("customers.sql", CUSTOMERS)]);
+
+    validate(dir.path())
+        .args(["--env", "local"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("unexpected argument"));
+}
+
+#[test]
+fn plan_requires_an_env() {
+    let dir = tree(&[("customers.sql", CUSTOMERS)]);
+
+    Command::cargo_bin("pgpushy")
+        .expect("binary builds")
+        .arg("plan")
+        .arg("--config")
+        .arg(dir.path().join("pgpushy.toml"))
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--env"));
+}
+
+#[test]
+fn an_unknown_env_lists_the_defined_ones() {
     let dir = project(
-        "default_schema = \"app\"",
-        &[("db/customers.sql", CUSTOMERS)],
+        "[env.local]\ndb = \"a\"\nuser = \"u\"\n[env.prod]\ndb = \"b\"\nuser = \"u\"",
+        &[("customers.sql", CUSTOMERS)],
     );
 
-    bare(&dir.path().join("db"))
+    plan(dir.path(), "staging")
         .assert()
-        .success()
-        .stdout(predicates::str::contains("config:").not())
-        .stdout(predicates::str::contains("managed schemas: public"));
+        .failure()
+        .stderr(predicates::str::contains(
+            "no environment named \"staging\"",
+        ))
+        .stderr(predicates::str::contains("local, prod"));
+}
+
+#[test]
+fn a_file_with_no_environments_says_how_to_add_one() {
+    let dir = tree(&[("customers.sql", CUSTOMERS)]);
+
+    plan(dir.path(), "local")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("no environments are defined"))
+        .stderr(predicates::str::contains("[env.local]"));
+}
+
+/// Reconciling the wrong database, or as the wrong role, are the mistakes
+/// naming an environment exists to prevent — so neither has a default.
+#[test]
+fn an_environment_must_say_which_database_and_who() {
+    let dir = project(
+        "[env.local]\nhost = \"db\"",
+        &[("customers.sql", CUSTOMERS)],
+    );
+
+    plan(dir.path(), "local")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("missing db and user"));
+}
+
+/// A bad target fails before the source tree is read: the problem is with the
+/// command, not with the SQL, and saying so first is less confusing.
+#[test]
+fn the_target_is_resolved_before_anything_is_parsed() {
+    let dir = project(
+        "[env.local]\ndb = \"a\"\nuser = \"u\"",
+        &[("broken.sql", "CREATE TABLE (((;")],
+    );
+
+    plan(dir.path(), "nope")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("no environment named"))
+        .stderr(predicates::str::contains("could not parse SQL").not());
 }

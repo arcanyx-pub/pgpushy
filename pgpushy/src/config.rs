@@ -1,37 +1,45 @@
-//! `pgpushy.toml` and the precedence rules around it (spec §10).
+//! `pgpushy.toml` (spec §10).
 //!
-//! The file is **optional convenience, never required**: CLI flags and `PG*`
-//! alone must always work. It is read from the current working directory and
-//! *not* searched for in parent directories; `--config` names one explicitly.
+//! pgpushy reconciles an entire database, so everything that decides *what*
+//! gets reconciled — which files are desired state, which schemas are managed,
+//! which server is on the other end — is required and explicit rather than
+//! inferred from where the command was run.
 //!
-//! Precedence is CLI flag → environment → file → built-in default. Note what
-//! that means for connections: an ambient `PGHOST` beats the project's
-//! `pgpushy.toml`. That is deliberate and matches `psql`, but it surprises
-//! people who expect a project file to be the more specific setting.
+//! Two rules follow, and both cost convenience on purpose:
 //!
-//! For a flag to lose to nothing, pgpushy has to be able to tell "not given"
-//! from "given the default value" — which is why the CLI carries `Option`s and
-//! defaults are applied here, at the end, rather than by clap.
+//! - **The file is required** (§10.1). An optional file plus a source root
+//!   defaulting to the working directory would mean that running from the
+//!   wrong directory silently treats a fragment of the tree as the whole
+//!   desired state — and everything outside that fragment is then
+//!   desired-state-absent, which is to say scheduled for deletion.
+//! - **Project structure is not settable by flag** (§10.1). The source root,
+//!   default schema, managed-schema declaration and exclusions all describe the
+//!   project, and each is a way to change what gets reconciled. A flag that
+//!   silently narrows the desired state is the same hazard as a missing file.
+//!
+//! `--config` selects which project. `--env` selects which target. Nothing
+//! else about either is a flag.
 
-use crate::cli::{PgschemaArgs, SourceArgs};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// The name looked for when `--config` is not given.
-const FILE_NAME: &str = "pgpushy.toml";
+pub const FILE_NAME: &str = "pgpushy.toml";
 
 /// `pgpushy.toml`, as written.
 ///
-/// `deny_unknown_fields` throughout: a mistyped key in a configuration file is
-/// nearly impossible to spot from behavior — pgpushy would simply act as
-/// though the setting were absent — so it is better to say so.
+/// `deny_unknown_fields` throughout: a mistyped key is invisible from
+/// behavior — pgpushy would act as though the setting were absent — so silence
+/// is the one response that cannot be recovered from.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct File {
-    /// Root of the source tree, relative to the file's own directory.
+    /// Root of the source tree. Relative to this file's own directory, and
+    /// defaulting to it.
     pub source_root: Option<PathBuf>,
-    /// Schema unqualified objects belong to.
+    /// Schema unqualified objects belong to. Defaults to `public`.
     pub default_schema: Option<String>,
     /// The authoritative managed-schema declaration (spec §4.4).
     pub managed_schemas: Option<Vec<String>>,
@@ -40,8 +48,9 @@ pub struct File {
 
     #[serde(default)]
     pub pgschema: Pgschema,
+    /// Named targets, selected by `--env` (spec §10.2).
     #[serde(default)]
-    pub connection: Connection,
+    pub env: BTreeMap<String, Environment>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -55,45 +64,157 @@ pub struct Pgschema {
     pub version: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+/// One named target.
+#[derive(Debug, Default, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Connection {
+pub struct Environment {
     pub host: Option<String>,
     pub port: Option<u16>,
+    /// Required: there is no safe default for which database to reconcile.
     pub db: Option<String>,
+    /// Required: there is no safe default for who to connect as.
     pub user: Option<String>,
     pub sslmode: Option<String>,
     /// Permitted, discouraged, and warned about loudly when actually used
-    /// (spec §10).
+    /// (spec §10.2).
     pub password: Option<String>,
 }
 
-/// A loaded configuration, plus where it came from.
+/// A loaded configuration and where it came from.
 #[derive(Debug)]
 pub struct Loaded {
     pub file: File,
-    /// The file that was read, or `None` if there wasn't one.
-    pub path: Option<PathBuf>,
+    pub path: PathBuf,
 }
 
 impl Loaded {
-    /// The directory relative paths in the file resolve against.
+    /// The directory relative paths resolve against: the file's own.
     ///
-    /// The file's own directory rather than the working directory, so that
-    /// `--config ../other/pgpushy.toml` means what it looks like it means.
-    fn base(&self) -> PathBuf {
+    /// Not the working directory, so that `--config ../other/pgpushy.toml`
+    /// means what it looks like.
+    pub fn base(&self) -> &Path {
         self.path
-            .as_ref()
-            .and_then(|path| path.parent())
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."))
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
+    }
+
+    /// Everything about the source tree, resolved.
+    pub fn settings(&self) -> Settings {
+        let file = &self.file;
+        Settings {
+            source_root: match &file.source_root {
+                Some(root) => self.base().join(root),
+                // Defaulting to the file's directory rather than the working
+                // directory is what makes "wrong directory" harmless: the
+                // source tree is anchored to the project, not to the caller.
+                None => self.base().to_path_buf(),
+            },
+            default_schema: file
+                .default_schema
+                .clone()
+                .unwrap_or_else(|| "public".to_owned()),
+            managed_schemas: file.managed_schemas.clone(),
+            exclude: file.exclude.clone().unwrap_or_default(),
+        }
+    }
+
+    /// The pgschema binary, if one is configured. `None` means look on `PATH`.
+    pub fn pgschema_path(&self, flag: Option<&Path>) -> Option<PathBuf> {
+        flag.map(Path::to_path_buf).or_else(|| {
+            self.file
+                .pgschema
+                .path
+                .as_ref()
+                .map(|path| self.base().join(path))
+        })
+    }
+
+    /// Select a named environment (spec §10.2).
+    ///
+    /// A name is always required, even when only one environment exists:
+    /// selecting the sole one automatically would make adding a second silently
+    /// change what an existing command reconciles.
+    pub fn environment(&self, name: &str) -> Result<Target> {
+        let Some(env) = self.file.env.get(name) else {
+            let available = self.file.env.keys().cloned().collect::<Vec<_>>();
+            if available.is_empty() {
+                bail!(
+                    "{}: no environments are defined\n\
+                     \n\
+                     plan and apply need a target. Add one:\n\
+                     \n    \
+                     [env.{name}]\n    \
+                     db   = \"your_database\"\n    \
+                     user = \"your_user\"",
+                    self.path.display(),
+                );
+            }
+            bail!(
+                "{}: no environment named {name:?}\n\
+                 \n\
+                 Defined environments: {}",
+                self.path.display(),
+                available.join(", "),
+            );
+        };
+
+        // No default for either: reconciling the wrong database, or as the
+        // wrong role, are exactly the mistakes naming the environment is
+        // supposed to prevent.
+        let (Some(db), Some(user)) = (env.db.clone(), env.user.clone()) else {
+            let mut missing = Vec::new();
+            if env.db.is_none() {
+                missing.push("db");
+            }
+            if env.user.is_none() {
+                missing.push("user");
+            }
+            bail!(
+                "{}: [env.{name}] is missing {}\n\
+                 \n\
+                 An environment must say which database to reconcile and who to \
+                 connect as; there is no safe default for either.",
+                self.path.display(),
+                missing.join(" and "),
+            );
+        };
+
+        Ok(Target {
+            name: name.to_owned(),
+            host: env.host.clone().unwrap_or_else(|| "localhost".to_owned()),
+            port: env.port.unwrap_or(5432),
+            db,
+            user,
+            sslmode: env.sslmode.clone().unwrap_or_else(|| "prefer".to_owned()),
+            password: env.password.clone(),
+        })
     }
 }
 
-/// Read `pgpushy.toml`, if there is one.
-///
-/// An explicit `--config` that does not exist is an error; an absent default
-/// `pgpushy.toml` is not, because the file is optional.
+/// A named target, fully resolved from its `[env.<name>]` block.
+#[derive(Debug, Clone)]
+pub struct Target {
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+    pub db: String,
+    pub user: String,
+    pub sslmode: String,
+    /// The environment's own password, before `PGPASSWORD` is considered.
+    pub password: Option<String>,
+}
+
+/// Everything about the source tree, resolved.
+#[derive(Debug)]
+pub struct Settings {
+    pub source_root: PathBuf,
+    pub default_schema: String,
+    pub managed_schemas: Option<Vec<String>>,
+    pub exclude: Vec<String>,
+}
+
+/// Read `pgpushy.toml`. Required (spec §10.1).
 pub fn load(explicit: Option<&Path>) -> Result<Loaded> {
     let path = match explicit {
         Some(path) => {
@@ -105,10 +226,7 @@ pub fn load(explicit: Option<&Path>) -> Result<Loaded> {
         None => {
             let default = PathBuf::from(FILE_NAME);
             if !default.exists() {
-                return Ok(Loaded {
-                    file: File::default(),
-                    path: None,
-                });
+                bail!("{}", missing_file_message());
             }
             default
         }
@@ -121,10 +239,37 @@ pub fn load(explicit: Option<&Path>) -> Result<Loaded> {
 
     check_unsupported(&file, &path)?;
 
-    Ok(Loaded {
-        file,
-        path: Some(path),
-    })
+    Ok(Loaded { file, path })
+}
+
+/// What to say when there is no configuration file.
+///
+/// The first thing many people will see, so it explains the requirement rather
+/// than merely stating it, and shows the smallest file that works.
+fn missing_file_message() -> String {
+    let cwd = std::env::current_dir()
+        .map(|dir| dir.display().to_string())
+        .unwrap_or_else(|_| ".".into());
+
+    format!(
+        "no {FILE_NAME} in {cwd}\n\
+         \n\
+         pgpushy reconciles a whole database, so it will not guess which files are\n\
+         desired state or which server to reconcile them against — running from the\n\
+         wrong directory would otherwise treat part of a source tree as all of it,\n\
+         and plan to drop everything else.\n\
+         \n\
+         Create {FILE_NAME} beside your schema files:\n\
+         \n    \
+         # source_root defaults to this file's directory\n    \
+         \n    \
+         [env.local]\n    \
+         db   = \"your_database\"\n    \
+         user = \"your_user\"\n\
+         \n\
+         Then run `pgpushy plan --env local`, or pass --config <path> to use a file\n\
+         somewhere else. {FILE_NAME} is not searched for in parent directories."
+    )
 }
 
 /// Reject settings that are specified but not yet built.
@@ -158,217 +303,133 @@ fn check_unsupported(file: &File, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Everything about the source tree, resolved.
-///
-/// Deliberately does not carry the pgschema binary: `validate` needs all of
-/// this and none of that, so the two are resolved separately (see
-/// [`pgschema_path`]).
-#[derive(Debug)]
-pub struct Settings {
-    pub source_root: PathBuf,
-    pub default_schema: String,
-    pub managed_schemas: Option<Vec<String>>,
-    pub exclude: Vec<String>,
-}
-
-impl Settings {
-    /// Fold CLI flags over the file, then over the built-in defaults.
-    ///
-    /// List-valued settings (`exclude`, `managed_schemas`) **replace** rather
-    /// than append: passing `--exclude` on the command line means "these are
-    /// the exclusions", not "these as well as the file's". Appending would
-    /// make it impossible to narrow a project's exclusions for one run.
-    pub fn resolve(args: &SourceArgs, loaded: &Loaded) -> Self {
-        let base = loaded.base();
-        let file = &loaded.file;
-
-        let source_root = args
-            .source_root
-            .clone()
-            .or_else(|| file.source_root.as_ref().map(|root| base.join(root)))
-            .unwrap_or_else(|| PathBuf::from("."));
-
-        let managed_schemas = if args.managed_schemas.is_empty() {
-            file.managed_schemas.clone()
-        } else {
-            Some(args.managed_schemas.clone())
-        };
-
-        let exclude = if args.exclude.is_empty() {
-            file.exclude.clone().unwrap_or_default()
-        } else {
-            args.exclude.clone()
-        };
-
-        Self {
-            source_root,
-            default_schema: args
-                .default_schema
-                .clone()
-                .or_else(|| file.default_schema.clone())
-                .unwrap_or_else(|| "public".to_owned()),
-            managed_schemas,
-            exclude,
-        }
-    }
-}
-
-/// The pgschema binary a command should use, if one was configured.
-///
-/// `None` means fall back to a `PATH` lookup.
-pub fn pgschema_path(args: &PgschemaArgs, loaded: &Loaded) -> Option<PathBuf> {
-    args.pgschema_path.clone().or_else(|| {
-        loaded
-            .file
-            .pgschema
-            .path
-            .as_ref()
-            .map(|path| loaded.base().join(path))
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn parse(toml: &str) -> File {
-        toml::from_str(toml).expect("valid config")
-    }
-
     fn loaded(toml: &str) -> Loaded {
         Loaded {
-            file: parse(toml),
-            path: Some(PathBuf::from("proj/pgpushy.toml")),
-        }
-    }
-
-    fn no_args() -> SourceArgs {
-        SourceArgs {
-            source_root: None,
-            default_schema: None,
-            managed_schemas: Vec::new(),
-            exclude: Vec::new(),
+            file: toml::from_str(toml).expect("valid config"),
+            path: PathBuf::from("/projects/app/pgpushy.toml"),
         }
     }
 
     #[test]
-    fn an_empty_config_yields_the_built_in_defaults() {
-        let settings = Settings::resolve(
-            &no_args(),
-            &Loaded {
-                file: File::default(),
-                path: None,
-            },
-        );
-        assert_eq!(settings.source_root, PathBuf::from("."));
+    fn the_source_root_defaults_to_the_config_files_directory() {
+        let settings = loaded("").settings();
+        assert_eq!(settings.source_root, PathBuf::from("/projects/app"));
         assert_eq!(settings.default_schema, "public");
         assert!(settings.managed_schemas.is_none());
         assert!(settings.exclude.is_empty());
     }
 
     #[test]
-    fn the_file_supplies_what_the_flags_do_not() {
-        let settings = Settings::resolve(
-            &no_args(),
-            &loaded(
-                r#"
-                source_root = "db/schema"
-                default_schema = "app"
-                managed_schemas = ["app", "billing"]
-                exclude = ["seeds/**"]
-                "#,
-            ),
-        );
-
-        assert_eq!(settings.source_root, PathBuf::from("proj/db/schema"));
-        assert_eq!(settings.default_schema, "app");
-        assert_eq!(settings.managed_schemas.unwrap(), vec!["app", "billing"]);
-        assert_eq!(settings.exclude, vec!["seeds/**"]);
-    }
-
-    #[test]
-    fn a_flag_beats_the_file() {
-        let mut args = no_args();
-        args.default_schema = Some("from_flag".into());
-        args.source_root = Some(PathBuf::from("/elsewhere"));
-
-        let settings = Settings::resolve(
-            &args,
-            &loaded("source_root = \"db\"\ndefault_schema = \"from_file\""),
-        );
-
-        assert_eq!(settings.default_schema, "from_flag");
-        assert_eq!(settings.source_root, PathBuf::from("/elsewhere"));
-    }
-
-    /// Replace, not append — otherwise a project's exclusions could never be
-    /// narrowed for a single run.
-    #[test]
-    fn list_flags_replace_the_files_lists() {
-        let mut args = no_args();
-        args.exclude = vec!["only-this/**".into()];
-
-        let settings = Settings::resolve(&args, &loaded(r#"exclude = ["a/**", "b/**"]"#));
-
-        assert_eq!(settings.exclude, vec!["only-this/**"]);
-    }
-
-    /// Paths in the file are relative to the file, so `--config` pointing
-    /// elsewhere means what it looks like.
-    #[test]
-    fn file_paths_resolve_against_the_files_own_directory() {
-        let loaded = Loaded {
-            file: parse("source_root = \"schema\"\n[pgschema]\npath = \"bin/pgschema\""),
-            path: Some(PathBuf::from("/projects/app/pgpushy.toml")),
-        };
-
+    fn relative_paths_resolve_against_that_directory() {
+        let loaded = loaded("source_root = \"db/schema\"\n[pgschema]\npath = \"bin/pgschema\"");
         assert_eq!(
-            Settings::resolve(&no_args(), &loaded).source_root,
-            PathBuf::from("/projects/app/schema"),
+            loaded.settings().source_root,
+            PathBuf::from("/projects/app/db/schema")
         );
         assert_eq!(
-            pgschema_path(
-                &PgschemaArgs {
-                    pgschema_path: None
-                },
-                &loaded
-            )
-            .unwrap(),
-            PathBuf::from("/projects/app/bin/pgschema"),
+            loaded.pgschema_path(None).unwrap(),
+            PathBuf::from("/projects/app/bin/pgschema")
         );
     }
 
+    /// The pgschema binary differs per machine and cannot change what is
+    /// reconciled, so unlike project structure it stays a flag.
     #[test]
     fn a_pgschema_path_flag_beats_the_file() {
-        let loaded = loaded("[pgschema]\npath = \"from/file\"");
-        let args = PgschemaArgs {
-            pgschema_path: Some(PathBuf::from("/from/flag")),
-        };
-        assert_eq!(
-            pgschema_path(&args, &loaded).unwrap(),
-            PathBuf::from("/from/flag")
-        );
+        let loaded = loaded("[pgschema]\npath = \"bin/pgschema\"");
+        let flag = PathBuf::from("/usr/local/bin/pgschema");
+        assert_eq!(loaded.pgschema_path(Some(&flag)).unwrap(), flag);
+    }
+
+    #[test]
+    fn an_environment_resolves_with_conventional_defaults() {
+        let target = loaded("[env.local]\ndb = \"shop\"\nuser = \"joe\"")
+            .environment("local")
+            .expect("ok");
+
+        assert_eq!(target.host, "localhost");
+        assert_eq!(target.port, 5432);
+        assert_eq!(target.sslmode, "prefer");
+        assert_eq!(target.db, "shop");
+        assert_eq!(target.user, "joe");
+    }
+
+    /// Reconciling the wrong database, or as the wrong role, are the mistakes
+    /// naming an environment exists to prevent.
+    #[test]
+    fn an_environment_must_say_which_database_and_who() {
+        let err = loaded("[env.local]\nhost = \"db\"")
+            .environment("local")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("missing db and user"), "{err}");
+
+        let err = loaded("[env.local]\ndb = \"shop\"")
+            .environment("local")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("missing user"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_environment_lists_the_defined_ones() {
+        let err =
+            loaded("[env.local]\ndb = \"a\"\nuser = \"u\"\n[env.prod]\ndb = \"b\"\nuser = \"u\"")
+                .environment("staging")
+                .unwrap_err()
+                .to_string();
+
+        assert!(err.contains("no environment named \"staging\""), "{err}");
+        assert!(err.contains("local, prod"), "{err}");
+    }
+
+    #[test]
+    fn a_file_with_no_environments_says_how_to_add_one() {
+        let err = loaded("source_root = \"db\"")
+            .environment("local")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no environments are defined"), "{err}");
+        assert!(err.contains("[env.local]"), "{err}");
+    }
+
+    /// Even with exactly one environment: selecting it automatically would make
+    /// adding a second silently change what an existing command reconciles.
+    #[test]
+    fn the_sole_environment_is_still_not_selected_automatically() {
+        let loaded = loaded("[env.only]\ndb = \"a\"\nuser = \"u\"");
+        assert!(loaded.environment("other").is_err());
+        assert!(loaded.environment("only").is_ok());
     }
 
     #[test]
     fn a_mistyped_key_is_an_error_rather_than_silence() {
         let err = toml::from_str::<File>("exclude_patterns = [\"x\"]").unwrap_err();
         assert!(err.to_string().contains("exclude_patterns"), "{err}");
+
+        let err = toml::from_str::<File>("[env.local]\ndatabase = \"x\"").unwrap_err();
+        assert!(err.to_string().contains("database"), "{err}");
     }
 
     #[test]
     fn settings_that_are_not_built_yet_say_so() {
         let path = Path::new("pgpushy.toml");
+        let parse = |t: &str| toml::from_str::<File>(t).expect("valid");
 
-        let managed = parse("[pgschema]\nbackend = \"managed\"");
-        let err = check_unsupported(&managed, path).unwrap_err().to_string();
+        let err = check_unsupported(&parse("[pgschema]\nbackend = \"managed\""), path)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("not available yet"), "{err}");
 
-        let pinned = parse("[pgschema]\nversion = \"1.12.0\"");
-        let err = check_unsupported(&pinned, path).unwrap_err().to_string();
+        let err = check_unsupported(&parse("[pgschema]\nversion = \"1.12.0\""), path)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("managed backend"), "{err}");
 
-        // The one backend that does exist is accepted.
         assert!(check_unsupported(&parse("[pgschema]\nbackend = \"byo\""), path).is_ok());
     }
 }
