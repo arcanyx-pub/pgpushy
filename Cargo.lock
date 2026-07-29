@@ -807,6 +807,8 @@ dependencies = [
  "postgres",
  "predicates",
  "semver",
+ "serde",
+ "serde_json",
  "tempfile",
  "which 8.0.5",
 ]

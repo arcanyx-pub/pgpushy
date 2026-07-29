@@ -464,3 +464,352 @@ fn a_missing_pgschema_says_how_to_get_one() {
         .failure()
         .stderr(predicates::str::contains("no pgschema binary at"));
 }
+
+// ---------------------------------------------------------------------------
+// Apply (spec §6.2, §8.6, §9)
+// ---------------------------------------------------------------------------
+
+/// The end of the thesis: an unordered, unqualified tree reconciles a real
+/// database, and running it again does nothing.
+#[test]
+fn applies_and_then_converges() {
+    let target = require_target!();
+    let schema = unique_schema("apply");
+    let _schemas = Schemas::create(&target, std::slice::from_ref(&schema));
+
+    let dir = tree(&[
+        ("b_orders.sql", ORDERS_UNORDERED.to_owned()),
+        (
+            "a_customers.sql",
+            "CREATE TABLE customers (id int PRIMARY KEY);".to_owned(),
+        ),
+    ]);
+
+    target
+        .pgpushy("apply", dir.path())
+        .args(["--default-schema", &schema, "--auto-approve"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("2 changes"))
+        .stdout(predicates::str::contains("Applied 1 schema"));
+
+    target
+        .pgpushy("apply", dir.path())
+        .args(["--default-schema", &schema, "--auto-approve"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("Nothing to apply"));
+}
+
+const ORDERS_UNORDERED: &str =
+    "CREATE TABLE orders (id int PRIMARY KEY, customer_id int REFERENCES customers(id));";
+
+/// Spec §8.6: approval is required, and a run that cannot ask must not assume
+/// the answer is yes. Test processes never have a terminal, so this is exactly
+/// the CI case.
+#[test]
+fn refuses_to_apply_unattended_without_auto_approve() {
+    let target = require_target!();
+    let schema = unique_schema("noapprove");
+    let _schemas = Schemas::create(&target, std::slice::from_ref(&schema));
+
+    let dir = tree(&[("t.sql", "CREATE TABLE t (id int PRIMARY KEY);".to_owned())]);
+
+    target
+        .pgpushy("apply", dir.path())
+        .args(["--default-schema", &schema])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "standard input is not a terminal",
+        ))
+        .stderr(predicates::str::contains("--auto-approve"));
+
+    // And nothing was applied.
+    let tables: i64 = target
+        .client()
+        .query_one(
+            "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = $1 AND c.relkind = 'r'",
+            &[&schema],
+        )
+        .expect("count tables")
+        .get(0);
+    assert_eq!(
+        tables, 0,
+        "the target must be untouched when approval was refused"
+    );
+}
+
+/// The approval summary must name destructive changes individually — a count
+/// alone is not a review (spec §8.6).
+#[test]
+fn names_each_destructive_change_before_asking() {
+    let target = require_target!();
+    let schema = unique_schema("destr");
+    let _schemas = Schemas::create(&target, std::slice::from_ref(&schema));
+
+    let dir = tree(&[(
+        "t.sql",
+        "CREATE TABLE t (id int PRIMARY KEY, doomed text);".to_owned(),
+    )]);
+    target
+        .pgpushy("apply", dir.path())
+        .args(["--default-schema", &schema, "--auto-approve"])
+        .assert()
+        .success();
+
+    std::fs::write(
+        dir.path().join("t.sql"),
+        "CREATE TABLE t (id int PRIMARY KEY);",
+    )
+    .expect("rewrite");
+
+    target
+        .pgpushy("apply", dir.path())
+        .args(["--default-schema", &schema, "--auto-approve"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("1 destructive"))
+        .stdout(predicates::str::contains("Destructive changes:"))
+        .stdout(predicates::str::contains(format!("{schema}.t.doomed")));
+}
+
+/// Spec §6.2, verified end to end: removing a cross-schema foreign key and the
+/// column it points at in one change is refused, and nothing is applied.
+///
+/// The schema names matter. Apply order falls back to name order once the
+/// desired state no longer has the foreign key linking them, and `aa_` sorts
+/// before `zz_` — putting the referenced schema first, which is the order that
+/// cannot work.
+#[test]
+fn refuses_a_cross_schema_removal_the_order_cannot_satisfy() {
+    let target = require_target!();
+    let id = std::process::id();
+    let referenced = format!("pgpushy_t_aa_up_{id}");
+    let referencing = format!("pgpushy_t_zz_down_{id}");
+    let _schemas = Schemas::create(&target, &[referenced.clone(), referencing.clone()]);
+
+    let dir = tree(&[
+        (
+            "a.sql",
+            format!(
+                "CREATE TABLE {referenced}.parent \
+                 (id int PRIMARY KEY, alt int, CONSTRAINT parent_alt_key UNIQUE (alt));"
+            ),
+        ),
+        (
+            "z.sql",
+            format!(
+                "CREATE TABLE {referencing}.child (id int PRIMARY KEY, alt_ref int);
+                 ALTER TABLE {referencing}.child ADD CONSTRAINT child_parent_fk
+                     FOREIGN KEY (alt_ref) REFERENCES {referenced}.parent (alt);"
+            ),
+        ),
+    ]);
+    target
+        .pgpushy("apply", dir.path())
+        .arg("--auto-approve")
+        .assert()
+        .success();
+
+    // Now remove both the foreign key and the column it depends on.
+    std::fs::write(
+        dir.path().join("a.sql"),
+        format!("CREATE TABLE {referenced}.parent (id int PRIMARY KEY);"),
+    )
+    .expect("rewrite");
+    std::fs::write(
+        dir.path().join("z.sql"),
+        format!("CREATE TABLE {referencing}.child (id int PRIMARY KEY, alt_ref int);"),
+    )
+    .expect("rewrite");
+
+    target
+        .pgpushy("apply", dir.path())
+        .arg("--auto-approve")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("cannot be applied in one pass"))
+        .stderr(predicates::str::contains("child_parent_fk"))
+        .stderr(predicates::str::contains("apply this in two steps"))
+        .stderr(predicates::str::contains("no schemas were applied"));
+
+    // Refused means refused: the foreign key is still there. Scoped to this
+    // test's own schema — constraint names are per-table, so an unscoped count
+    // would also see the identically-named constraint another test created.
+    let remaining: i64 = target
+        .client()
+        .query_one(
+            "SELECT count(*) FROM pg_constraint con
+             JOIN pg_class c ON c.oid = con.conrelid
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = $1 AND con.conname = 'child_parent_fk'",
+            &[&referencing],
+        )
+        .expect("count")
+        .get(0);
+    assert_eq!(remaining, 1, "nothing should have been applied");
+}
+
+/// And the two-step remedy pgpushy prints actually works.
+#[test]
+fn the_two_step_remedy_converges() {
+    let target = require_target!();
+    let id = std::process::id();
+    let referenced = format!("pgpushy_t_aa_up2_{id}");
+    let referencing = format!("pgpushy_t_zz_down2_{id}");
+    let _schemas = Schemas::create(&target, &[referenced.clone(), referencing.clone()]);
+
+    let with_column = format!(
+        "CREATE TABLE {referenced}.parent \
+         (id int PRIMARY KEY, alt int, CONSTRAINT parent_alt_key UNIQUE (alt));"
+    );
+    let dir = tree(&[
+        ("a.sql", with_column.clone()),
+        (
+            "z.sql",
+            format!(
+                "CREATE TABLE {referencing}.child (id int PRIMARY KEY, alt_ref int);
+                 ALTER TABLE {referencing}.child ADD CONSTRAINT child_parent_fk
+                     FOREIGN KEY (alt_ref) REFERENCES {referenced}.parent (alt);"
+            ),
+        ),
+    ]);
+    target
+        .pgpushy("apply", dir.path())
+        .arg("--auto-approve")
+        .assert()
+        .success();
+
+    // Step 1: remove only the foreign key, keeping the column.
+    std::fs::write(
+        dir.path().join("z.sql"),
+        format!("CREATE TABLE {referencing}.child (id int PRIMARY KEY, alt_ref int);"),
+    )
+    .expect("rewrite");
+    target
+        .pgpushy("apply", dir.path())
+        .arg("--auto-approve")
+        .assert()
+        .success();
+
+    // Step 2: now the column can go.
+    std::fs::write(
+        dir.path().join("a.sql"),
+        format!("CREATE TABLE {referenced}.parent (id int PRIMARY KEY);"),
+    )
+    .expect("rewrite");
+    target
+        .pgpushy("apply", dir.path())
+        .arg("--auto-approve")
+        .assert()
+        .success();
+
+    target
+        .pgpushy("apply", dir.path())
+        .arg("--auto-approve")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("Nothing to apply"));
+}
+
+/// Spec §7: a cycle has no valid apply order, so `apply` refuses outright —
+/// unlike `plan`, which shows the plans because they are how you break it.
+#[test]
+fn a_cycle_blocks_apply_entirely() {
+    let target = require_target!();
+    let id = std::process::id();
+    let one = format!("pgpushy_t_cyc1_{id}");
+    let two = format!("pgpushy_t_cyc2_{id}");
+    let _schemas = Schemas::create(&target, &[one.clone(), two.clone()]);
+
+    let dir = tree(&[(
+        "cycle.sql",
+        format!(
+            "CREATE TABLE {one}.a (id int PRIMARY KEY, r int REFERENCES {two}.b(id));
+             CREATE TABLE {two}.b (id int PRIMARY KEY, r int REFERENCES {one}.a(id));"
+        ),
+    )]);
+
+    target
+        .pgpushy("apply", dir.path())
+        .arg("--auto-approve")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("cross-schema foreign key cycle"))
+        .stderr(predicates::str::contains("no schemas were applied"));
+}
+
+/// Spec §9: when a schema fails partway, say exactly what landed, what broke,
+/// and what never ran — and that the applied ones are not rolled back.
+#[test]
+fn a_partial_failure_reports_what_landed() {
+    let target = require_target!();
+    let id = std::process::id();
+    // Name-ordered so the schema that succeeds is applied first.
+    let good = format!("pgpushy_t_p1good_{id}");
+    let bad = format!("pgpushy_t_p2bad_{id}");
+    let _schemas = Schemas::create(&target, &[good.clone(), bad.clone()]);
+
+    let dir = tree(&[
+        (
+            "good.sql",
+            format!("CREATE TABLE {good}.t (id int PRIMARY KEY);"),
+        ),
+        (
+            "bad.sql",
+            format!("CREATE TABLE {bad}.t (id int PRIMARY KEY, amount int);"),
+        ),
+    ]);
+    target
+        .pgpushy("apply", dir.path())
+        .arg("--auto-approve")
+        .assert()
+        .success();
+
+    // Data that the new constraint will reject, so the second schema's apply
+    // fails for a reason pgpushy cannot foresee — which is the point.
+    target
+        .client()
+        .batch_execute(&format!("INSERT INTO {bad}.t (id, amount) VALUES (1, -5)"))
+        .expect("insert violating row");
+
+    std::fs::write(
+        dir.path().join("good.sql"),
+        format!("CREATE TABLE {good}.t (id int PRIMARY KEY, added text);"),
+    )
+    .expect("rewrite");
+    std::fs::write(
+        dir.path().join("bad.sql"),
+        format!(
+            "CREATE TABLE {bad}.t (id int PRIMARY KEY, amount int,
+                 CONSTRAINT amount_positive CHECK (amount > 0));"
+        ),
+    )
+    .expect("rewrite");
+
+    target
+        .pgpushy("apply", dir.path())
+        .arg("--auto-approve")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(format!(
+            "apply failed at schema {bad}"
+        )))
+        .stderr(predicates::str::contains(format!("applied:      {good}")))
+        .stderr(predicates::str::contains("NOT rolled back"));
+
+    // The successful schema really did land, which is what "not rolled back"
+    // means and why it has to be said.
+    let added: i64 = target
+        .client()
+        .query_one(
+            "SELECT count(*) FROM information_schema.columns
+             WHERE table_schema = $1 AND table_name = 't' AND column_name = 'added'",
+            &[&good],
+        )
+        .expect("count")
+        .get(0);
+    assert_eq!(added, 1);
+}

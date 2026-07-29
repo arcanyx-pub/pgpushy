@@ -47,7 +47,10 @@ impl SchemaName {
 
 impl fmt::Display for SchemaName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        // `pad` rather than `write_str`, so that width and alignment work:
+        // `{schema:<20}` is how the reports line schemas up in a column, and
+        // `write_str` silently ignores those flags.
+        f.pad(&self.0)
     }
 }
 

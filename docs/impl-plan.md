@@ -68,6 +68,21 @@ commands are in [Appendix A](#appendix-a-reproduction-harness).
 - `plan` is **read-only on the target** (scratch lives in the plan DB); `apply`
   writes only the diff (it does **not** emit `CREATE SCHEMA` — it assumes the
   schema exists).
+- **`--output-human stdout --output-json <file>` work together** in one
+  invocation, so the plan a human reads and the plan pgpushy summarizes are the
+  same computation. The JSON is `{groups: [{steps: [{sql, type, operation,
+  path}]}]}`, where `operation` is `create|drop|alter` and `path` is dotted
+  (`public.orders.customer_id`). A plan with nothing to do has `groups: null`,
+  not `[]`.
+- **`apply --plan <file.json>` applies a previously computed plan**, and
+  pgschema refuses one whose target has changed since (the plan carries a
+  `source_fingerprint`). This is what lets pgpushy apply the plans the operator
+  reviewed rather than recomputing them.
+- **Drops are not generated uniformly**, which is the whole of spec §6.2:
+  `DROP TABLE … CASCADE` for a table, but `ALTER TABLE … DROP COLUMN` and
+  `ALTER TABLE … DROP CONSTRAINT` with no CASCADE. So dropping a table a
+  cross-schema FK points at is safe in any order, and dropping the referenced
+  *column* or *unique constraint* is not.
 
 **What pgschema itself manages** (from its docs, 2026-07-29)
 - Fifteen statement types: `CREATE TABLE`, `CREATE INDEX`, `CREATE VIEW`,
@@ -473,9 +488,9 @@ touches nothing. `--auto-approve` skips the prompt; a non-TTY stdin without
   resolution, target inspection, and `pgschema plan` per managed schema in
   dependency order — the multi-schema loop came free, since `pgpushy-core`
   already produces the order. Fixtures 1–3, 5, 7, 8 (via plan), 9.
-- **M3 — Multi-schema + `apply`.** Graph ordering in anger, cross-schema FK
-  removal detection, plan pass + single approval, stop-at-first-failure
-  reporting. Fixtures 4–6, 8, 10, 11.
+- **M3 — `apply`. ✅ Done.** Plan pass retaining each plan as JSON, single
+  database-level approval, cross-schema FK removal detection, apply via
+  `--plan`, stop-at-first-failure reporting. Fixtures 4–6, 8, 10, 11.
 - **M4 — `pgpushy.toml`.** config + precedence + `managed_schemas` + `exclude`
   + password warning.
 - **M5 — UX polish.** error messages, plan presentation, `--out`, identity
@@ -568,12 +583,18 @@ logic lives, and `validate` makes it shippable and testable on its own.
   SHA-256. Decide the update process when we bump the pinned version (recompute
   hashes for all four platforms). Consider verifying against GitHub's API
   digest too.
-- **R3 — Cross-schema FK removal detection precision.** Spec §6.2 must reject
-  the genuinely unorderable case without rejecting benign ones (e.g. an FK
-  removed while its referenced table survives, which applies fine in either
-  order). Getting this wrong in the strict direction blocks legitimate changes.
-  Model it explicitly: an error only when the removed FK's referenced *object*
-  is also being dropped, or the §7 order otherwise cannot satisfy both.
+- **~~R3~~ — RESOLVED (2026-07-29).** Cross-schema FK removal detection is
+  precise because it reads pgschema's own plan rather than guessing: a hazard
+  only when the referenced schema's plan drops the specific column or unique
+  constraint the foreign key depends on, *and* the referencing schema is
+  ordered after it. Table drops are explicitly not flagged, since pgschema
+  CASCADEs them. One residual sharp edge, documented rather than fixed: when
+  the desired state removes the foreign key entirely, the graph has no edge
+  between the pair, so their relative order falls to the name tie-break — which
+  may happen to be safe or may not. Either way pgpushy is correct (it refuses
+  when unsafe), but whether a given change needs the two-step remedy depends on
+  schema names. Ordering such pairs deliberately is the future work in spec
+  §14.
 - **R4 — testcontainers vs. image wrapper** for pgschema in CI, and how to get
   a pgschema binary into CI hermetically (download in `just setup`).
 

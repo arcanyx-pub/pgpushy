@@ -57,6 +57,31 @@ pub enum Command {
         #[arg(long, value_name = "PATH")]
         out: Option<PathBuf>,
     },
+
+    /// Reconcile the database: plan every managed schema, then apply.
+    ///
+    /// Approval is asked once, for the whole database, after every plan has
+    /// been computed and shown — so declining leaves the target untouched.
+    /// Apply is not atomic across schemas: a failure partway leaves earlier
+    /// schemas applied.
+    Apply {
+        #[command(flatten)]
+        source: SourceArgs,
+
+        #[command(flatten)]
+        connection: ConnectionArgs,
+
+        #[command(flatten)]
+        pgschema: PgschemaArgs,
+
+        /// Write the synthesized desired state to a file.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+
+        /// Apply without prompting. Required when stdin is not a terminal.
+        #[arg(long)]
+        auto_approve: bool,
+    },
 }
 
 #[derive(Args, Debug)]

@@ -14,6 +14,7 @@
 
 use crate::cli::SourceArgs;
 use crate::discovery::Discovered;
+use crate::hazard::Hazard;
 use crate::inspect::Identity;
 use crate::provider::PgschemaBin;
 use pgpushy_core::{Analysis, Diagnostic, SchemaName};
@@ -238,4 +239,124 @@ pub fn pgschema_failed(schemas: &[SchemaName]) {
             .collect::<Vec<_>>()
             .join(", "),
     );
+}
+
+/// Spec §6.2: a cross-schema removal the apply order cannot satisfy.
+///
+/// An error in both commands — it makes the change unappliable either way, and
+/// `plan` is a gate as much as a preview. `applying` only controls whether the
+/// closing line reassures the reader that nothing was touched, which would be
+/// a strange thing to say about a command that never applies anything.
+pub fn hazards(hazards: &[Hazard], applying: bool) {
+    eprintln!();
+    eprintln!(
+        "error: {} cross-schema foreign key removal{} cannot be applied in one pass",
+        hazards.len(),
+        s(hazards.len()),
+    );
+
+    for hazard in hazards {
+        let fk = &hazard.foreign_key;
+        eprintln!();
+        eprintln!(
+            "  {} on {}.{} references {}.{}",
+            fk.name, fk.from_schema, fk.from_table, fk.to_schema, fk.to_table,
+        );
+        eprintln!(
+            "  but applying {} would drop the {} it depends on: {}.{}.{}",
+            fk.to_schema, hazard.dropped_kind, fk.to_schema, fk.to_table, hazard.dropped,
+        );
+        eprintln!(
+            "  and {} is applied after {}, so the foreign key still exists at that point.",
+            fk.from_schema, fk.to_schema,
+        );
+        eprintln!("  {}", hazard.remedy());
+    }
+
+    eprintln!();
+    eprintln!("  (dropping the referenced table instead would be fine — pgschema drops");
+    eprintln!("   tables with CASCADE, which removes the foreign key along with it.)");
+    if applying {
+        eprintln!();
+        eprintln!("  no schemas were applied.");
+    }
+}
+
+/// Said when a cycle stops `apply` before anything is planned.
+pub fn cycle_blocks_apply() {
+    eprintln!("  apply cannot proceed. Run `pgpushy plan` to see the plans for each");
+    eprintln!("  schema, which is usually the fastest way to find the constraint to remove.");
+    eprintln!();
+    eprintln!("  no schemas were applied.");
+}
+
+pub fn declined() {
+    println!("\n  Aborted. No schemas were applied.");
+}
+
+/// A schema whose plan was empty needs no apply at all.
+pub fn skipped_unchanged(schema: &SchemaName) {
+    println!("\n\u{2500}\u{2500} {schema} \u{2500}\u{2500}");
+    println!("No changes; nothing to apply.");
+}
+
+pub fn applied(applied: &[SchemaName]) {
+    println!();
+    if applied.is_empty() {
+        println!("  Nothing to apply; the target already matches the source tree.");
+    } else {
+        println!(
+            "  Applied {} schema{}: {}",
+            applied.len(),
+            s(applied.len()),
+            applied
+                .iter()
+                .map(SchemaName::as_str)
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    }
+}
+
+/// Spec §9: after a failure partway through, say exactly where things stand.
+///
+/// The three groups are kept separate because they need different responses:
+/// what landed, what broke, and what never ran.
+pub fn partial_apply(applied: &[SchemaName], failed: &SchemaName, unattempted: &[SchemaName]) {
+    eprintln!();
+    eprintln!("error: apply failed at schema {failed}");
+    eprintln!();
+
+    if applied.is_empty() {
+        eprintln!("  applied:      (none)");
+    } else {
+        eprintln!(
+            "  applied:      {}",
+            applied
+                .iter()
+                .map(SchemaName::as_str)
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    }
+    eprintln!("  failed:       {failed}");
+    if unattempted.is_empty() {
+        eprintln!("  not attempted: (none)");
+    } else {
+        eprintln!(
+            "  not attempted: {}",
+            unattempted
+                .iter()
+                .map(SchemaName::as_str)
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    }
+
+    if !applied.is_empty() {
+        eprintln!();
+        eprintln!(
+            "  apply is not atomic across schemas: the schemas listed as applied are\n               NOT rolled back. Fix the failure and run pgpushy apply again — the\n               already-applied schemas will plan as no-ops."
+        );
+    }
 }

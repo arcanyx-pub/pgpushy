@@ -1,11 +1,11 @@
-//! Running pgschema (spec §8.1, §8.3).
+//! Running pgschema (spec §8.1, §8.3, §8.6).
 //!
 //! Deliberately thin. pgpushy builds the argv, hands over the synthesized
 //! document, and lets pgschema's own output through untouched — it does not
-//! parse plans or reformat them (G3). What pgpushy *does* own is the three
-//! arguments it must not let the user set: `--schema`, because it loops over
-//! the managed set; `--file`, because it synthesizes the desired state; and
-//! `--auto-approve`, because approval happens once at the pgpushy level.
+//! reformat plans (G3). What pgpushy *does* own is the arguments it must not
+//! let the user set: `--schema`, because it loops over the managed set;
+//! `--file` and `--plan`, because it supplies both; and `--auto-approve`,
+//! because approval happens once at the pgpushy level.
 
 use crate::conn::Resolved;
 use crate::provider::PgschemaBin;
@@ -14,53 +14,70 @@ use pgpushy_core::SchemaName;
 use std::path::Path;
 use std::process::Command;
 
-/// Which pgschema subcommand to run.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Subcommand {
-    Plan,
-    Apply,
-}
-
-impl Subcommand {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Plan => "plan",
-            Self::Apply => "apply",
-        }
-    }
-}
-
-/// Run pgschema against one schema, streaming its output through.
+/// Plan one schema, streaming the human-readable output through and writing a
+/// machine-readable copy for pgpushy to read (spec §8.6).
 ///
-/// Returns whether pgschema succeeded. A non-zero exit is not an error in the
-/// `anyhow` sense — pgschema has already explained itself on stderr, and the
-/// caller decides what a failure means for the run as a whole.
-pub fn run(
+/// Both forms come out of the same invocation, so the plan the operator reads
+/// and the plan pgpushy summarizes are the same computation — not two runs
+/// that could disagree.
+pub fn plan(
     binary: &PgschemaBin,
-    subcommand: Subcommand,
     connection: &Resolved,
     schema: &SchemaName,
     file: &Path,
+    json_out: &Path,
 ) -> Result<bool> {
-    let mut command = Command::new(&binary.path);
-    command.arg(subcommand.as_str());
-    command.args(["--schema", schema.as_str()]);
+    let mut command = base(binary, connection, "plan", schema);
     command.arg("--file").arg(file);
+    command.arg("--output-human").arg("stdout");
+    command.arg("--output-json").arg(json_out);
+    run(command, binary, "plan")
+}
+
+/// Apply a plan pgschema computed earlier (spec §8.6).
+///
+/// Applying the reviewed plan rather than recomputing from the desired state
+/// is what makes the change that lands the change that was approved. pgschema
+/// fingerprints the state each plan was computed against and refuses one whose
+/// target has since moved, so drift between plan and apply fails loudly
+/// instead of quietly applying something nobody saw.
+pub fn apply_plan(
+    binary: &PgschemaBin,
+    connection: &Resolved,
+    schema: &SchemaName,
+    plan_file: &Path,
+) -> Result<bool> {
+    let mut command = base(binary, connection, "apply", schema);
+    command.arg("--plan").arg(plan_file);
+    // Approval already happened, once, for the whole database (spec §8.6).
+    command.arg("--auto-approve");
+    run(command, binary, "apply")
+}
+
+fn base(
+    binary: &PgschemaBin,
+    connection: &Resolved,
+    subcommand: &str,
+    schema: &SchemaName,
+) -> Command {
+    let mut command = Command::new(&binary.path);
+    command.arg(subcommand);
+    command.args(["--schema", schema.as_str()]);
     command.args(connection.pgschema_flags());
-
-    if subcommand == Subcommand::Apply {
-        // Approval happened once, for the database, before anything was
-        // touched (spec §8.6). pgschema must not ask again.
-        command.arg("--auto-approve");
-    }
-
-    // Resolve nothing for itself: the password arrives here, and every other
-    // PG* variable is stripped (spec §6.3).
+    // Resolve nothing for itself: the password arrives through the
+    // environment, and every other PG* variable is stripped (spec §6.3).
     connection.command_env(&mut command);
+    command
+}
 
+/// Run pgschema, streaming its output.
+///
+/// A non-zero exit is not an error in the `anyhow` sense — pgschema has already
+/// explained itself on stderr, and the caller decides what a failure means for
+/// the run as a whole.
+fn run(mut command: Command, binary: &PgschemaBin, subcommand: &str) -> Result<bool> {
     let status = command
         .status()
-        .with_context(|| format!("running {} {}", binary.path.display(), subcommand.as_str()))?;
-
+        .with_context(|| format!("running {} {subcommand}", binary.path.display()))?;
     Ok(status.success())
 }

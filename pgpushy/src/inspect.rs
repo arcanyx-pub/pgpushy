@@ -16,8 +16,30 @@ use postgres::{Client, NoTls};
 pub struct Inspection {
     /// Managed schemas that do not exist on the target (spec §6.1).
     pub missing_schemas: Vec<SchemaName>,
+    /// Foreign keys crossing between two managed schemas (spec §6.2).
+    pub cross_schema_foreign_keys: Vec<CrossSchemaForeignKey>,
     /// Which database pgpushy actually reached (spec §6.3).
     pub identity: Identity,
+}
+
+/// A foreign key on the target whose two ends are in different managed schemas.
+///
+/// Carries what it *depends on* rather than just what it points at: the
+/// referenced columns, and the unique or primary key constraint backing them.
+/// Those are the objects whose removal the apply order cannot accommodate
+/// (spec §6.2), so they are what the check in [`crate::hazard`] matches
+/// against.
+#[derive(Debug, Clone)]
+pub struct CrossSchemaForeignKey {
+    pub from_schema: SchemaName,
+    pub from_table: String,
+    pub name: String,
+    pub to_schema: SchemaName,
+    pub to_table: String,
+    /// The referenced columns, in key order.
+    pub to_columns: Vec<String>,
+    /// The unique or primary key constraint the foreign key depends on.
+    pub to_constraint: Option<String>,
 }
 
 /// Enough to identify the target unambiguously in output.
@@ -49,11 +71,74 @@ pub fn inspect(connection: &Resolved, managed: &[SchemaName]) -> Result<Inspecti
 
     let identity = read_identity(&mut client)?;
     let missing_schemas = missing_schemas(&mut client, managed)?;
+    let cross_schema_foreign_keys = cross_schema_foreign_keys(&mut client, managed)?;
 
     Ok(Inspection {
         missing_schemas,
+        cross_schema_foreign_keys,
         identity,
     })
+}
+
+/// Foreign keys on the target that cross between two managed schemas.
+///
+/// Both ends must be managed: a foreign key reaching into a schema pgpushy
+/// does not reconcile cannot be affected by an ordering pgpushy chooses,
+/// because pgpushy never applies anything to the other end.
+fn cross_schema_foreign_keys(
+    client: &mut Client,
+    managed: &[SchemaName],
+) -> Result<Vec<CrossSchemaForeignKey>> {
+    if managed.len() < 2 {
+        return Ok(Vec::new());
+    }
+
+    let names: Vec<&str> = managed.iter().map(SchemaName::as_str).collect();
+    let rows = client
+        .query(
+            "SELECT fn.nspname,
+                    fc.relname,
+                    con.conname,
+                    tn.nspname,
+                    tc.relname,
+                    ARRAY(
+                        SELECT a.attname
+                        FROM unnest(con.confkey) WITH ORDINALITY AS k(attnum, ord)
+                        JOIN pg_attribute a
+                          ON a.attrelid = con.confrelid AND a.attnum = k.attnum
+                        ORDER BY k.ord
+                    ),
+                    (SELECT u.conname
+                       FROM pg_constraint u
+                      WHERE u.conindid = con.conindid
+                        AND u.contype IN (\'p\', \'u\')
+                      LIMIT 1)
+             FROM pg_constraint con
+             JOIN pg_class fc     ON fc.oid = con.conrelid
+             JOIN pg_namespace fn ON fn.oid = fc.relnamespace
+             JOIN pg_class tc     ON tc.oid = con.confrelid
+             JOIN pg_namespace tn ON tn.oid = tc.relnamespace
+             WHERE con.contype = \'f\'
+               AND fn.nspname <> tn.nspname
+               AND fn.nspname = ANY($1)
+               AND tn.nspname = ANY($1)
+             ORDER BY 1, 2, 3",
+            &[&names],
+        )
+        .context("reading cross-schema foreign keys from pg_constraint")?;
+
+    Ok(rows
+        .iter()
+        .map(|row| CrossSchemaForeignKey {
+            from_schema: SchemaName::new(row.get::<_, String>(0)),
+            from_table: row.get(1),
+            name: row.get(2),
+            to_schema: SchemaName::new(row.get::<_, String>(3)),
+            to_table: row.get(4),
+            to_columns: row.get(5),
+            to_constraint: row.get(6),
+        })
+        .collect())
 }
 
 /// Which of the managed schemas are absent.

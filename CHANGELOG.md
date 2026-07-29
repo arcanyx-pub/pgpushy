@@ -31,3 +31,12 @@ and [`docs/impl-plan.md`](docs/impl-plan.md) for the build plan.
 - Connection resolution that pgschema does not repeat: pgpushy folds flags and
   `PG*` into one answer and passes every parameter explicitly, so the two
   cannot reach different databases.
+- `pgpushy apply` — plans every managed schema, presents them as one reviewable
+  unit with destructive changes named individually, asks once, then applies the
+  plans it just showed. Declining leaves the target untouched. `--auto-approve`
+  for non-interactive use; without a terminal and without that flag, apply
+  refuses rather than assuming yes.
+- Detection of cross-schema foreign key removals the apply order cannot
+  satisfy, with the two-step remedy spelled out and nothing applied.
+- Failure reporting for a partial apply: what landed, what broke, what was
+  never attempted, and that the applied schemas are not rolled back.

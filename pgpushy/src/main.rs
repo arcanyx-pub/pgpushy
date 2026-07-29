@@ -5,11 +5,14 @@
 
 #![forbid(unsafe_code)]
 
+mod approve;
 mod cli;
 mod conn;
 mod discovery;
+mod hazard;
 mod inspect;
 mod pgschema;
+mod plan_file;
 mod provider;
 mod report;
 mod run;
@@ -30,6 +33,13 @@ fn main() -> std::process::ExitCode {
             pgschema,
             out,
         } => run::plan(source, connection, pgschema, out.as_deref()),
+        Command::Apply {
+            source,
+            connection,
+            pgschema,
+            out,
+            auto_approve,
+        } => run::apply(source, connection, pgschema, out.as_deref(), *auto_approve),
     };
 
     match result {
