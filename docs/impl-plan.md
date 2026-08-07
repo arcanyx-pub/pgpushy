@@ -122,7 +122,10 @@ commands are in [Appendix A](#appendix-a-reproduction-harness).
 
 Mirror `snowdrop-id-rs`:
 - **Rust edition 2024**, `rust-version = "1.85"` (bump only with reason),
-  workspace `resolver = "3"`, shared `[workspace.package]`.
+  workspace `resolver = "3"`, shared `[workspace.package]`. Note that edition
+  2024 is available on 1.85 but **`let` chains are not** — those are stable
+  from 1.88 — so `if let Some(x) = y && z` compiles on a modern toolchain and
+  fails the MSRV job. `just msrv` catches it before pushing.
 - **License:** Apache-2.0 (`LICENSE` is in the repo root), matching pgschema's
   own license. Set `license = "Apache-2.0"` in `[workspace.package]`.
 - **justfile** recipes: `fmt`, `fmt-check`, `clippy` (`--all-targets

@@ -30,8 +30,23 @@ test-fast:
 doc:
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
 
+# Check the crate still builds on the minimum supported Rust version
+#
+# Worth running before pushing: edition 2024 is available on 1.85, but plenty of
+# ergonomics landed later — `let` chains are 1.88 — so modern-toolchain code can
+# compile locally and fail here.
+msrv:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    version=$(grep -m1 '^rust-version' Cargo.toml | cut -d '"' -f 2)
+    if ! rustup toolchain list | grep -q "^${version}"; then
+        echo "installing Rust ${version} to check the MSRV..."
+        rustup toolchain install "${version}" --profile minimal
+    fi
+    cargo "+${version}" check --workspace --all-features
+
 # Everything CI checks, in one command
-ci: fmt-check clippy test doc
+ci: fmt-check clippy test doc msrv
 
 # Install the `pgpushy` CLI from the working tree
 install-cli:

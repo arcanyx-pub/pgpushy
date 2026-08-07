@@ -633,10 +633,12 @@ fn qualify(relation: &RangeVar, default_schema: &SchemaName) -> QualifiedName {
 }
 
 fn qualify_relation(relation: Option<&mut RangeVar>, default_schema: &SchemaName) {
-    if let Some(relation) = relation
-        && relation.schemaname.is_empty()
-    {
-        relation.schemaname = default_schema.as_str().to_owned();
+    // Nested rather than a `let` chain: those are stable from Rust 1.88, and
+    // this workspace supports 1.85.
+    if let Some(relation) = relation {
+        if relation.schemaname.is_empty() {
+            relation.schemaname = default_schema.as_str().to_owned();
+        }
     }
 }
 
