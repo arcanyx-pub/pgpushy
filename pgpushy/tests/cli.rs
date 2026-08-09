@@ -544,3 +544,192 @@ fn the_target_is_resolved_before_anything_is_parsed() {
         .stderr(predicates::str::contains("no environment named"))
         .stderr(predicates::str::contains("could not parse SQL").not());
 }
+
+// ---------------------------------------------------------------------------
+// init (spec §10.1)
+// ---------------------------------------------------------------------------
+
+fn init_in(dir: &Path) -> Command {
+    let mut cmd = Command::cargo_bin("pgpushy").expect("binary builds");
+    cmd.arg("init").current_dir(dir);
+    cmd
+}
+
+/// Configuration is required, so this is the first command most projects run —
+/// and what it writes has to be loadable without further editing beyond the
+/// target.
+#[test]
+fn init_writes_a_config_that_validate_can_load() {
+    let dir = TempDir::new().expect("temp dir");
+    std::fs::create_dir_all(dir.path().join("db/schema")).expect("mkdir");
+    std::fs::write(dir.path().join("db/schema/customers.sql"), CUSTOMERS).expect("write");
+
+    init_in(dir.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("wrote pgpushy.toml"))
+        .stdout(predicates::str::contains("source_root: db/schema"));
+
+    // The generated file is immediately usable for the offline command.
+    validate(dir.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("1 table"));
+}
+
+#[test]
+fn init_leaves_the_source_root_alone_for_a_flat_project() {
+    let dir = TempDir::new().expect("temp dir");
+    std::fs::write(dir.path().join("customers.sql"), CUSTOMERS).expect("write");
+
+    init_in(dir.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("source_root: this directory"));
+
+    let written = std::fs::read_to_string(dir.path().join("pgpushy.toml")).expect("read");
+    assert!(
+        written.contains("# source_root = "),
+        "the key should be present but commented out:\n{written}"
+    );
+    validate(dir.path()).assert().success();
+}
+
+/// A configuration file is the one thing in the project whose loss would be
+/// both silent and expensive.
+#[test]
+fn init_refuses_to_overwrite() {
+    let dir = project("", &[("customers.sql", CUSTOMERS)]);
+
+    init_in(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("already exists"))
+        .stderr(predicates::str::contains("will not overwrite"));
+}
+
+/// Guessing wrong would silently narrow the desired state, so two candidate
+/// roots means pgpushy declines to guess at all.
+#[test]
+fn init_does_not_guess_between_two_candidate_roots() {
+    let dir = TempDir::new().expect("temp dir");
+    for path in ["db/customers.sql", "other/orders.sql"] {
+        let full = dir.path().join(path);
+        std::fs::create_dir_all(full.parent().unwrap()).expect("mkdir");
+        std::fs::write(&full, CUSTOMERS).expect("write");
+    }
+
+    init_in(dir.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("source_root: this directory"));
+}
+
+// ---------------------------------------------------------------------------
+// Empty trees and bad source roots
+// ---------------------------------------------------------------------------
+
+/// Nothing to reconcile is not a failure, but a silent success looks exactly
+/// like a successful reconciliation — so it has to say which it was.
+#[test]
+fn an_empty_tree_says_there_is_nothing_to_reconcile() {
+    let dir = tree(&[]);
+
+    validate(dir.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("No managed schemas"))
+        .stdout(predicates::str::contains("will not touch anything"));
+}
+
+/// Easy to reach by pointing `source_root` at the one file a small project has.
+#[test]
+fn a_source_root_that_is_a_file_says_so() {
+    let dir = project(
+        "source_root = \"customers.sql\"",
+        &[("customers.sql", CUSTOMERS)],
+    );
+
+    validate(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("is not a directory"))
+        .stderr(predicates::str::contains("names the directory"));
+}
+
+// ---------------------------------------------------------------------------
+// Verbose (spec §10.3)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn verbose_lists_the_files_discovery_kept() {
+    let dir = project(
+        r#"exclude = ["seeds/**"]"#,
+        &[
+            ("a/customers.sql", CUSTOMERS),
+            ("b/orders.sql", ORDERS),
+            ("seeds/data.sql", "INSERT INTO customers VALUES (1, 'x');"),
+        ],
+    );
+
+    validate(dir.path())
+        .arg("--verbose")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("a/customers.sql"))
+        .stdout(predicates::str::contains("b/orders.sql"))
+        // Excluded files were never read, so they are not "kept".
+        .stdout(predicates::str::contains("seeds/data.sql").not());
+}
+
+// ---------------------------------------------------------------------------
+// Plan database and lock timeout (spec §10.4, §10.5)
+// ---------------------------------------------------------------------------
+
+/// Same rule as the target itself: pointing scratch work at the wrong server
+/// is not something to guess at.
+#[test]
+fn a_plan_database_must_say_which_database_and_who() {
+    let dir = project(
+        "[env.local]\ndb = \"a\"\nuser = \"u\"\n[env.local.plan_db]\nhost = \"plan.example\"",
+        &[("customers.sql", CUSTOMERS)],
+    );
+
+    plan(dir.path(), "local")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "[env.local.plan_db] is missing db and user",
+        ))
+        // The reason it matters: pgschema writes there.
+        .stderr(predicates::str::contains("scratch space"));
+}
+
+#[test]
+fn an_unknown_key_in_a_plan_database_is_rejected() {
+    let dir = project(
+        "[env.local]\ndb = \"a\"\nuser = \"u\"\n[env.local.plan_db]\ndatabase = \"x\"",
+        &[("customers.sql", CUSTOMERS)],
+    );
+
+    plan(dir.path(), "local")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("unknown field `database`"));
+}
+
+/// `plan` has no `--lock-timeout` because pgschema's `plan` does not accept one
+/// (verified) — it is an apply-time concern.
+#[test]
+fn only_apply_takes_a_lock_timeout() {
+    let dir = project(
+        "[env.local]\ndb = \"a\"\nuser = \"u\"",
+        &[("c.sql", CUSTOMERS)],
+    );
+
+    plan(dir.path(), "local")
+        .args(["--lock-timeout", "30s"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("unexpected argument"));
+}

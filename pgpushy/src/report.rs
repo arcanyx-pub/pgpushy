@@ -88,15 +88,17 @@ pub fn summary(settings: &Settings, analysis: &Analysis) {
     } else {
         " (declared)"
     };
-    println!(
-        "\n  managed schemas{declared}: {}",
-        analysis
-            .managed_schemas
-            .iter()
-            .map(|s| s.as_str().to_owned())
-            .collect::<Vec<_>>()
-            .join(", "),
-    );
+    if !analysis.managed_schemas.is_empty() {
+        println!(
+            "\n  managed schemas{declared}: {}",
+            analysis
+                .managed_schemas
+                .iter()
+                .map(|s| s.as_str().to_owned())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    }
 
     // A managed schema with nothing in it reconciles the target's copy to
     // empty. That is the only way to say so, and it is destructive, so it is
@@ -191,6 +193,56 @@ pub fn pgschema(binary: &PgschemaBin) {
 }
 
 /// Which database pgpushy actually reached (spec §6.3).
+/// Where the comparison model is built, when it is not the embedded default.
+///
+/// Worth saying: it is a real server that gets written to, and an operator who
+/// configured it once should be reminded which one is in play.
+pub fn plan_database(connection: &Resolved) {
+    if let Some(plan) = &connection.plan_db {
+        println!("  plan database: {}", plan.describe());
+    }
+}
+
+/// Every file discovery kept, under `--verbose`.
+pub fn discovered_files(discovered: &Discovered) {
+    for file in &discovered.files {
+        println!("    {}", file.path);
+    }
+}
+
+/// The pgschema command line, under `--verbose`.
+///
+/// Rendered from the built `Command` rather than reassembled, so it is what
+/// actually runs. Note the password never appears — it travels through the
+/// environment, not the argv (spec §6.3).
+pub fn pgschema_command(command: &std::process::Command) {
+    let args: Vec<String> = command
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    println!(
+        "  $ {} {}",
+        command.get_program().to_string_lossy(),
+        args.join(" ")
+    );
+}
+
+/// Where the synthesized document went, under `--verbose`.
+pub fn desired_state_at(path: &Path) {
+    println!("  desired state: {}", path.display());
+}
+
+/// No managed schemas at all — so there is nothing to reconcile.
+///
+/// Reported rather than passed over in silence: a run that does nothing looks
+/// exactly like a run that reconciled successfully, and the difference matters.
+pub fn nothing_managed() {
+    println!();
+    println!("  No managed schemas — nothing to reconcile.");
+    println!("  No source file describes an object, so there is nothing to compare");
+    println!("  against the target. pgpushy will not touch anything.");
+}
+
 pub fn target(connection: &Resolved, identity: &Identity) {
     // The environment name as well as the database: "prod" and "the database
     // called myapp" are different facts, and a mismatch between them is

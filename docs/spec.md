@@ -608,9 +608,14 @@ from the target (§6.1).
 
 The connection pgpushy resolved (§6.4) MUST be forwarded to pgschema in full —
 `--host`, `--port`, `--db`, `--user`, `--sslmode`, with the password through
-the environment — so that pgschema resolves nothing for itself (§6.3).
-Apply-tuning flags pgpushy does not model, such as `--lock-timeout` and the
-`--plan-*` family, MUST be forwarded when given.
+the environment — so that pgschema resolves nothing for itself (§6.3). The plan
+database (§10.4) and the lock timeout (§10.5) MUST likewise be forwarded when
+configured, as `--plan-*` and `--lock-timeout`.
+
+pgpushy MUST NOT let pgschema resolve any of these from *its* environment
+either: `PGSCHEMA_PLAN_HOST` and the rest of that family MUST be stripped from
+the subprocess environment alongside `PG*` (§6.3), so that the plan database
+pgpushy configured is the one pgschema uses.
 
 Note that pgpushy does **not** honor `PG*` for the target's identity: the
 target comes from the named environment and nowhere else (§10.2). `PGPASSWORD`
@@ -781,6 +786,7 @@ the sole environment automatically would make adding a second one silently
 change what an existing command reconciles.
 
 An environment MUST specify `db` and `user`, which have no safe default.
+It MAY also carry a plan database (§10.4) and a lock timeout (§10.5).
 `host` defaults to `localhost`, `port` to `5432`, and `sslmode` to `prefer`.
 
 **`PG*` environment variables MUST NOT override a named environment's target.**
@@ -805,7 +811,48 @@ password.
 
 Only things that describe *this run* or *this machine*, never the project or
 the target: `--config`, `--env`, `--pgschema-path` (which differs per machine
-and cannot affect what is reconciled), `--out`, and `--auto-approve`.
+and cannot affect what is reconciled), `--out`, `--auto-approve`,
+`--lock-timeout` (§10.5), `--verbose`, and `--no-color`.
+
+### 10.4 The plan database
+
+pgschema builds its comparison model by executing the desired state into a
+**plan database** — an ephemeral embedded Postgres by default, or an external
+one given `--plan-*`. An environment MAY name an external one:
+
+```toml
+[env.prod.plan_db]
+host = "plan.internal"
+db   = "pgschema_plan"
+user = "planner"
+```
+
+`db` and `user` are required, as in the environment itself; `host`, `port` and
+`sslmode` default the same way (§10.2), and `password` behaves as it does
+there, except that the environment variable supplying it is
+`PGPUSHY_PLAN_PASSWORD` — a separate variable, because the plan database is a
+separate server with separate credentials.
+
+> **Non-normative — this database is scratch, and is written to.** Verified
+> against pgschema 1.12.0: planning a schema `pd` leaves a schema `pd` behind
+> in the plan database afterwards. It is working space, not a read-only
+> reference, so it MUST NOT be a database that matters. The embedded default
+> needs none of this; an external plan database exists for environments where
+> spawning a Postgres is not possible, and for seeding objects pgpushy does not
+> manage (§14).
+
+### 10.5 Lock timeout
+
+`apply` MAY carry a `lock_timeout`, forwarded to pgschema as
+`--lock-timeout`. It bounds how long Postgres waits for a lock before giving
+up, which matters on a busy production table where an unbounded wait blocks
+every query behind it.
+
+Unlike project structure (§10.1), this MAY be set both in an environment and
+by `--lock-timeout` on the command line, with the flag winning. Precedence is
+safe here precisely because a lock timeout **cannot change what is
+reconciled** — only whether the apply gives up waiting. `plan` does not accept
+it, because pgschema's `plan` does not (verified).
 
 ## 11. Properties
 
@@ -1058,6 +1105,11 @@ made after draft 2 of v0.1.
   from the working directory only, and get away with it because their input is
   explicitly named — pgschema requires `--file`. pgpushy's blast radius is the
   whole database, so it names its input explicitly too. (§10.1)
+- **[0.3] Plan database and lock timeout** — both live in the environment
+  (§10.4, §10.5), because both describe *that target*. `--lock-timeout` is
+  additionally a flag, since it cannot change what gets reconciled — the test
+  that separates a safe flag from an unsafe one. The plan database is not:
+  pointing it somewhere else changes where the desired state gets executed.
 - **[0.3] Named environments** — connection settings live in `[env.<name>]`
   blocks and `--env` is required for `plan` and `apply`, even with only one
   environment defined. `PG*` no longer overrides a named environment's target,

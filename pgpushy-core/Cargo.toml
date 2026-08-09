@@ -14,5 +14,3 @@ repository.workspace = true
 pg_query = "6"
 thiserror = "2"
 
-[dev-dependencies]
-insta = "1"

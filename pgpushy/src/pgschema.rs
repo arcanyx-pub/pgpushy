@@ -8,6 +8,7 @@
 //! because approval happens once at the pgpushy level.
 
 use crate::conn::Resolved;
+use crate::output::Output;
 use crate::provider::PgschemaBin;
 use anyhow::{Context, Result};
 use pgpushy_core::SchemaName;
@@ -26,12 +27,13 @@ pub fn plan(
     schema: &SchemaName,
     file: &Path,
     json_out: &Path,
+    output: Output,
 ) -> Result<bool> {
-    let mut command = base(binary, connection, "plan", schema);
+    let mut command = base(binary, connection, "plan", schema, output);
     command.arg("--file").arg(file);
     command.arg("--output-human").arg("stdout");
     command.arg("--output-json").arg(json_out);
-    run(command, binary, "plan")
+    run(command, binary, "plan", output)
 }
 
 /// Apply a plan pgschema computed earlier (spec §8.6).
@@ -46,12 +48,18 @@ pub fn apply_plan(
     connection: &Resolved,
     schema: &SchemaName,
     plan_file: &Path,
+    lock_timeout: Option<&str>,
+    output: Output,
 ) -> Result<bool> {
-    let mut command = base(binary, connection, "apply", schema);
+    let mut command = base(binary, connection, "apply", schema, output);
     command.arg("--plan").arg(plan_file);
     // Approval already happened, once, for the whole database (spec §8.6).
     command.arg("--auto-approve");
-    run(command, binary, "apply")
+    // Apply-only: pgschema's `plan` rejects this flag (verified).
+    if let Some(lock_timeout) = lock_timeout {
+        command.args(["--lock-timeout", lock_timeout]);
+    }
+    run(command, binary, "apply", output)
 }
 
 fn base(
@@ -59,11 +67,15 @@ fn base(
     connection: &Resolved,
     subcommand: &str,
     schema: &SchemaName,
+    output: Output,
 ) -> Command {
     let mut command = Command::new(&binary.path);
     command.arg(subcommand);
     command.args(["--schema", schema.as_str()]);
     command.args(connection.pgschema_flags());
+    // pgschema colours unconditionally otherwise, so piping pgpushy's output
+    // to a file would capture escape sequences.
+    command.args(output.pgschema_color_flags());
     // Resolve nothing for itself: the password arrives through the
     // environment, and every other PG* variable is stripped (spec §6.3).
     connection.command_env(&mut command);
@@ -75,7 +87,15 @@ fn base(
 /// A non-zero exit is not an error in the `anyhow` sense — pgschema has already
 /// explained itself on stderr, and the caller decides what a failure means for
 /// the run as a whole.
-fn run(mut command: Command, binary: &PgschemaBin, subcommand: &str) -> Result<bool> {
+fn run(
+    mut command: Command,
+    binary: &PgschemaBin,
+    subcommand: &str,
+    output: Output,
+) -> Result<bool> {
+    if output.verbose {
+        crate::report::pgschema_command(&command);
+    }
     let status = command
         .status()
         .with_context(|| format!("running {} {subcommand}", binary.path.display()))?;

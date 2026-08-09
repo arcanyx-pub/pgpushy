@@ -922,3 +922,187 @@ fn an_ambient_pghost_does_not_redirect_a_named_environment() {
         .stderr(predicates::str::contains("127.0.0.1"))
         .stderr(predicates::str::contains("somewhere.else.example").not());
 }
+
+// ---------------------------------------------------------------------------
+// Plan database, lock timeout, colour (spec §10.4, §10.5, §8.3)
+// ---------------------------------------------------------------------------
+
+/// The plan database is where pgschema executes the desired state to build its
+/// comparison model. Pointing it at a real server must work — and must leave
+/// the *target's* result unchanged, since it is only scratch space.
+#[test]
+fn plans_through_an_external_plan_database() {
+    let target = require_target!();
+    let schema = unique_schema("plandb");
+    let _schemas = Schemas::create(&target, std::slice::from_ref(&schema));
+
+    // A separate database on the same server. It gets written to, so it must
+    // not be one that matters — which is exactly why the spec says so.
+    let plan_db = format!("pgpushy_plan_{}", std::process::id());
+    let mut client = target.client();
+    client
+        .batch_execute(&format!("DROP DATABASE IF EXISTS {plan_db}"))
+        .ok();
+    client
+        .batch_execute(&format!("CREATE DATABASE {plan_db}"))
+        .expect("create plan database");
+
+    let parts = parse(&target.url);
+    let project = target.project(
+        &format!("default_schema = \"{schema}\""),
+        &[(
+            "t.sql",
+            "CREATE TABLE t (id int PRIMARY KEY, name text);".to_owned(),
+        )],
+    );
+    // Append the plan database to the generated [env.test] block.
+    let config = project.dir.path().join("pgpushy.toml");
+    let mut text = std::fs::read_to_string(&config).expect("read config");
+    text.push_str(&format!(
+        "\n[env.test.plan_db]\nhost = \"{}\"\nport = {}\ndb = \"{plan_db}\"\n\
+         user = \"{}\"\nsslmode = \"disable\"\n",
+        parts.host, parts.port, parts.user,
+    ));
+    std::fs::write(&config, text).expect("write config");
+
+    let mut cmd = project.command("plan");
+    if let Some(password) = &parts.password {
+        cmd.env("PGPUSHY_PLAN_PASSWORD", password);
+    }
+    cmd.assert()
+        .success()
+        .stdout(predicates::str::contains("1 to add"))
+        .stdout(predicates::str::contains(format!(
+            "plan database: {}",
+            parts.user
+        )));
+
+    let mut client = target.client();
+    let _ = client.batch_execute(&format!("DROP DATABASE IF EXISTS {plan_db}"));
+}
+
+/// The plan database's password travels through `PGSCHEMA_PLAN_PASSWORD`, not
+/// `--plan-password`: a secret in the argv is visible in the process list, and
+/// in anything `--verbose` prints into a bug report.
+#[test]
+fn the_plan_database_password_never_reaches_the_command_line() {
+    let target = require_target!();
+    let schema = unique_schema("planpw");
+    let _schemas = Schemas::create(&target, std::slice::from_ref(&schema));
+
+    let plan_db = format!("pgpushy_secret_{}", std::process::id());
+    let mut client = target.client();
+    client
+        .batch_execute(&format!("DROP DATABASE IF EXISTS {plan_db}"))
+        .ok();
+    client
+        .batch_execute(&format!("CREATE DATABASE {plan_db}"))
+        .expect("create plan database");
+
+    let parts = parse(&target.url);
+    let project = target.project(
+        &format!("default_schema = \"{schema}\""),
+        &[("t.sql", "CREATE TABLE t (id int PRIMARY KEY);".to_owned())],
+    );
+    let config = project.dir.path().join("pgpushy.toml");
+    let mut text = std::fs::read_to_string(&config).expect("read config");
+    text.push_str(&format!(
+        "\n[env.test.plan_db]\nhost = \"{}\"\nport = {}\ndb = \"{plan_db}\"\n\
+         user = \"{}\"\nsslmode = \"disable\"\n",
+        parts.host, parts.port, parts.user,
+    ));
+    std::fs::write(&config, text).expect("write config");
+
+    let mut cmd = project.command("plan");
+    cmd.arg("--verbose");
+    if let Some(password) = &parts.password {
+        cmd.env("PGPUSHY_PLAN_PASSWORD", password);
+    }
+    let assert = cmd.assert().success();
+
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("--plan-db"),
+        "the plan database should be forwarded:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("--plan-password"),
+        "the password must not be a flag:\n{stdout}"
+    );
+    // Token-wise rather than substring: a short test password like "pw" occurs
+    // inside plenty of innocent words, and what actually matters is whether it
+    // appears as an argument in its own right.
+    if let Some(password) = &parts.password {
+        assert!(
+            !stdout.split_whitespace().any(|token| token == password),
+            "the password appeared as a command-line argument:\n{stdout}"
+        );
+    }
+
+    let mut client = target.client();
+    let _ = client.batch_execute(&format!("DROP DATABASE IF EXISTS {plan_db}"));
+}
+
+/// Spec §10.5: forwarded from the environment, and overridable by the flag —
+/// safe precedence, because a lock timeout cannot change what is reconciled.
+#[test]
+fn the_lock_timeout_is_forwarded_and_the_flag_wins() {
+    let target = require_target!();
+    let schema = unique_schema("lock");
+    let _schemas = Schemas::create(&target, std::slice::from_ref(&schema));
+
+    let project = target.project(
+        &format!("default_schema = \"{schema}\""),
+        &[("t.sql", "CREATE TABLE t (id int PRIMARY KEY);".to_owned())],
+    );
+    let config = project.dir.path().join("pgpushy.toml");
+    let mut text = std::fs::read_to_string(&config).expect("read config");
+    text.push_str("lock_timeout = \"7s\"\n");
+    std::fs::write(&config, text).expect("write config");
+
+    project
+        .command("apply")
+        .args(["--auto-approve", "--verbose"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("--lock-timeout 7s"));
+
+    // Re-plan is empty, so apply again from scratch to see the override.
+    let mut client = target.client();
+    client
+        .batch_execute(&format!(
+            r#"DROP SCHEMA "{schema}" CASCADE; CREATE SCHEMA "{schema}""#
+        ))
+        .expect("reset schema");
+
+    project
+        .command("apply")
+        .args(["--auto-approve", "--verbose", "--lock-timeout", "99s"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("--lock-timeout 99s"));
+}
+
+/// pgschema colours unconditionally, so without `--no-color` a captured plan is
+/// full of escape sequences. Test output is never a terminal, which is exactly
+/// the case that must stay clean.
+#[test]
+fn captured_output_carries_no_escape_sequences() {
+    let target = require_target!();
+    let schema = unique_schema("color");
+    let _schemas = Schemas::create(&target, std::slice::from_ref(&schema));
+
+    let project = target.project(
+        &format!("default_schema = \"{schema}\""),
+        &[("t.sql", "CREATE TABLE t (id int PRIMARY KEY);".to_owned())],
+    );
+
+    let assert = project.command("plan").assert().success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+
+    assert!(stdout.contains("to add"), "expected a plan:\n{stdout}");
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "pgschema's colour leaked into captured output:\n{stdout}"
+    );
+}

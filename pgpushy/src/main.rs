@@ -11,7 +11,9 @@ mod config;
 mod conn;
 mod discovery;
 mod hazard;
+mod init;
 mod inspect;
+mod output;
 mod pgschema;
 mod plan_file;
 mod provider;
@@ -26,29 +28,59 @@ use std::io::Write;
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
 
-    // Loaded once, before dispatch: every command shares the same file, and a
-    // broken one should fail immediately rather than partway through a run.
+    let output = output::Output::resolve(cli.verbose, cli.no_color);
+
+    // `init` writes the configuration, so it must run before anything tries to
+    // load one — otherwise the command that fixes a missing file would itself
+    // fail on the missing file.
+    if let Command::Init { out } = &cli.command {
+        return match init::init(out.as_deref()) {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!(
+                    "
+error: {err:#}"
+                );
+                std::process::ExitCode::FAILURE
+            }
+        };
+    }
+
     let loaded = match config::load(cli.config.as_deref()) {
         Ok(loaded) => loaded,
         Err(err) => {
-            eprintln!("\nerror: {err:#}");
+            eprintln!(
+                "
+error: {err:#}"
+            );
             return std::process::ExitCode::FAILURE;
         }
     };
 
     let result = match &cli.command {
-        Command::Validate { out } => run::validate(&loaded, out.as_deref()),
+        // Handled above, before the configuration file was required.
+        Command::Init { .. } => unreachable!("init runs before config is loaded"),
+        Command::Validate { out } => run::validate(&loaded, output, out.as_deref()),
         Command::Plan {
             target,
             pgschema,
             out,
-        } => run::plan(target, pgschema, &loaded, out.as_deref()),
+        } => run::plan(target, pgschema, &loaded, output, out.as_deref()),
         Command::Apply {
             target,
             pgschema,
             out,
             auto_approve,
-        } => run::apply(target, pgschema, &loaded, out.as_deref(), *auto_approve),
+            lock_timeout,
+        } => run::apply(
+            target,
+            pgschema,
+            &loaded,
+            output,
+            out.as_deref(),
+            *auto_approve,
+            lock_timeout.as_deref(),
+        ),
     };
 
     match result {

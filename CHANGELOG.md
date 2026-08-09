@@ -51,3 +51,19 @@ and [`docs/impl-plan.md`](docs/impl-plan.md) for the build plan.
   secret should not live in the file.
 - A prominent warning when the password actually in use came from
   `pgpushy.toml` — and silence when something else overrode it.
+- `pgpushy init`, which writes a starter configuration and guesses the source
+  root from where the `*.sql` files are. It declines to guess when the answer
+  is ambiguous, and never overwrites an existing file.
+- An optional external plan database per environment (`[env.<name>.plan_db]`)
+  and a `lock_timeout`, both forwarded to pgschema. `--lock-timeout` on
+  `apply` overrides the environment. Neither password is ever passed on a
+  command line: the target's goes through `PGPASSWORD`, the plan database's
+  through `PGPUSHY_PLAN_PASSWORD`.
+- `--verbose`, printing the pgschema command line, the synthesized document's
+  path, and the files discovery kept.
+- Colour is suppressed when output is not a terminal, and by `--no-color` or
+  `NO_COLOR` — including pgschema's own, which previously left escape
+  sequences in captured output.
+- A source tree with no managed schemas now says so rather than succeeding
+  silently, and a `source_root` pointing at a file explains itself instead of
+  failing with a bare "Not a directory".

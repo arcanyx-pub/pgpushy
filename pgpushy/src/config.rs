@@ -78,6 +78,28 @@ pub struct Environment {
     /// Permitted, discouraged, and warned about loudly when actually used
     /// (spec §10.2).
     pub password: Option<String>,
+    /// How long to wait for a lock before giving up, e.g. `"30s"` (spec §10.5).
+    pub lock_timeout: Option<String>,
+    /// An external plan database (spec §10.4).
+    pub plan_db: Option<PlanDatabase>,
+}
+
+/// Where pgschema should build its comparison model (spec §10.4).
+///
+/// Scratch space, and written to: verified against pgschema 1.12.0, planning a
+/// schema leaves that schema behind here afterwards. It must not be a database
+/// that matters.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanDatabase {
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    /// Required, as in the environment itself.
+    pub db: Option<String>,
+    /// Required, as in the environment itself.
+    pub user: Option<String>,
+    pub sslmode: Option<String>,
+    pub password: Option<String>,
 }
 
 /// A loaded configuration and where it came from.
@@ -180,6 +202,11 @@ impl Loaded {
             );
         };
 
+        let plan_db = match &env.plan_db {
+            Some(plan) => Some(self.plan_database(name, plan)?),
+            None => None,
+        };
+
         Ok(Target {
             name: name.to_owned(),
             host: env.host.clone().unwrap_or_else(|| "localhost".to_owned()),
@@ -188,6 +215,41 @@ impl Loaded {
             user,
             sslmode: env.sslmode.clone().unwrap_or_else(|| "prefer".to_owned()),
             password: env.password.clone(),
+            lock_timeout: env.lock_timeout.clone(),
+            plan_db,
+        })
+    }
+
+    /// Resolve an environment's external plan database (spec §10.4).
+    fn plan_database(&self, env: &str, plan: &PlanDatabase) -> Result<ResolvedPlanDatabase> {
+        // Same rule as the target itself: pointing scratch work at the wrong
+        // server is not something to guess at.
+        let (Some(db), Some(user)) = (plan.db.clone(), plan.user.clone()) else {
+            let mut missing = Vec::new();
+            if plan.db.is_none() {
+                missing.push("db");
+            }
+            if plan.user.is_none() {
+                missing.push("user");
+            }
+            bail!(
+                "{}: [env.{env}.plan_db] is missing {}\n\
+                 \n\
+                 A plan database must say which database to build the comparison model \
+                 in and who to connect as. Note that pgschema writes to it — it is \
+                 scratch space, not a reference.",
+                self.path.display(),
+                missing.join(" and "),
+            );
+        };
+
+        Ok(ResolvedPlanDatabase {
+            host: plan.host.clone().unwrap_or_else(|| "localhost".to_owned()),
+            port: plan.port.unwrap_or(5432),
+            db,
+            user,
+            sslmode: plan.sslmode.clone().unwrap_or_else(|| "prefer".to_owned()),
+            password: plan.password.clone(),
         })
     }
 }
@@ -202,6 +264,21 @@ pub struct Target {
     pub user: String,
     pub sslmode: String,
     /// The environment's own password, before `PGPASSWORD` is considered.
+    pub password: Option<String>,
+    /// The environment's lock timeout, before `--lock-timeout` is considered.
+    pub lock_timeout: Option<String>,
+    pub plan_db: Option<ResolvedPlanDatabase>,
+}
+
+/// An external plan database, fully resolved.
+#[derive(Debug, Clone)]
+pub struct ResolvedPlanDatabase {
+    pub host: String,
+    pub port: u16,
+    pub db: String,
+    pub user: String,
+    pub sslmode: String,
+    /// Its own password, before `PGPUSHY_PLAN_PASSWORD` is considered.
     pub password: Option<String>,
 }
 

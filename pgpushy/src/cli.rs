@@ -31,12 +31,40 @@ pub struct Cli {
     #[arg(long, short = 'c', value_name = "PATH", global = true)]
     pub config: Option<PathBuf>,
 
+    /// Show what pgpushy is doing: the pgschema command line, and where the
+    /// synthesized desired state was written.
+    ///
+    /// The first thing worth seeing when a run does something unexpected, and
+    /// the reason pgpushy has no log levels — this is the only extra detail
+    /// there is to want.
+    #[arg(long, short = 'v', global = true)]
+    pub verbose: bool,
+
+    /// Never emit colored output, and tell pgschema not to either.
+    ///
+    /// Colour is suppressed automatically when stdout is not a terminal, so
+    /// this is for the cases that heuristic gets wrong. `NO_COLOR` in the
+    /// environment does the same.
+    #[arg(long, global = true)]
+    pub no_color: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Write a starter pgpushy.toml.
+    ///
+    /// Configuration is required, so this is the first command most projects
+    /// run. It guesses the source root from any `*.sql` it can find nearby and
+    /// scaffolds an environment to fill in.
+    Init {
+        /// Where to write it. Defaults to ./pgpushy.toml.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+    },
+
     /// Check the source tree. Connects to nothing.
     ///
     /// Runs the whole offline pipeline — discovery, parsing, the statement
@@ -87,6 +115,14 @@ pub enum Command {
         /// Apply without prompting. Required when stdin is not a terminal.
         #[arg(long)]
         auto_approve: bool,
+
+        /// How long Postgres waits for a lock before giving up, e.g. `30s`.
+        ///
+        /// Overrides the environment's `lock_timeout`. Unlike the project
+        /// settings this is a flag, because it cannot change what gets
+        /// reconciled — only whether the apply gives up waiting.
+        #[arg(long, value_name = "DURATION")]
+        lock_timeout: Option<String>,
     },
 }
 

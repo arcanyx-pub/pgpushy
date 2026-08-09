@@ -147,19 +147,29 @@ Mirror `snowdrop-id-rs`:
 - `thiserror` — typed errors carrying source locations.
 
 *Binary (`pgpushy`):*
-- `clap` (derive) — CLI. `serde` + `toml` — config. `semver` — version floor.
-- `globset` — `exclude` patterns (spec §4.1). `walkdir` — discovery.
+- `clap` (derive) — CLI. `serde` + `toml` + `serde_json` — config, and reading
+  pgschema's plan output. `semver` — version floor.
+- `globset` — `exclude` patterns (spec §4.1).
 - `postgres` (sync rust-postgres) — the read-only target inspection
   (spec §6). Sync, not async: pgpushy issues one query and shells out; a
-  runtime would be pure overhead. Its connection-string parsing is
-  libpq-compatible, which spec §6.4 relies on.
-- `which` — PATH lookup (BYO). `tempfile` — the synthesized file.
-- `tracing` + `tracing-subscriber` — logging and the password warning.
-- `anyhow` — binary-level error context. `camino` (UTF-8 paths, opt).
+  runtime would be pure overhead.
+- `which` — PATH lookup (BYO). `tempfile` — the synthesized file and the plans.
+- `anyhow` — binary-level error context.
 - Later (managed provider): `ureq` or `reqwest` (blocking, rustls) + `sha2`.
 
-*Dev:* `insta` (snapshot the synthesized SQL), `assert_cmd` + `predicates`
-(CLI), `testcontainers` (hermetic Postgres) — with an env-URL fallback.
+*Dev:* `assert_cmd` + `predicates` (CLI), `postgres` and `tempfile`
+(integration), gated on env vars rather than `testcontainers`.
+
+**Dropped from the original plan.** `tracing` + `tracing-subscriber`: pgpushy's
+output is hand-formatted and user-facing rather than logs, and a subscriber
+would add a layer over text that is already exactly what we want. What that
+entry was really after is debuggability, which `--verbose` serves directly —
+it prints the pgschema command line and where the synthesized document went,
+which is the only extra detail there is to want. `camino` was never needed;
+`insta` was listed for snapshotting the synthesized SQL, but explicit golden
+strings in the tests turned out to read better, since the interesting part is
+*which* line changed rather than that something did. `walkdir` is a handful of
+lines of `read_dir` given that discovery must not follow symlinks anyway.
 
 ---
 
@@ -501,8 +511,12 @@ touches nothing. `--auto-approve` skips the prompt; a non-TTY stdin without
   get wrong — the earlier design had both, and the interaction between an
   optional file and a source root defaulting to the working directory was the
   hazard that prompted the change (spec §10.1).
-- **M5 — UX polish.** error messages, plan presentation, `--out`, identity
-  line, docs.
+- **M5 — Pass-through and polish. ✅ Done.** The §8.3 gap (`--lock-timeout`,
+  the `--plan-*` family) plus `pgpushy init`, colour handling, `--verbose`, the
+  empty-tree case, and dependency hygiene. Both pass-through settings live in
+  the environment (spec §10.4, §10.5) because both describe *that target*;
+  `--lock-timeout` is additionally a flag, since it cannot change what gets
+  reconciled.
 - **M6 — Managed provider (0.x fast-follow, then default).** download/cache/
   verify; SHA-256 table; make managed the default backend.
 

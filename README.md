@@ -26,10 +26,83 @@ ordering them by their cross-schema foreign keys.
 pgpushy does not compute diffs or generate migrations — pgschema does. pgpushy
 is a preprocessor and an orchestrator.
 
+## A worked example
+
+```console
+$ pgpushy init
+  wrote pgpushy.toml
+  source_root: db/schema (found *.sql there)
+```
+
+Fill in the target it scaffolded:
+
+```toml
+[env.local]
+db   = "myapp_dev"
+user = "joe"
+```
+
+Now write your schema, in whatever files and folders suit you. Nothing needs
+ordering, and nothing needs qualifying:
+
+```sql
+-- db/schema/orders.sql   (references a table defined in another file)
+CREATE TABLE orders (
+    id          int PRIMARY KEY,
+    customer_id int NOT NULL REFERENCES customers(id) ON DELETE CASCADE
+);
+CREATE INDEX orders_customer_idx ON orders (customer_id);
+
+-- db/schema/customers.sql
+CREATE TABLE customers (id int PRIMARY KEY, name text NOT NULL);
+```
+
+```console
+$ pgpushy validate
+  config: pgpushy.toml
+  db/schema (2 files)
+  2 tables, 1 foreign key, 1 index
+
+  managed schemas: public
+
+  ok  no duplicate objects
+  ok  all foreign key referents resolvable
+  ok  no cross-schema foreign key cycles
+  ok  no unsupported statements
+
+$ pgpushy apply --env local
+  config: pgpushy.toml
+  db/schema (2 files)
+  2 tables, 1 foreign key, 1 index
+
+  managed schemas: public
+
+  pgschema 1.12.0 (/usr/local/bin/pgschema)
+  env local: myapp_dev on 127.0.0.1:5432 (cluster 7668031834611146801)
+
+── public ──
+  <pgschema's plan for this schema>
+
+  Plan for 1 managed schema, in apply order:
+
+    public    3 changes
+
+  3 changes across 1 schema, 0 destructive.
+
+  apply is not atomic across schemas: a failure partway leaves
+  earlier schemas applied and the rest unapplied.
+
+Apply? [y/N] y
+  Applied 1 schema: public
+```
+
+Running it again does nothing — the target already matches.
+
 ## Commands
 
 | Command | What it does |
 |---|---|
+| `pgpushy init` | Write a starter `pgpushy.toml`. |
 | `pgpushy validate` | Check the source tree. No database connection at all. |
 | `pgpushy plan` | Show what would change, per schema. Read-only. |
 | `pgpushy apply` | Reconcile the database, after one approval. |
@@ -68,6 +141,19 @@ host    = "db.internal"
 db      = "myapp"
 user    = "deploy"
 sslmode = "require"
+
+# How long Postgres waits for a lock before giving up. Worth setting on a busy
+# production database, where an unbounded wait blocks everything behind it.
+lock_timeout = "30s"
+
+# Optional. pgschema builds its comparison model in an ephemeral embedded
+# Postgres by default; name an external one if spawning a process is not
+# possible where pgpushy runs. NOTE: pgschema WRITES here — it is scratch
+# space, not a reference, so do not point it at anything that matters.
+[env.prod.plan_db]
+host = "plan.internal"
+db   = "pgschema_scratch"
+user = "planner"
 ```
 
 `plan` and `apply` take `--env <name>`, and it is **required** — even when only
@@ -88,7 +174,20 @@ parent directories; `-c`/`--config <path>` names one anywhere.
 `PG*` deliberately does not override a named environment's target: the point of
 `--env prod` is that it is unambiguous. `PGPASSWORD` is the exception, since a
 secret should not live in a version-controlled file — and pgpushy warns loudly
-if the password it ends up using came from the file.
+if the password it ends up using came from the file. A plan database takes its
+password from `PGPUSHY_PLAN_PASSWORD`, a separate variable because it is a
+separate server. Neither password is ever passed on a command line.
+
+`--lock-timeout` may also be given on `apply`, overriding the environment. It
+is the one setting that works both ways, because it cannot change *what* gets
+reconciled — only whether the apply gives up waiting.
+
+## Other flags
+
+`--verbose` prints the pgschema command line and where the synthesized desired
+state was written; it is the first thing to reach for when a run does something
+unexpected. Colour is suppressed automatically when output is not a terminal,
+and `--no-color` or `NO_COLOR` forces it off.
 
 ## Building
 
