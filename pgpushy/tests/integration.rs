@@ -981,68 +981,6 @@ fn plans_through_an_external_plan_database() {
     let _ = client.batch_execute(&format!("DROP DATABASE IF EXISTS {plan_db}"));
 }
 
-/// The plan database's password travels through `PGSCHEMA_PLAN_PASSWORD`, not
-/// `--plan-password`: a secret in the argv is visible in the process list, and
-/// in anything `--verbose` prints into a bug report.
-#[test]
-fn the_plan_database_password_never_reaches_the_command_line() {
-    let target = require_target!();
-    let schema = unique_schema("planpw");
-    let _schemas = Schemas::create(&target, std::slice::from_ref(&schema));
-
-    let plan_db = format!("pgpushy_secret_{}", std::process::id());
-    let mut client = target.client();
-    client
-        .batch_execute(&format!("DROP DATABASE IF EXISTS {plan_db}"))
-        .ok();
-    client
-        .batch_execute(&format!("CREATE DATABASE {plan_db}"))
-        .expect("create plan database");
-
-    let parts = parse(&target.url);
-    let project = target.project(
-        &format!("default_schema = \"{schema}\""),
-        &[("t.sql", "CREATE TABLE t (id int PRIMARY KEY);".to_owned())],
-    );
-    let config = project.dir.path().join("pgpushy.toml");
-    let mut text = std::fs::read_to_string(&config).expect("read config");
-    text.push_str(&format!(
-        "\n[env.test.plan_db]\nhost = \"{}\"\nport = {}\ndb = \"{plan_db}\"\n\
-         user = \"{}\"\nsslmode = \"disable\"\n",
-        parts.host, parts.port, parts.user,
-    ));
-    std::fs::write(&config, text).expect("write config");
-
-    let mut cmd = project.command("plan");
-    cmd.arg("--verbose");
-    if let Some(password) = &parts.password {
-        cmd.env("PGPUSHY_PLAN_PASSWORD", password);
-    }
-    let assert = cmd.assert().success();
-
-    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
-    assert!(
-        stdout.contains("--plan-db"),
-        "the plan database should be forwarded:\n{stdout}"
-    );
-    assert!(
-        !stdout.contains("--plan-password"),
-        "the password must not be a flag:\n{stdout}"
-    );
-    // Token-wise rather than substring: a short test password like "pw" occurs
-    // inside plenty of innocent words, and what actually matters is whether it
-    // appears as an argument in its own right.
-    if let Some(password) = &parts.password {
-        assert!(
-            !stdout.split_whitespace().any(|token| token == password),
-            "the password appeared as a command-line argument:\n{stdout}"
-        );
-    }
-
-    let mut client = target.client();
-    let _ = client.batch_execute(&format!("DROP DATABASE IF EXISTS {plan_db}"));
-}
-
 /// Spec §10.5: forwarded from the environment, and overridable by the flag —
 /// safe precedence, because a lock timeout cannot change what is reconciled.
 #[test]
@@ -1104,5 +1042,58 @@ fn captured_output_carries_no_escape_sequences() {
     assert!(
         !stdout.contains('\u{1b}'),
         "pgschema's colour leaked into captured output:\n{stdout}"
+    );
+}
+
+/// The plan database's password travels through `PGSCHEMA_PLAN_PASSWORD`, not
+/// `--plan-password`: a secret in the argv is visible in the process list, and
+/// in anything `--verbose` prints into a bug report.
+///
+/// Needs a real target because pgpushy inspects it before ever invoking
+/// pgschema — but the *plan* database can be anywhere, since pgpushy never
+/// connects there itself. So it gets a deliberately distinctive password,
+/// which a real target's could not be: CI's happens to equal the username,
+/// and asserting on a value that appears legitimately all over the output
+/// cannot work.
+#[test]
+fn the_plan_database_password_never_reaches_the_command_line() {
+    let target = require_target!();
+    const DISTINCTIVE: &str = "zzz-plan-secret-zzz";
+
+    let schema = unique_schema("planpw");
+    let _schemas = Schemas::create(&target, std::slice::from_ref(&schema));
+
+    let project = target.project(
+        &format!("default_schema = \"{schema}\""),
+        &[("t.sql", "CREATE TABLE t (id int PRIMARY KEY);".to_owned())],
+    );
+    let config = project.dir.path().join("pgpushy.toml");
+    let mut text = std::fs::read_to_string(&config).expect("read config");
+    text.push_str(
+        "\n[env.test.plan_db]\nhost = \"127.0.0.1\"\nport = 1\n\
+         db = \"plan\"\nuser = \"planner\"\nsslmode = \"disable\"\n",
+    );
+    std::fs::write(&config, text).expect("write config");
+
+    // pgschema cannot reach that plan database, and does not need to: the
+    // command line is printed before it runs, which is all this asserts on.
+    let assert = project
+        .command("plan")
+        .arg("--verbose")
+        .env("PGPUSHY_PLAN_PASSWORD", DISTINCTIVE)
+        .assert();
+
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("--plan-db"),
+        "the plan database should be forwarded:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("--plan-password"),
+        "the password must not be a flag:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains(DISTINCTIVE),
+        "the password leaked into output:\n{stdout}"
     );
 }
