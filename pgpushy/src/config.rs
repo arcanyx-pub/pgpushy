@@ -355,19 +355,17 @@ fn missing_file_message() -> String {
 /// someone reading it will reasonably try them, and "not implemented yet"
 /// answers the question they actually have.
 fn check_unsupported(file: &File, path: &Path) -> Result<()> {
-    // Nested rather than a `let` chain: those are stable from Rust 1.88, and
-    // this workspace supports 1.85.
-    if let Some(backend) = &file.pgschema.backend {
-        if backend != "byo" {
-            bail!(
-                "{}: pgschema backend {backend:?} is not available yet\n\
-                 \n\
-                 Only \"byo\" — a pgschema binary you supply — is implemented. The managed \
-                 backend, which downloads and verifies a pinned version, is a fast-follow.\n\
-                 Set [pgschema] path, or pass --pgschema-path.",
-                path.display(),
-            );
-        }
+    if let Some(backend) = &file.pgschema.backend
+        && backend != "byo"
+    {
+        bail!(
+            "{}: pgschema backend {backend:?} is not available yet\n\
+             \n\
+             Only \"byo\" — a pgschema binary you supply — is implemented. The managed \
+             backend, which downloads and verifies a pinned version, is a fast-follow.\n\
+             Set [pgschema] path, or pass --pgschema-path.",
+            path.display(),
+        );
     }
     if file.pgschema.version.is_some() {
         bail!(

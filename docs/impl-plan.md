@@ -121,11 +121,13 @@ commands are in [Appendix A](#appendix-a-reproduction-harness).
 ## 2. Tech stack & conventions
 
 Mirror `snowdrop-id-rs`:
-- **Rust edition 2024**, `rust-version = "1.85"` (bump only with reason),
-  workspace `resolver = "3"`, shared `[workspace.package]`. Note that edition
-  2024 is available on 1.85 but **`let` chains are not** — those are stable
-  from 1.88 — so `if let Some(x) = y && z` compiles on a modern toolchain and
-  fails the MSRV job. `just msrv` catches it before pushing.
+- **Rust edition 2024**, `rust-version = "1.88"`, workspace `resolver = "3"`,
+  shared `[workspace.package]`. 1.88 rather than snowdrop's 1.85 for a stated
+  reason: **`let` chains** (`if let Some(x) = y && z`) are stable from 1.88,
+  and writing around them costs readability in exactly the code that walks
+  optional AST nodes. pgpushy is a CLI rather than a widely-depended-on
+  library, so an older floor buys little. `just msrv` checks it before pushing
+  — this is the one class of failure a modern local toolchain cannot see.
 - **License:** Apache-2.0 (`LICENSE` is in the repo root), matching pgschema's
   own license. Set `license = "Apache-2.0"` in `[workspace.package]`.
 - **justfile** recipes: `fmt`, `fmt-check`, `clippy` (`--all-targets
