@@ -343,14 +343,31 @@ struct PgschemaBin { path: Utf8PathBuf, version: Option<Version> }
   **Below floor → hard error** naming found vs required, with **no override**
   (spec §13). **Unparseable version → warn, proceed** (the line is not a
   stability contract) — hence `Option<Version>`.
-- **`managed.rs` (fast-follow, becomes default).** Resolve version (pinned to
-  tested version, config-overridable) → map `(version, os, arch)` to the
-  GitHub release asset URL `…/releases/download/v<ver>/pgschema-<ver>-<os>-<arch>`
-  → download over HTTPS to `$XDG_CACHE_HOME/pgpushy/pgschema/<ver>/pgschema`
-  (atomic: temp file + rename; lock for concurrent runs) → **verify against a
-  pgpushy-shipped SHA-256** (const table `{version,platform} → hash`, since
-  pgschema ships none) → `chmod +x`. Reuse if cached+verified. Linux/macOS
+- **`managed.rs` (the default).** Resolve version (pinned to tested version,
+  config-overridable) → map `(version, os, arch)` to the GitHub release asset
+  URL `…/releases/download/v<ver>/pgschema-<ver>-<os>-<arch>` → download over
+  HTTPS to `$XDG_CACHE_HOME/pgpushy/pgschema/<ver>/<platform>/pgschema` →
+  **verify against a pgpushy-shipped SHA-256** (const table, since pgschema
+  ships none) → `chmod +x` via an atomic temp-file-and-rename. Linux/macOS
   only; Windows/air-gapped → BYO.
+
+  Two departures from the sketch above, both from testing:
+
+  **No lock is needed for concurrent runs.** The atomic rename is sufficient —
+  four simultaneous cold-cache runs each download, each rename, and the last
+  wins with an identical file. Verified: one cached binary, correct hash, no
+  leftover temporaries. A lock would only save redundant bandwidth, and it
+  would add a failure mode (a stale lock from a killed process) worse than the
+  problem.
+
+  **The cache is re-verified on every hit**, not trusted for existing. Atomic
+  writes cover pgpushy's own interrupted downloads and nothing else, and
+  `exists()` cannot distinguish a good cache from a tampered one. Hashing
+  ~19 MB costs about 10 ms, which is nothing beside the network and database
+  work that follows. On mismatch: report and re-download.
+
+  The path also keys on platform as well as version, so a cache on a shared
+  network home directory cannot serve one architecture's binary to another.
 
 **Floor constant:** `MIN_PGSCHEMA = "1.12.0"` (the tested version). True
 behavioral floor is v1.4.2 — headroom to lower later *with tests*, not the
@@ -519,8 +536,12 @@ touches nothing. `--auto-approve` skips the prompt; a non-TTY stdin without
   the environment (spec §10.4, §10.5) because both describe *that target*;
   `--lock-timeout` is additionally a flag, since it cannot change what gets
   reconciled.
-- **M6 — Managed provider (0.x fast-follow, then default).** download/cache/
-  verify; SHA-256 table; make managed the default backend.
+- **M6 — Managed provider. ✅ Done.** download/cache/verify; SHA-256 table;
+  managed is now the default backend. Adding a pgschema version means adding
+  four hashes — one per published platform — computed by downloading each asset
+  and hashing it. A unit test asserts the pinned version has a hash for every
+  platform, so forgetting one drops that platform to TLS-only trust loudly
+  rather than silently.
 
 **Widening to pgschema parity** (spec §12.5, §14). Deliberately *after* the
 vertical slice: until `plan` and `apply` work, a new object kind cannot be
@@ -603,10 +624,12 @@ logic lives, and `validate` makes it shippable and testable on its own.
 ## 14. Risks & open implementation questions
 
 - **~~R1~~ — RESOLVED (2026-07-29).** Both halves confirmed; see below.
-- **R2 — Managed download integrity.** pgschema ships no checksums; we self-pin
-  SHA-256. Decide the update process when we bump the pinned version (recompute
-  hashes for all four platforms). Consider verifying against GitHub's API
-  digest too.
+- **~~R2~~ — RESOLVED (2026-08-11).** pgschema ships no checksums, so pgpushy
+  self-pins SHA-256 in `managed.rs`. The update process is part of
+  [RELEASING.md](RELEASING.md): bumping the pinned version means downloading
+  all four assets, hashing them, and committing the four rows in the same
+  change as the version bump, so the hashes get reviewed alongside it. A unit
+  test fails if the pinned version lacks a hash for any published platform.
 - **~~R3~~ — RESOLVED (2026-07-29).** Cross-schema FK removal detection is
   precise because it reads pgschema's own plan rather than guessing: a hazard
   only when the referenced schema's plan drops the specific column or unique

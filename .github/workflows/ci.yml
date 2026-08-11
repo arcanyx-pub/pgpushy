@@ -47,6 +47,10 @@ jobs:
           --health-retries 10
     env:
       PGPUSHY_TEST_PG_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # This job already has network, so it is where the managed backend's
+      # real download is exercised. Ordinary `cargo test` must not fetch
+      # ~19 MB from GitHub, so those tests are opt-in everywhere else.
+      PGPUSHY_TEST_DOWNLOAD: "1"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable

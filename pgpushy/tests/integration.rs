@@ -1097,3 +1097,151 @@ fn the_plan_database_password_never_reaches_the_command_line() {
         "the password leaked into output:\n{stdout}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The managed backend (spec §8.5)
+// ---------------------------------------------------------------------------
+//
+// Downloading ~19 MB from GitHub is not something an ordinary `cargo test`
+// should do, so these are gated on `PGPUSHY_TEST_DOWNLOAD=1` — separately from
+// the database variables, because the resource they need is different.
+
+fn downloads_enabled() -> bool {
+    std::env::var("PGPUSHY_TEST_DOWNLOAD").is_ok_and(|value| value == "1")
+}
+
+macro_rules! require_downloads {
+    () => {
+        if !downloads_enabled() {
+            eprintln!("skipping: set PGPUSHY_TEST_DOWNLOAD=1 to run this test");
+            return;
+        }
+    };
+}
+
+/// The whole point of the managed backend: pgschema arrives without anyone
+/// installing it, and what arrives is what pgpushy expects byte for byte.
+#[test]
+fn downloads_verifies_and_caches_pgschema() {
+    let target = require_target!();
+    require_downloads!();
+
+    let schema = unique_schema("managed");
+    let _schemas = Schemas::create(&target, std::slice::from_ref(&schema));
+
+    // A project with no [pgschema] path, so the managed backend is used.
+    let parts = parse(&target.url);
+    let dir = TempDir::new().expect("temp dir");
+    std::fs::write(
+        dir.path().join("pgpushy.toml"),
+        format!(
+            "default_schema = \"{schema}\"\n\
+             \n[env.test]\nhost = \"{}\"\nport = {}\ndb = \"{}\"\n\
+             user = \"{}\"\nsslmode = \"disable\"\n",
+            parts.host, parts.port, parts.dbname, parts.user,
+        ),
+    )
+    .expect("write config");
+    write(&dir, "t.sql", "CREATE TABLE t (id int PRIMARY KEY);");
+
+    let cache = TempDir::new().expect("temp dir");
+    let run = || {
+        let mut cmd = Command::cargo_bin("pgpushy").expect("binary builds");
+        cmd.args(["plan", "--env", "test"])
+            .arg("--config")
+            .arg(dir.path().join("pgpushy.toml"))
+            .env("XDG_CACHE_HOME", cache.path());
+        if let Some(password) = &parts.password {
+            cmd.env("PGPASSWORD", password);
+        }
+        cmd
+    };
+
+    // Cold cache: downloads, then plans with what it fetched.
+    run()
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("downloading pgschema"))
+        .stdout(predicates::str::contains("1 to add"));
+
+    // Warm cache: no second download.
+    run()
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("downloading pgschema").not())
+        .stdout(predicates::str::contains("1 to add"));
+}
+
+/// The cache is re-verified on every hit rather than trusted for existing:
+/// atomic writes cover pgpushy's own partial writes and nothing else.
+#[test]
+fn a_tampered_cache_is_noticed_and_replaced() {
+    let target = require_target!();
+    require_downloads!();
+
+    let schema = unique_schema("tamper");
+    let _schemas = Schemas::create(&target, std::slice::from_ref(&schema));
+
+    let parts = parse(&target.url);
+    let dir = TempDir::new().expect("temp dir");
+    std::fs::write(
+        dir.path().join("pgpushy.toml"),
+        format!(
+            "default_schema = \"{schema}\"\n\
+             \n[env.test]\nhost = \"{}\"\nport = {}\ndb = \"{}\"\n\
+             user = \"{}\"\nsslmode = \"disable\"\n",
+            parts.host, parts.port, parts.dbname, parts.user,
+        ),
+    )
+    .expect("write config");
+    write(&dir, "t.sql", "CREATE TABLE t (id int PRIMARY KEY);");
+
+    let cache = TempDir::new().expect("temp dir");
+    let run = || {
+        let mut cmd = Command::cargo_bin("pgpushy").expect("binary builds");
+        cmd.args(["plan", "--env", "test"])
+            .arg("--config")
+            .arg(dir.path().join("pgpushy.toml"))
+            .env("XDG_CACHE_HOME", cache.path());
+        if let Some(password) = &parts.password {
+            cmd.env("PGPASSWORD", password);
+        }
+        cmd
+    };
+
+    run().assert().success();
+
+    // Find the cached binary and corrupt it.
+    let cached = walk_for_file(cache.path(), "pgschema").expect("a cached binary");
+    let original = std::fs::read(&cached).expect("read cached");
+    let mut tampered = original.clone();
+    tampered.extend_from_slice(b"not the real binary");
+    std::fs::write(&cached, &tampered).expect("tamper");
+
+    run()
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("does not match its"))
+        .stdout(predicates::str::contains("downloading pgschema"));
+
+    assert_eq!(
+        std::fs::read(&cached).expect("read cached"),
+        original,
+        "the tampered binary should have been replaced",
+    );
+}
+
+/// Find a file by name anywhere under `root`.
+fn walk_for_file(root: &Path, name: &str) -> Option<PathBuf> {
+    for entry in std::fs::read_dir(root).ok()?.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(found) = walk_for_file(&path, name) {
+                return Some(found);
+            }
+        } else if path.file_name().is_some_and(|f| f == name) {
+            return Some(path);
+        }
+    }
+    None
+}

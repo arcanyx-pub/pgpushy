@@ -667,9 +667,15 @@ string, not a stability contract. BYO is the only backend available on
 environments, and is therefore a permanent part of pgpushy, not a temporary
 measure.
 
-**Rollout.** The first 0.x release ships the **BYO backend with the version
-check** only. The managed backend is a fast-follow and becomes the default when
-it lands; the provider seam keeps that change additive.
+pgpushy MUST NOT trust a cached binary merely because the file is present: a
+cache hit MUST be re-verified against the shipped hash where one exists. An
+atomic write protects against pgpushy's own interrupted downloads and says
+nothing about what else may have touched the cache since. A mismatch MUST be
+reported and the binary re-fetched rather than executed.
+
+**Selection.** The managed backend is the default. An explicitly configured
+binary path selects BYO regardless of the configured backend, since naming a
+binary and then downloading a different one cannot be what the operator meant.
 
 ### 8.6 Approval
 
@@ -963,7 +969,9 @@ useful it is (§14).
   technically present from **v1.4.2** (2025-11-14), which bounds how far the
   floor could be lowered later with testing, but is not itself the supported
   floor. The BYO backend enforces the floor (§8.5); the managed backend
-  controls the version and so needs no check.
+  controls the version and so needs no check — but the floor still applies to
+  a version the operator pins, since it is about what pgpushy is tested
+  against rather than about how the binary arrived.
 - **libpg_query** (via the `pg_query` crate) — used for parsing (§4.2).
 - **A Postgres client driver** — used for the read-only target inspection
   (§6). pgpushy connects to the target directly, in addition to the
@@ -1090,7 +1098,8 @@ made after draft 2 of v0.1.
   pgpushy resolves the binary through a provider: managed download (intended
   default, pinned + SHA-256-verified) with a permanent BYO override that
   parses `pgschema --help` and enforces the floor. First 0.x release ships
-  BYO + version check; managed is a fast-follow. (§8.5, §13)
+  BYO + version check; **[0.3]** managed landed and is now the default, with
+  BYO selected by naming a binary or setting `backend = "byo"`. (§8.5, §13)
 - **Configuration file** — **[0.3]** `pgpushy.toml` is **required**, read from
   the working directory only (not searched upward; `--config` for an explicit
   path), and holds everything about the project: structure, `managed_schemas`,

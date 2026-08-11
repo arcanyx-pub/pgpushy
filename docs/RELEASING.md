@@ -27,6 +27,29 @@ release means the CI matrix in [`ci.yml`](../.github/workflows/ci.yml) and
 agree. Raising one without the other makes the floor a lie in whichever
 direction is worse.
 
+## Bumping the pinned pgschema
+
+The managed backend downloads a version pgpushy pins and verifies it against a
+hash pgpushy ships, so bumping that version is a security-relevant change, not
+a version-string edit:
+
+```console
+$ ver=1.13.0
+$ for p in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64; do
+    curl -fsSL -o "pgschema-$ver-$p" \
+      "https://github.com/pgplex/pgschema/releases/download/v$ver/pgschema-$ver-$p"
+  done
+$ sha256sum pgschema-$ver-*
+```
+
+Put all four rows in `HASHES` in
+[`provider/managed.rs`](../pgpushy/src/provider/managed.rs), update
+`MIN_PGSCHEMA` and the CI matrix together, and commit them in one change so the
+hashes are reviewed alongside the version they belong to. A unit test fails if
+the pinned version lacks a hash for any published platform — but nothing can
+check that a hash is the *right* one except computing it from the real asset,
+so do that rather than copying from anywhere.
+
 ## Release flow
 
 1. **On a feature branch, bump the version** (the commit rides along in a

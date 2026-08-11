@@ -64,6 +64,12 @@ and [`docs/impl-plan.md`](docs/impl-plan.md) for the build plan.
 - Colour is suppressed when output is not a terminal, and by `--no-color` or
   `NO_COLOR` — including pgschema's own, which previously left escape
   sequences in captured output.
+- A managed pgschema provider, and it is the **default**: pgpushy downloads a
+  pinned pgschema over HTTPS, verifies it against a SHA-256 it ships, and
+  caches it per version and platform. No install step. The cache is re-verified
+  on every run rather than trusted for existing, and a mismatch is reported and
+  replaced. `backend = "byo"` or naming a binary opts out — required on
+  Windows and in air-gapped environments.
 - A source tree with no managed schemas now says so rather than succeeding
   silently, and a `source_root` pointing at a file explains itself instead of
   failing with a bare "Not a directory".

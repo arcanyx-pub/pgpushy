@@ -20,6 +20,7 @@
 //! `--config` selects which project. `--env` selects which target. Nothing
 //! else about either is a flag.
 
+use crate::provider::Backend;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -314,7 +315,9 @@ pub fn load(explicit: Option<&Path>) -> Result<Loaded> {
     let file: File =
         toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
 
-    check_unsupported(&file, &path)?;
+    // Fail on a bad backend name here rather than at first use, so that a
+    // typo is reported before a source tree is parsed.
+    backend(&file)?;
 
     Ok(Loaded { file, path })
 }
@@ -349,35 +352,12 @@ fn missing_file_message() -> String {
     )
 }
 
-/// Reject settings that are specified but not yet built.
-///
-/// A dedicated message beats "unknown field": these keys are in the spec, so
-/// someone reading it will reasonably try them, and "not implemented yet"
-/// answers the question they actually have.
-fn check_unsupported(file: &File, path: &Path) -> Result<()> {
-    if let Some(backend) = &file.pgschema.backend
-        && backend != "byo"
-    {
-        bail!(
-            "{}: pgschema backend {backend:?} is not available yet\n\
-             \n\
-             Only \"byo\" — a pgschema binary you supply — is implemented. The managed \
-             backend, which downloads and verifies a pinned version, is a fast-follow.\n\
-             Set [pgschema] path, or pass --pgschema-path.",
-            path.display(),
-        );
+/// Which pgschema backend the configuration asks for (spec §8.5).
+pub fn backend(file: &File) -> Result<Backend> {
+    match &file.pgschema.backend {
+        Some(name) => Backend::parse(name),
+        None => Ok(Backend::default()),
     }
-    if file.pgschema.version.is_some() {
-        bail!(
-            "{}: [pgschema] version only applies to the managed backend, which is not \
-             available yet\n\
-             \n\
-             With the BYO backend pgpushy uses whatever binary you point it at, and checks \
-             that its version meets the supported minimum.",
-            path.display(),
-        );
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -492,21 +472,30 @@ mod tests {
         assert!(err.to_string().contains("database"), "{err}");
     }
 
+    /// The default has to be `managed`, since that is what makes pgpushy
+    /// usable without installing pgschema first.
     #[test]
-    fn settings_that_are_not_built_yet_say_so() {
-        let path = Path::new("pgpushy.toml");
+    fn the_backend_defaults_to_managed() {
         let parse = |t: &str| toml::from_str::<File>(t).expect("valid");
+        assert_eq!(backend(&parse("")).unwrap(), Backend::Managed);
+        assert_eq!(
+            backend(&parse("[pgschema]\nbackend = \"managed\"")).unwrap(),
+            Backend::Managed
+        );
+        assert_eq!(
+            backend(&parse("[pgschema]\nbackend = \"byo\"")).unwrap(),
+            Backend::Byo
+        );
+    }
 
-        let err = check_unsupported(&parse("[pgschema]\nbackend = \"managed\""), path)
+    #[test]
+    fn an_unknown_backend_names_the_valid_ones() {
+        let parse = |t: &str| toml::from_str::<File>(t).expect("valid");
+        let err = backend(&parse("[pgschema]\nbackend = \"magic\""))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("not available yet"), "{err}");
-
-        let err = check_unsupported(&parse("[pgschema]\nversion = \"1.12.0\""), path)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("managed backend"), "{err}");
-
-        assert!(check_unsupported(&parse("[pgschema]\nbackend = \"byo\""), path).is_ok());
+        assert!(err.contains("unknown pgschema backend"), "{err}");
+        assert!(err.contains("\"managed\""), "{err}");
+        assert!(err.contains("\"byo\""), "{err}");
     }
 }

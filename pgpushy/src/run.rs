@@ -7,12 +7,12 @@
 
 use crate::approve::{self, Decision};
 use crate::cli::{PgschemaArgs, TargetArgs};
-use crate::config::{Loaded, Settings};
+use crate::config::{self, Loaded, Settings};
 use crate::conn::Resolved;
 use crate::inspect::{self, Inspection};
 use crate::output::Output;
 use crate::plan_file::Plan;
-use crate::provider::{PgschemaBin, PgschemaProvider, byo::Byo};
+use crate::provider::{self, PgschemaBin};
 use crate::report;
 use crate::{discovery, hazard, pgschema, tempfile_for};
 use anyhow::{Context, Result, bail};
@@ -217,10 +217,12 @@ impl Session {
         };
         report::summary(&settings, &analysis);
 
-        let binary = Byo {
-            explicit: loaded.pgschema_path(pgschema_args.pgschema_path.as_deref()),
-        }
-        .resolve()?;
+        let binary = provider::select(
+            config::backend(&loaded.file)?,
+            loaded.pgschema_path(pgschema_args.pgschema_path.as_deref()),
+            loaded.file.pgschema.version.clone(),
+            None,
+        )?;
         report::pgschema(&binary);
 
         // Spec §10.2: the warning fires on use, not on presence, and this is

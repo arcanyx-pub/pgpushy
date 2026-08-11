@@ -440,20 +440,18 @@ fn an_explicit_config_that_does_not_exist_is_an_error() {
         .stderr(predicates::str::contains("no configuration file at"));
 }
 
-/// The managed backend is in the spec but not built yet, so someone reading
-/// the spec will try it. "Unknown field" would be the wrong answer.
+/// The managed backend is the default, so naming it explicitly must simply
+/// work — this used to be the "not built yet" case.
 #[test]
-fn settings_that_are_not_built_yet_say_so_plainly() {
+fn the_managed_backend_is_accepted() {
     let dir = project(
         "[pgschema]\nbackend = \"managed\"",
         &[("customers.sql", CUSTOMERS)],
     );
 
-    validate(dir.path())
-        .assert()
-        .failure()
-        .stderr(predicates::str::contains("not available yet"))
-        .stderr(predicates::str::contains("fast-follow"));
+    // `validate` never resolves a pgschema binary, so this checks the setting
+    // is accepted without downloading anything.
+    validate(dir.path()).assert().success();
 }
 
 // ---------------------------------------------------------------------------
@@ -732,4 +730,56 @@ fn only_apply_takes_a_lock_timeout() {
         .assert()
         .failure()
         .stderr(predicates::str::contains("unexpected argument"));
+}
+
+// ---------------------------------------------------------------------------
+// The pgschema backend (spec §8.5)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_unknown_backend_names_the_valid_ones() {
+    let dir = project(
+        "[pgschema]\nbackend = \"magic\"",
+        &[("customers.sql", CUSTOMERS)],
+    );
+
+    validate(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("unknown pgschema backend"))
+        .stderr(predicates::str::contains("managed"))
+        .stderr(predicates::str::contains("byo"));
+}
+
+/// Rejected while loading the configuration, before a source tree is parsed —
+/// a typo in the backend name is a problem with the command, not the SQL.
+#[test]
+fn a_bad_backend_is_rejected_before_parsing() {
+    let dir = project(
+        "[pgschema]\nbackend = \"magic\"",
+        &[("broken.sql", "CREATE TABLE (((;")],
+    );
+
+    validate(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("unknown pgschema backend"))
+        .stderr(predicates::str::contains("could not parse SQL").not());
+}
+
+/// An explicit path means BYO whatever the backend says: naming a binary and
+/// then downloading a different one would be absurd.
+#[test]
+fn an_explicit_path_wins_over_the_managed_backend() {
+    let dir = project(
+        "[pgschema]\nbackend = \"managed\"\npath = \"/nonexistent/pgschema\"\n\
+         [env.local]\ndb = \"a\"\nuser = \"u\"",
+        &[("customers.sql", CUSTOMERS)],
+    );
+
+    // Reaching the BYO "no binary here" error proves nothing was downloaded.
+    plan(dir.path(), "local")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("no pgschema binary at"));
 }

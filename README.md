@@ -130,7 +130,10 @@ exclude        = ["seeds/**", "**/*.test.sql"]
 managed_schemas = ["app", "billing"]
 
 [pgschema]
-path = "/usr/local/bin/pgschema"  # otherwise looked up on PATH
+# pgpushy downloads and caches a pinned pgschema by default, verified against
+# a checksum it ships. Point it at your own binary instead if you prefer:
+# backend = "byo"
+# path    = "/usr/local/bin/pgschema"
 
 [env.local]
 db   = "myapp_dev"
@@ -188,6 +191,26 @@ reconciled — only whether the apply gives up waiting.
 state was written; it is the first thing to reach for when a run does something
 unexpected. Colour is suppressed automatically when output is not a terminal,
 and `--no-color` or `NO_COLOR` forces it off.
+
+## Where pgschema comes from
+
+By default pgpushy **downloads pgschema for you** and caches it under
+`$XDG_CACHE_HOME/pgpushy` — there is no install step. The download is over
+HTTPS and verified against a SHA-256 that pgpushy ships for each version it
+pins, because pgschema publishes no checksums of its own. The cache is
+re-checked against that hash on every run rather than trusted for existing.
+
+To use your own binary instead — required on Windows, where pgschema publishes
+none, and in air-gapped environments:
+
+```toml
+[pgschema]
+backend = "byo"
+path    = "/usr/local/bin/pgschema"   # or omit, to look on PATH
+```
+
+`--pgschema-path` does the same for a single run. Either way pgpushy checks the
+binary's version against the minimum it supports.
 
 ## Building
 

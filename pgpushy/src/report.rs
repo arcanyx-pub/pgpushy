@@ -443,3 +443,36 @@ pub fn password_from_file(connection: &Resolved, loaded: &Loaded) {
     eprintln!("    That file is easily committed to version control. Prefer PGPASSWORD");
     eprintln!("    in the environment, or --password, and remove it from the file.");
 }
+
+/// About to fetch pgschema (spec §8.5).
+///
+/// Said out loud because pgpushy is downloading and then executing a binary,
+/// which the operator should see happening rather than infer from a pause.
+pub fn downloading_pgschema(version: &str, platform: &str, unverified: bool) {
+    println!("  downloading pgschema {version} ({platform})...");
+    if unverified {
+        // Spec §8.5 permits pinning a version pgpushy ships no hash for, and
+        // requires saying which trust applies.
+        println!("    note: pgpushy ships no checksum for {version}, so this download is");
+        println!("    trusted on TLS alone. Versions pgpushy pins are checksum-verified.");
+    }
+}
+
+/// A cached pgschema that no longer matches its shipped checksum.
+///
+/// Not fatal — the fresh download is verified too — but corruption and
+/// tampering are indistinguishable from here, so it is not passed over.
+pub fn cache_mismatch(path: &Path) {
+    eprintln!();
+    eprintln!(
+        "warning: the cached pgschema at {} does not match its",
+        path.display()
+    );
+    eprintln!("  expected checksum. Re-downloading. If this repeats, something is");
+    eprintln!("  modifying the cache.");
+    eprintln!();
+}
+
+pub fn downloaded_pgschema(path: &Path) {
+    println!("  cached at {}", path.display());
+}
