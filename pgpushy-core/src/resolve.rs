@@ -12,8 +12,10 @@
 //!   schema. `managed_schemas` in configuration exists to close that.
 
 use crate::error::{Diagnostic, DiagnosticKind};
-use crate::model::{Objects, Origin, SchemaName};
-use std::collections::BTreeMap;
+use crate::model::{Objects, Origin, QualifiedName, SchemaName};
+use pg_query::NodeEnum;
+use pg_query::protobuf::Node;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Determine the managed-schema set.
 ///
@@ -131,4 +133,162 @@ fn render_list(schemas: &[SchemaName]) -> String {
         .map(SchemaName::as_str)
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Resolve which type names actually refer to something the source tree
+/// defines, qualify those, and record them as dependencies.
+///
+/// This cannot happen while parsing, for two reasons. A type may be defined in
+/// a file that has not been read yet, and — more sharply — libpg_query only
+/// writes `pg_catalog` in front of the built-ins that have an alias spelling.
+/// `int` arrives as `pg_catalog.int4`, but `text` arrives as plain `text`, so
+/// "not `pg_catalog`" does not mean "user-defined". Treating it that way
+/// rewrites `text` to `public.text` in the emitted SQL, which is a type that
+/// does not exist.
+///
+/// Matching against what the tree defines is the only test that cannot make
+/// that mistake. A name that matches nothing is left exactly as written: it
+/// belongs to an extension or to the target, and spec §14 covers it.
+pub fn type_references(objects: &mut Objects, default_schema: &SchemaName) {
+    let defined: BTreeSet<QualifiedName> =
+        objects.types.iter().map(|kind| kind.name.clone()).collect();
+
+    for index in 0..objects.tables.len() {
+        let schema = objects.tables[index].name.schema.clone();
+        let mut found = Vec::new();
+        resolve_columns(
+            &mut objects.tables[index].ast.table_elts,
+            &schema,
+            default_schema,
+            &defined,
+            &mut found,
+        );
+        resolve_literals(
+            &NodeEnum::CreateStmt(objects.tables[index].ast.clone()),
+            &defined,
+            &mut found,
+        );
+        objects.tables[index].depends_on = found;
+    }
+
+    for index in 0..objects.types.len() {
+        let schema = objects.types[index].name.schema.clone();
+        let mut found = Vec::new();
+        match &mut objects.types[index].ast {
+            NodeEnum::CompositeTypeStmt(composite) => resolve_columns(
+                &mut composite.coldeflist,
+                &schema,
+                default_schema,
+                &defined,
+                &mut found,
+            ),
+            NodeEnum::CreateDomainStmt(domain) => {
+                if let Some(type_name) = domain.type_name.as_mut() {
+                    resolve_type_name(type_name, &schema, default_schema, &defined, &mut found);
+                }
+            }
+            _ => {}
+        }
+        resolve_literals(&objects.types[index].ast.clone(), &defined, &mut found);
+        objects.types[index].depends_on = found;
+    }
+}
+
+/// Record the objects a statement names inside a string literal.
+///
+/// `DEFAULT nextval('public.ticket_no')` is a creation-time dependency exactly
+/// as a column's type is: the sequence has to exist before the table can be
+/// created. It reaches the closure and the cross-schema check the same way,
+/// which is why it is collected here rather than handled separately.
+///
+/// The literal is already qualified — spec §4.3 rejects a bare one — so there
+/// is nothing to resolve against a search path, only to look up.
+fn resolve_literals(
+    node: &NodeEnum,
+    defined: &BTreeSet<QualifiedName>,
+    found: &mut Vec<QualifiedName>,
+) {
+    for name in crate::literal::find(node) {
+        let Some(parts) = crate::literal::name_parts(&name.raw) else {
+            continue;
+        };
+        let [schema, object] = parts.as_slice() else {
+            continue;
+        };
+        let referenced = QualifiedName::new(SchemaName::new(schema), object);
+        if defined.contains(&referenced) {
+            found.push(referenced);
+        }
+    }
+}
+
+fn resolve_columns(
+    columns: &mut [Node],
+    owner: &SchemaName,
+    default_schema: &SchemaName,
+    defined: &BTreeSet<QualifiedName>,
+    found: &mut Vec<QualifiedName>,
+) {
+    for column in columns {
+        if let Some(NodeEnum::ColumnDef(column)) = column.node.as_mut()
+            && let Some(type_name) = column.type_name.as_mut()
+        {
+            resolve_type_name(type_name, owner, default_schema, defined, found);
+        }
+    }
+}
+
+/// Qualify one type reference, if it names something the tree defines.
+///
+/// An unqualified name is tried against the owning object's schema first and
+/// the default schema second, which is how Postgres itself would resolve it
+/// under an ordinary `search_path`. A qualified one is taken as written —
+/// including when it points at another schema, which [`crate::validate`]
+/// rejects rather than silently accepting (spec §12.6).
+fn resolve_type_name(
+    type_name: &mut pg_query::protobuf::TypeName,
+    owner: &SchemaName,
+    default_schema: &SchemaName,
+    defined: &BTreeSet<QualifiedName>,
+    found: &mut Vec<QualifiedName>,
+) {
+    let parts: Vec<String> = type_name
+        .names
+        .iter()
+        .filter_map(|node| match node.node.as_ref() {
+            Some(NodeEnum::String(s)) => Some(s.sval.clone()),
+            _ => None,
+        })
+        .collect();
+    if parts.len() != type_name.names.len() {
+        return;
+    }
+
+    let candidates = match parts.as_slice() {
+        [name] => vec![
+            QualifiedName::new(owner.clone(), name),
+            QualifiedName::new(default_schema.clone(), name),
+        ],
+        [schema, name] if schema != "pg_catalog" => {
+            vec![QualifiedName::new(SchemaName::new(schema), name)]
+        }
+        _ => return,
+    };
+
+    let Some(resolved) = candidates.into_iter().find(|name| defined.contains(name)) else {
+        return;
+    };
+    type_name.names = vec![
+        string_node(resolved.schema.as_str()),
+        string_node(&resolved.name),
+    ];
+    found.push(resolved);
+}
+
+fn string_node(s: &str) -> Node {
+    Node {
+        node: Some(NodeEnum::String(pg_query::protobuf::String {
+            sval: s.to_owned(),
+        })),
+    }
 }

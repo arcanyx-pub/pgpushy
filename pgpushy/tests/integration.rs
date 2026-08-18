@@ -1350,3 +1350,67 @@ fn a_stray_pgschemaignore_cannot_change_what_is_reconciled() {
         .success()
         .stdout(predicates::str::contains("to modify"));
 }
+
+/// Every category-2 kind, applied and then converged (spec §4.3, §5.1).
+///
+/// The order here is one no fixed rule gets right: the composite type is
+/// written first and needs the domain written last. pgpushy sorts category 2
+/// by what each object needs, and pgschema then applies what it is given.
+///
+/// The sequence is deliberately one nothing defaults to. Verified against
+/// pgschema 1.12.0: a default calling `nextval` is applied as SERIAL — an
+/// owned sequence is created instead of the one named, apply reports success,
+/// and every later plan shows the same drop and add. §4.3 rejects that shape
+/// rather than letting a database silently never converge.
+#[test]
+fn a_tree_with_types_domains_and_sequences_converges() {
+    let target = require_target!();
+    let schema = unique_schema("m8");
+    let _schemas = Schemas::create(&target, std::slice::from_ref(&schema));
+
+    let project = target.project(
+        &format!("default_schema = \"{schema}\""),
+        &[(
+            "schema.sql",
+            "CREATE TYPE addr AS (city text, zip zipcode);
+             CREATE DOMAIN zipcode AS text CHECK (VALUE ~ '^[0-9]{5}$');
+             CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');
+             CREATE SEQUENCE ticket_no START 1000 INCREMENT 5;
+             CREATE TABLE people (
+                 id     int PRIMARY KEY,
+                 how    mood,
+                 home   addr,
+                 ticket int
+             );"
+            .to_owned(),
+        )],
+    );
+
+    project
+        .command("apply")
+        .arg("--auto-approve")
+        .assert()
+        .success();
+
+    // A composite emitted before the domain it is written in would have failed
+    // the apply; anything pgschema normalises would show up here.
+    project
+        .command("plan")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("No changes detected"));
+
+    // The sequence is a standalone object, with the parameters as written.
+    let increment: i64 = target
+        .client()
+        .query_one(
+            "SELECT seqincrement FROM pg_sequence s
+             JOIN pg_class c ON c.oid = s.seqrelid
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = $1 AND c.relname = 'ticket_no'",
+            &[&schema],
+        )
+        .expect("the standalone sequence should exist")
+        .get(0);
+    assert_eq!(increment, 5);
+}

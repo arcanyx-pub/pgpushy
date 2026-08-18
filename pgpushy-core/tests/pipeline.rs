@@ -365,8 +365,14 @@ fn rejects_statements_outside_the_allow_list() {
         ("INSERT INTO t VALUES (1);", "INSERT"),
         ("DROP TABLE t;", "DROP"),
         ("GRANT SELECT ON t TO joe;", "GRANT or REVOKE"),
-        ("CREATE TYPE mood AS ENUM ('ok');", "CREATE TYPE"),
-        ("CREATE SEQUENCE s;", "CREATE SEQUENCE"),
+        (
+            "CREATE FUNCTION f() RETURNS int AS 'SELECT 1' LANGUAGE sql;",
+            "CREATE FUNCTION",
+        ),
+        (
+            "CREATE TRIGGER g AFTER INSERT ON t EXECUTE FUNCTION f();",
+            "CREATE TRIGGER",
+        ),
         ("ALTER TABLE t ADD COLUMN c int;", "ADD CONSTRAINT"),
         ("CREATE TABLE t (id int) INHERITS (parent);", "INHERITS"),
         ("CREATE INDEX CONCURRENTLY i ON t (c);", "CONCURRENTLY"),
@@ -714,9 +720,8 @@ fn a_three_schema_cycle_names_all_three() {
 #[test]
 fn rejects_a_bare_name_inside_a_string_literal() {
     for sql in [
-        "CREATE TABLE t (id int DEFAULT nextval('s'));",
-        "CREATE TABLE t (id int DEFAULT nextval('s'::regclass));",
         "CREATE TABLE t (a int DEFAULT (('x'::regtype)::oid)::int);",
+        "CREATE TABLE t (a int CHECK ('t'::regclass IS NOT NULL));",
     ] {
         let diagnostics = err(vec![file("t.sql", sql)]);
         let diagnostic = only(&diagnostics, DiagnosticKind::UnqualifiedNameLiteral);
@@ -733,7 +738,7 @@ fn rejects_a_bare_name_inside_a_string_literal() {
 fn accepts_a_qualified_name_inside_a_string_literal() {
     let analysis = ok(vec![file(
         "t.sql",
-        "CREATE TABLE public.t (id int DEFAULT nextval('public.s'::regclass));",
+        "CREATE TABLE public.t (a int CHECK ('public.t'::regclass IS NOT NULL));",
     )]);
     assert_eq!(analysis.counts.tables, 1);
 }
@@ -744,7 +749,7 @@ fn accepts_a_qualified_name_inside_a_string_literal() {
 fn a_dot_inside_quotes_does_not_count_as_a_qualifier() {
     let diagnostics = err(vec![file(
         "t.sql",
-        "CREATE TABLE t (id int DEFAULT nextval('\"my.seq\"'));",
+        "CREATE TABLE t (a int CHECK ('\"my.rel\"'::regclass IS NOT NULL));",
     )]);
     only(&diagnostics, DiagnosticKind::UnqualifiedNameLiteral);
 }
@@ -873,4 +878,194 @@ fn one_document_per_managed_schema() {
     // `addresses -> regions` is same-schema, so it needs no closure and no
     // ordering edge.
     assert!(document(&analysis, "public").contains("REFERENCES public.regions (id)"));
+}
+
+// ---------------------------------------------------------------------------
+// Types, domains and sequences (spec §4.3, §5.1, §12.6)
+// ---------------------------------------------------------------------------
+
+/// Category 2 is the one category that is not internally order-free, so it is
+/// sorted by what each object needs rather than by kind or by name. Written
+/// here in the order that is wrong every way round: the composite first, the
+/// domain it uses last, and names that sort against the answer.
+#[test]
+fn orders_category_two_by_dependency_not_by_kind_or_name() {
+    let analysis = ok(vec![file(
+        "t.sql",
+        "CREATE TYPE aaa AS (zip zzz, note mmm);
+         CREATE TYPE mmm AS ENUM ('a', 'b');
+         CREATE DOMAIN zzz AS text;
+         CREATE SEQUENCE sss;",
+    )]);
+
+    let body = body(&analysis);
+    let at = |needle: &str| {
+        body.find(needle)
+            .unwrap_or_else(|| panic!("missing {needle}:\n{body}"))
+    };
+    assert!(
+        at("CREATE DOMAIN public.zzz") < at("CREATE TYPE public.aaa"),
+        "a domain must precede the composite that uses it:\n{body}"
+    );
+    assert!(
+        at("CREATE TYPE public.mmm") < at("CREATE TYPE public.aaa"),
+        "an enum must precede the composite that uses it:\n{body}"
+    );
+    // A sequence needs nothing, so it is placed by the name tie-break alone.
+    assert!(body.contains("CREATE SEQUENCE public.sss"), "{body}");
+}
+
+/// libpg_query writes `pg_catalog` in front of `int` but not `text`, so "not
+/// pg_catalog" cannot mean "user-defined". Matching what the tree defines is
+/// the only test that does not rewrite `text` into a type that does not exist.
+#[test]
+fn leaves_built_in_and_extension_types_alone() {
+    let analysis = ok(vec![file(
+        "t.sql",
+        "CREATE TABLE t (a text, b int, c varchar(10), d timestamptz, e citext);",
+    )]);
+    let body = body(&analysis);
+    assert!(body.contains(" text"), "{body}");
+    assert!(!body.contains("public.text"), "{body}");
+    // `citext` belongs to an extension; it is not pgpushy's to qualify.
+    assert!(!body.contains("public.citext"), "{body}");
+}
+
+/// A user-defined type the tree does define is qualified like everything else.
+#[test]
+fn qualifies_a_type_the_source_tree_defines() {
+    let analysis = ok(vec![file(
+        "t.sql",
+        "CREATE TYPE mood AS ENUM ('sad', 'ok');
+         CREATE TABLE people (how mood);",
+    )]);
+    assert!(
+        body(&analysis).contains("how public.mood"),
+        "{}",
+        body(&analysis)
+    );
+}
+
+/// Spec §4.3: an owned sequence is part of its column, and pgschema models it
+/// as SERIAL rather than an object of its own.
+#[test]
+fn rejects_a_sequence_owned_by_a_column() {
+    let diagnostics = err(vec![file(
+        "t.sql",
+        "CREATE TABLE t (id int);
+         CREATE SEQUENCE s OWNED BY t.id;",
+    )]);
+    let diagnostic = only(&diagnostics, DiagnosticKind::UnsupportedStatement);
+    assert!(diagnostic.to_string().contains("serial"), "{diagnostic}");
+}
+
+/// Spec §12.6: a foreign key is the only reference 0.1 lets cross a schema.
+#[test]
+fn rejects_a_cross_schema_type_reference() {
+    let diagnostics = err(vec![file(
+        "t.sql",
+        "CREATE SCHEMA billing;
+         CREATE DOMAIN public.email AS text;
+         CREATE TABLE billing.invoices (who public.email);",
+    )]);
+    let diagnostic = only(&diagnostics, DiagnosticKind::CrossSchemaReference);
+    let rendered = diagnostic.to_string();
+    assert!(rendered.contains("billing"), "{rendered}");
+    assert!(rendered.contains("public.email"), "{rendered}");
+}
+
+/// The same rule between two category-2 objects, not just from a table.
+#[test]
+fn rejects_a_cross_schema_domain_base_type() {
+    let diagnostics = err(vec![file(
+        "t.sql",
+        "CREATE SCHEMA billing;
+         CREATE DOMAIN public.email AS text;
+         CREATE DOMAIN billing.contact AS public.email;",
+    )]);
+    only(&diagnostics, DiagnosticKind::CrossSchemaReference);
+}
+
+/// A type a closure member is written in has to travel with it, or the
+/// member's CREATE TABLE cannot execute in the other schema's document.
+#[test]
+fn a_closure_member_brings_the_types_it_is_written_in() {
+    let billing = document(
+        &ok(vec![file(
+            "t.sql",
+            "CREATE SCHEMA billing;
+             CREATE DOMAIN email AS text;
+             CREATE TABLE customers (id int PRIMARY KEY, who email);
+             CREATE TABLE billing.invoices (cid int REFERENCES customers(id));",
+        )]),
+        "billing",
+    );
+    assert!(
+        billing.contains("CREATE DOMAIN public.email"),
+        "the closure member's domain must come with it:\n{billing}"
+    );
+    assert!(
+        billing.find("CREATE DOMAIN public.email") < billing.find("CREATE TABLE public.customers"),
+        "and it must come first:\n{billing}"
+    );
+}
+
+/// Spec §4.3: pgschema applies any default calling nextval as SERIAL, so the
+/// sequence named here would never be created and the plan would never
+/// converge. Verified against pgschema 1.12.0.
+#[test]
+fn rejects_a_default_that_calls_nextval() {
+    for sql in [
+        "CREATE SEQUENCE s;\nCREATE TABLE t (id int DEFAULT nextval('public.s'));",
+        "CREATE SEQUENCE s;\nCREATE DOMAIN d AS int DEFAULT nextval('public.s');",
+    ] {
+        let diagnostics = err(vec![file("t.sql", sql)]);
+        let diagnostic = only(&diagnostics, DiagnosticKind::UnsupportedStatement);
+        let rendered = diagnostic.to_string();
+        assert!(rendered.contains("nextval"), "{rendered}");
+        assert!(rendered.contains("serial"), "{rendered}");
+    }
+}
+
+/// A sequence nothing defaults to is managed normally — verified to apply and
+/// converge against pgschema 1.12.0.
+#[test]
+fn keeps_a_sequence_nothing_defaults_to() {
+    let analysis = ok(vec![file(
+        "t.sql",
+        "CREATE SEQUENCE ticket_no START 1000 INCREMENT 5;\nCREATE TABLE t (id int PRIMARY KEY);",
+    )]);
+    assert!(
+        body(&analysis).contains("CREATE SEQUENCE public.ticket_no"),
+        "{}",
+        body(&analysis)
+    );
+}
+
+/// Spec §5.4: a name inside a literal is spelled one way in its own schema's
+/// document and another way everywhere else. A `regclass` cast is how 0.1
+/// reaches that rule, since a nextval default is rejected outright.
+#[test]
+fn a_name_literal_is_dequalified_in_its_own_document_only() {
+    let analysis = ok(vec![file(
+        "t.sql",
+        "CREATE SCHEMA billing;
+         CREATE TABLE customers (
+             id int PRIMARY KEY,
+             a  int CHECK ('public.customers'::regclass IS NOT NULL)
+         );
+         CREATE TABLE billing.invoices (cid int REFERENCES customers(id));",
+    )]);
+
+    let public = document(&analysis, "public");
+    assert!(
+        public.contains("'customers'::regclass"),
+        "public's own document must drop the qualifier:\n{public}"
+    );
+
+    let billing = document(&analysis, "billing");
+    assert!(
+        billing.contains("'public.customers'::regclass"),
+        "every other document must keep it:\n{billing}"
+    );
 }

@@ -31,6 +31,9 @@ const QUALIFIED_REG_TYPES: &[(&str, &str)] = &[
 /// Functions whose first argument is coerced to `regclass`.
 const SEQUENCE_FUNCTIONS: &[&str] = &["nextval", "currval", "setval"];
 
+/// What a literal reached through one of those functions names.
+const SEQUENCE_CALL: &str = "sequence";
+
 /// Every name literal reachable from a statement.
 ///
 /// The search runs over the AST serialized to JSON rather than over the typed
@@ -91,7 +94,7 @@ fn from_call(call: &Value) -> Option<NameLiteral> {
     }
     Some(NameLiteral {
         raw: const_string(call.get("args")?.get(0)?)?,
-        what: "sequence",
+        what: SEQUENCE_CALL,
     })
 }
 
@@ -124,6 +127,15 @@ fn last_string(names: &Value) -> Option<String> {
             .as_str()?
             .to_owned(),
     )
+}
+
+/// Whether this literal came from a call to `nextval` and friends, rather than
+/// from a cast.
+///
+/// The distinction matters because pgschema can manage a sequence but not a
+/// default that draws from one (spec §4.3).
+pub fn names_a_sequence_call(literal: &NameLiteral) -> bool {
+    literal.what == SEQUENCE_CALL
 }
 
 /// Split a qualified-name literal the way Postgres does.
@@ -200,7 +212,7 @@ mod tests {
             found,
             vec![NameLiteral {
                 raw: "billing.s".to_owned(),
-                what: "sequence",
+                what: SEQUENCE_CALL,
             }]
         );
     }

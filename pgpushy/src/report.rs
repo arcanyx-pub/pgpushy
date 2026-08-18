@@ -71,6 +71,14 @@ pub fn summary(settings: &Settings, analysis: &Analysis) {
     if counts.indexes > 0 {
         parts.push(format!("{} index{}", counts.indexes, es(counts.indexes)));
     }
+    if counts.types > 0 {
+        parts.push(format!(
+            "{} type{} and sequence{}",
+            counts.types,
+            s(counts.types),
+            s(counts.types)
+        ));
+    }
     if counts.comments > 0 {
         parts.push(format!("{} comment{}", counts.comments, s(counts.comments)));
     }

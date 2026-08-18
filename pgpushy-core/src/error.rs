@@ -82,6 +82,9 @@ pub enum DiagnosticKind {
     CollidingUnnamedForeignKeys,
     /// An object assigned to a schema that `managed_schemas` omits (spec §4.4).
     SchemaNotManaged,
+    /// A reference across a schema boundary that is not a foreign key
+    /// (spec §12.6).
+    CrossSchemaReference,
     /// Managed schemas whose foreign keys form a cycle (spec §7, §12.1).
     CrossSchemaForeignKeyCycle,
 }
@@ -98,6 +101,7 @@ impl DiagnosticKind {
             Self::UnresolvedReference => "unresolved-reference",
             Self::CollidingUnnamedForeignKeys => "colliding-unnamed-foreign-keys",
             Self::SchemaNotManaged => "schema-not-managed",
+            Self::CrossSchemaReference => "cross-schema-reference",
             Self::CrossSchemaForeignKeyCycle => "cross-schema-foreign-key-cycle",
         }
     }
@@ -129,6 +133,17 @@ pub enum CoreError {
          this is a pgpushy bug — please report it with the statement that caused it"
     )]
     QualifiedLiteral { context: String, literal: String },
+    /// Types, domains or sequences that depend on each other in a circle.
+    ///
+    /// Postgres will not create one, so this means pgpushy derived a
+    /// dependency that is not real. Emitting them in some arbitrary order
+    /// would produce a document that cannot execute.
+    #[error(
+        "these types depend on each other in a circle: {}; \
+         this is a pgpushy bug — please report it with the statements involved",
+        names.join(", ")
+    )]
+    TypeCycle { names: Vec<String> },
 }
 
 /// Analysis either succeeds or yields every problem it found.

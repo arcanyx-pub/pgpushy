@@ -200,6 +200,33 @@ commands are in [Appendix A](#appendix-a-reproduction-harness).
   `tokio-postgres-rustls` 0.14 resolves against the current tree, and rustls is
   already there via `ureq`.
 
+**Verified while building category 2 (2026-08-18)**
+- **pgschema's `dump` is dependency-ordered, not fixed-order.** A composite
+  type over a domain dumps the domain first, even though the type/domain
+  category order would put the type first. Same conclusion spec §5.1 reaches:
+  sort category 2, do not hardcode an order among the kinds.
+- **A standalone sequence nothing defaults to is managed correctly.** Applied
+  with its parameters, and the re-plan is empty.
+- **A default calling `nextval` is applied as `SERIAL`.** `CREATE SEQUENCE
+  m9.ticket_no` plus `t int DEFAULT nextval('ticket_no')` applies "successfully"
+  and leaves `m9.people_t_seq` (deptype `a`) on the target — `ticket_no` is
+  never created, and the re-plan shows `sequences: 1 to add, 1 to drop` forever.
+  A **silent** non-convergence, which is why spec §4.3 rejects the shape.
+- **A domain default calling `nextval` fails outright**: `relation "ticket_no"
+  does not exist`, because pgschema applies domains before sequences. pgpushy's
+  own category-2 sort cannot help — it orders the document pgschema *reads*,
+  not the DDL pgschema *applies*.
+- **Measure by applying, not by seeding with `psql`.** The first measurement of
+  the sequence case used a hand-built target and concluded it worked. pgschema
+  reads that target correctly; it just never builds one like it. Only an
+  apply-then-replan measures what a user will hit.
+- **libpg_query does not mark every built-in with `pg_catalog`.** `int` arrives
+  as `pg_catalog.int4`, `text` arrives as plain `text`. So "not `pg_catalog`"
+  does not mean "user-defined", and treating it that way rewrites `text` into
+  `public.text`. Type references are resolved by matching what the source tree
+  defines, after every file is parsed — which is also the only point at which
+  the answer is knowable.
+
 **Release/distribution facts (for the provider, §7)**
 - Assets are **standalone per-platform binaries**: `pgschema-<ver>-{darwin,
   linux}-{amd64,arm64}` (~18 MB static Go), plus `.deb`/`.rpm`. **No Windows

@@ -103,6 +103,7 @@ impl Analysis {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Counts {
     pub files: usize,
+    pub types: usize,
     pub tables: usize,
     pub indexes: usize,
     pub foreign_keys: usize,
@@ -158,10 +159,14 @@ impl From<CoreError> for AnalysisError {
 ///
 /// Cross-schema cycles do **not** fail this call; see [`Analysis::cycles`].
 pub fn analyze(files: &[SourceFile], options: &Options) -> Result<Analysis, AnalysisError> {
-    let (objects, diagnostics) = parse::parse_files(files, &options.default_schema);
+    let (mut objects, diagnostics) = parse::parse_files(files, &options.default_schema);
     if !diagnostics.is_empty() {
         return Err(AnalysisError::Source(diagnostics));
     }
+
+    // Which type names refer to something the tree defines can only be
+    // answered once every file has been read (see `resolve::type_references`).
+    resolve::type_references(&mut objects, &options.default_schema);
 
     let managed = resolve::managed_schemas(&objects, options.managed_schemas.as_deref())
         .map_err(AnalysisError::Source)?;
@@ -188,6 +193,7 @@ pub fn analyze(files: &[SourceFile], options: &Options) -> Result<Analysis, Anal
         empty_schemas,
         counts: Counts {
             files: files.len(),
+            types: objects.types.len(),
             tables: objects.tables.len(),
             indexes: objects.indexes.len(),
             foreign_keys: objects.foreign_keys.len(),

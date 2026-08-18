@@ -249,8 +249,18 @@ same reason the allow-list exists at all:
   sequence does not survive a dump-and-reapply (verified against pgschema
   1.12.0 — the standalone sequence is dropped and an owned one created in its
   place). An owned sequence is spelled `serial` or `GENERATED … AS IDENTITY`.
-- A schema-qualifying name inside a **string literal** — `nextval('s')`,
-  `'x'::regclass` — MUST name its schema explicitly; a bare name MUST be
+- A **default calling `nextval`** — on a column or on a domain — MUST be
+  rejected. pgschema models any such default as `SERIAL`: verified against
+  pgschema 1.12.0, applying `CREATE SEQUENCE s` together with a column
+  defaulting to it creates a sequence *owned by that column* instead, never
+  creates `s`, reports success, and leaves every later plan showing the same
+  drop and add. A **domain** default calling `nextval` fails outright, because
+  pgschema applies domains before sequences. Neither is something pgpushy can
+  order around — the apply order is pgschema's. The remedy is `serial` or
+  `GENERATED … AS IDENTITY`; a sequence nothing defaults to is managed normally
+  (§12.8).
+- A schema-qualifying name inside a **string literal** — `'x'::regclass`,
+  `'x'::regtype` — MUST name its schema explicitly; a bare name MUST be
   rejected. pgpushy does not infer a schema inside a literal. §4.4's rule for
   identifiers cannot simply be reused, because the two would then disagree
   silently the moment cross-schema references are supported: `nextval('s')`
@@ -482,9 +492,9 @@ reuse a single document across runs. This is a correctness requirement, not an
 optimization.
 
 The reason is that pgschema strips a schema qualifier from an **identifier**
-but cannot strip one from inside a **string literal**. A sequence reference in
-a column default is a string literal, and `pg_dump` emits exactly that form.
-So a `nextval` reference to an object in schema `X` must be spelled:
+but cannot strip one from inside a **string literal**. So a name inside a
+literal — `'X.t'::regclass` — that refers to an object in schema `X` must be
+spelled:
 
 | In the document for… | as | because |
 |---|---|---|
@@ -493,12 +503,21 @@ So a `nextval` reference to an object in schema `X` must be spelled:
 
 The same reference therefore has two correct spellings, chosen by which
 document it appears in — so no single document can serve every run. Verified
-against pgschema 1.12.0: `CREATE SEQUENCE w1.invoice_no`
-plus `DEFAULT nextval('w1.invoice_no')` fails with `relation "w1.invoice_no"
-does not exist`, because the sequence was created in the scratch schema while
-the literal still names the real one; de-qualifying the literal to
-`nextval('invoice_no')` yields `No changes detected.` against a target built
-from the same definition.
+against pgschema 1.12.0: `CREATE SEQUENCE w1.invoice_no` plus
+`DEFAULT nextval('w1.invoice_no')` fails with `relation "w1.invoice_no" does
+not exist`, because the sequence was created in the scratch schema while the
+literal still names the real one; de-qualifying the literal yields `No changes
+detected.` against a target built from the same definition.
+
+> **Non-normative — how often this bites in 0.1.** Narrowly, and the rule is
+> here for what comes next rather than for what is here now. The clearest
+> example of a name in a literal is a `nextval` default, and §4.3 rejects those
+> outright for an unrelated pgschema limitation, so 0.1 reaches this rule only
+> through a `regclass` or `regtype` cast — legal, and uncommon. Views (§14) are
+> what make it routine: a view's body is full of names, it is resolved at
+> creation time, and there is no lifting it out the way a foreign key is
+> lifted. Building the per-schema document before views rather than during them
+> is deliberate.
 
 Accordingly, in the document for schema `S`, a schema-qualifying name inside a
 string literal MUST be emitted **without its qualifier when it names an object
@@ -1242,6 +1261,19 @@ found them. This is a deliberate non-feature rather than an oversight: the
 alternative available today is not "pgpushy manages grants" but "pgschema
 revokes every grant pgpushy cannot see."
 
+### 12.8 A sequence cannot be a default
+
+pgschema models any default calling `nextval` as `SERIAL`, so a sequence named
+in one is not a sequence it will manage: on a column it silently creates a
+different, column-owned sequence and never converges, and on a domain it fails
+to apply at all. §4.3 rejects both rather than letting either reach a database.
+
+A sequence nothing defaults to is managed normally — created with its
+parameters, and idempotent afterwards (verified). That covers a sequence drawn
+from by application code, which is the common reason to declare one; it does
+not cover using a shared sequence as a column default, for which `serial` or
+`GENERATED … AS IDENTITY` is the supported spelling.
+
 ## 13. Dependencies and Compatibility
 
 - **pgschema** — required at runtime, resolved through the provider (§8.5):
@@ -1483,6 +1515,17 @@ made after draft 2 of v0.1.
   choice open and costs imported trees nothing: `pg_dump` qualifies inside
   literals already (verified), and `serial`/`IDENTITY` produce no literal.
   (§4.3, §5.4)
+- **[0.4] A sequence may not be a default** — pgschema models any default
+  calling `nextval` as `SERIAL`. Verified against pgschema 1.12.0 by applying
+  and then re-planning: on a column it creates a sequence owned by that column,
+  never creates the one named, reports success, and leaves the plan showing the
+  same drop and add on every run afterwards; on a domain it fails to apply,
+  because pgschema orders domains before sequences. The apply order is
+  pgschema's, so pgpushy cannot order around either. Both are rejected. A
+  sequence nothing defaults to applies and converges normally, which is the
+  common reason to declare one. An earlier measurement missed this by building
+  the target with `psql` rather than letting pgschema apply it — the two
+  disagree, and only one of them is what a user will run. (§4.3, §12.8)
 - **[0.4] Object scope for 0.1** — adds user-defined types, domains and
   standalone sequences to tables, indexes, constraints, foreign keys and
   comments. `CREATE SEQUENCE … OWNED BY` is rejected: it inverts the category

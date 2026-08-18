@@ -17,6 +17,7 @@ pub fn check(objects: &Objects, managed: &[SchemaName]) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     duplicate_objects(objects, &mut diagnostics);
     unresolved_references(objects, managed, &mut diagnostics);
+    type_references(objects, &mut diagnostics);
     colliding_unnamed_foreign_keys(objects, &mut diagnostics);
     diagnostics
 }
@@ -43,6 +44,14 @@ fn duplicate_objects(objects: &Objects, diagnostics: &mut Vec<Diagnostic>) {
         seen.entry(format!("schema {}", schema.name))
             .or_default()
             .push(schema.origin.clone());
+    }
+    // Types, domains and sequences share one namespace with tables in
+    // Postgres, but pgpushy reports them by what the author wrote, which is
+    // the more useful half of the collision.
+    for kind in &objects.types {
+        seen.entry(format!("{} {}", kind.kind, kind.name))
+            .or_default()
+            .push(kind.origin.clone());
     }
     // Constraints share a namespace per table, so an explicitly named
     // constraint collides with another of the same name on the same table
@@ -175,5 +184,80 @@ fn colliding_unnamed_foreign_keys(objects: &Objects, diagnostics: &mut Vec<Diagn
                  constraint an explicit name",
             ),
         );
+    }
+}
+
+/// Column and base types that pgpushy cannot resolve, or that reach across a
+/// schema boundary (spec §4.5, §12.6).
+///
+/// Two problems with one walk, because both come from the same list of
+/// references and both would otherwise surface as a pgschema failure naming an
+/// object the author did not write.
+///
+/// A reference the source tree does not define is unresolvable: pgschema
+/// builds its model by executing the document, so a type that exists only in
+/// the target — an extension's, most often — is not there to be used.
+/// Supporting those means seeding an external plan database, which is future
+/// work (spec §14).
+///
+/// A reference that crosses a schema is rejected even when it does resolve. A
+/// foreign key is the only reference 0.1 lets cross, because FK-lift is what
+/// makes a foreign key not a creation-time dependency; anything else would
+/// drag a transitive closure of another schema's objects behind it (§12.6).
+fn type_references(objects: &Objects, diagnostics: &mut Vec<Diagnostic>) {
+    let defined: BTreeMap<&QualifiedName, &crate::model::TypeLike> = objects
+        .types
+        .iter()
+        .map(|kind| (&kind.name, kind))
+        .collect();
+
+    let referrers = objects
+        .tables
+        .iter()
+        .map(|table| (&table.name, "table", &table.depends_on, &table.origin))
+        .chain(
+            objects
+                .types
+                .iter()
+                .map(|kind| (&kind.name, "type", &kind.depends_on, &kind.origin)),
+        );
+
+    for (owner, what, references, origin) in referrers {
+        for referenced in references {
+            let Some(target) = defined.get(referenced) else {
+                diagnostics.push(
+                    Diagnostic::new(
+                        DiagnosticKind::UnresolvedReference,
+                        format!("{what} {owner} uses {referenced}, which the source tree does not define"),
+                        vec![origin.clone()],
+                    )
+                    .with_help(
+                        "pgschema builds the desired state from the synthesized document alone, \
+                         never from the target, so a type that exists only on the target cannot \
+                         be used. Types from extensions are not supported in this version \
+                         (spec §14).",
+                    ),
+                );
+                continue;
+            };
+            if referenced.schema == owner.schema {
+                continue;
+            }
+            diagnostics.push(
+                Diagnostic::new(
+                    DiagnosticKind::CrossSchemaReference,
+                    format!(
+                        "{what} {owner} uses the {} {referenced}, which is in another schema",
+                        target.kind
+                    ),
+                    vec![origin.clone(), target.origin.clone()],
+                )
+                .with_help(format!(
+                    "a foreign key is the only reference pgpushy 0.1 lets cross a schema \
+                     boundary (spec §12.6); define the {} in {}, or the {what} in {}",
+                    target.kind, owner.schema, referenced.schema
+                )),
+            );
+        }
     }
 }

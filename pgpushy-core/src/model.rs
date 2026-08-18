@@ -101,6 +101,11 @@ pub struct SchemaDecl {
 pub struct Table {
     pub name: QualifiedName,
     pub origin: Origin,
+    /// Category-2 objects this table's columns need before it is created.
+    ///
+    /// Carried so that a table pulled into another schema's document as a
+    /// closure member brings the types it is written in (spec §5.4).
+    pub depends_on: Vec<QualifiedName>,
     pub ast: CreateStmt,
 }
 
@@ -126,6 +131,47 @@ pub struct ForeignKey {
     pub columns: Vec<String>,
     pub origin: Origin,
     pub ast: Constraint,
+}
+
+/// What kind of category-2 object this is, for diagnostics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TypeKind {
+    Type,
+    Domain,
+    Sequence,
+}
+
+impl fmt::Display for TypeKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad(match self {
+            Self::Type => "type",
+            Self::Domain => "domain",
+            Self::Sequence => "sequence",
+        })
+    }
+}
+
+/// A user-defined type, a domain, or a standalone sequence — category 2.
+///
+/// The three share a category because they share a problem: unlike tables,
+/// they *can* depend on one another at creation time, and no fixed order among
+/// the kinds is correct. A domain may be defined over another domain, a
+/// composite type may have a domain-typed field, and a domain default may call
+/// `nextval`. So the category is sorted by [`Self::depends_on`] rather than by
+/// kind (spec §5.1).
+#[derive(Clone, Debug)]
+pub struct TypeLike {
+    pub name: QualifiedName,
+    pub kind: TypeKind,
+    pub origin: Origin,
+    /// Objects that must exist before this one is created.
+    ///
+    /// Only names the source tree defines. A reference to something outside it
+    /// — an extension's type, say — is not an ordering constraint pgpushy can
+    /// satisfy, and [`crate::validate`] reports it rather than ordering around
+    /// it.
+    pub depends_on: Vec<QualifiedName>,
+    pub ast: pg_query::NodeEnum,
 }
 
 /// An index. Depends on its table existing, hence category 4 (spec §5.1).
@@ -155,6 +201,7 @@ pub struct Comment {
 #[derive(Clone, Debug, Default)]
 pub struct Objects {
     pub schemas: Vec<SchemaDecl>,
+    pub types: Vec<TypeLike>,
     pub tables: Vec<Table>,
     pub indexes: Vec<Index>,
     pub foreign_keys: Vec<ForeignKey>,
@@ -178,6 +225,7 @@ impl Objects {
             .tables
             .iter()
             .map(|t| t.name.schema.clone())
+            .chain(self.types.iter().map(|t| t.name.schema.clone()))
             .chain(self.indexes.iter().map(|i| i.table.schema.clone()))
             .chain(self.foreign_keys.iter().map(|f| f.table.schema.clone()))
             .chain(self.comments.iter().map(|c| c.schema.clone()))
@@ -193,6 +241,7 @@ impl Objects {
             .iter()
             .map(|s| s.name.clone())
             .chain(self.tables.iter().map(|t| t.name.schema.clone()))
+            .chain(self.types.iter().map(|t| t.name.schema.clone()))
             .chain(self.indexes.iter().map(|i| i.table.schema.clone()))
             .chain(self.foreign_keys.iter().map(|f| f.table.schema.clone()))
             .chain(self.comments.iter().map(|c| c.schema.clone()))
