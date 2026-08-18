@@ -71,13 +71,6 @@ pub fn summary(settings: &Settings, analysis: &Analysis) {
     if counts.indexes > 0 {
         parts.push(format!("{} index{}", counts.indexes, es(counts.indexes)));
     }
-    if counts.constraints > 0 {
-        parts.push(format!(
-            "{} constraint{}",
-            counts.constraints,
-            s(counts.constraints)
-        ));
-    }
     if counts.comments > 0 {
         parts.push(format!("{} comment{}", counts.comments, s(counts.comments)));
     }
@@ -138,9 +131,22 @@ pub fn checks_passed(analysis: &Analysis) {
     }
 }
 
-pub fn wrote(path: &Path, contents: &str) {
-    let lines = contents.lines().count();
-    println!("\n  wrote {} ({lines} lines)", path.display());
+/// The documents `--out` just wrote (spec §8.7).
+pub fn wrote(dir: &Path, written: &[std::path::PathBuf]) {
+    println!(
+        "\n  wrote {} into {}",
+        plural(written.len(), "document"),
+        dir.display()
+    );
+    for path in written {
+        if let Some(name) = path.file_name() {
+            println!("    {}", name.to_string_lossy());
+        }
+    }
+}
+
+fn plural(n: usize, word: &str) -> String {
+    format!("{n} {word}{}", s(n))
 }
 
 /// Print every diagnostic, to stderr.
@@ -162,13 +168,8 @@ pub fn diagnostics(diagnostics: &[Diagnostic]) {
 }
 
 /// Whether any object was assigned to this schema.
-///
-/// [`Analysis`] reports counts rather than objects, so this is answered from
-/// the synthesized document: a schema with objects appears qualifying at least
-/// one of them, while a schema with none appears only in its own
-/// `CREATE SCHEMA`.
 fn mentions(analysis: &Analysis, schema: &pgpushy_core::SchemaName) -> bool {
-    analysis.desired_state.contains(&format!("{schema}."))
+    !analysis.empty_schemas.contains(schema)
 }
 
 fn s(n: usize) -> &'static str {
@@ -428,8 +429,8 @@ pub fn configuration(loaded: &Loaded) {
 
 /// Spec §10: a password read from a file that is easily committed.
 ///
-/// Fires on *use*, not presence — a file password that PGPASSWORD or
-/// --password overrode is not a risk worth interrupting anyone about. Made
+/// Fires on *use*, not presence — a file password that PGPASSWORD overrode
+/// is not a risk worth interrupting anyone about. Made
 /// deliberately hard to skim past, because the whole point is that the
 /// operator may not know the file has one.
 pub fn password_from_file(connection: &Resolved, loaded: &Loaded) {
@@ -441,7 +442,7 @@ pub fn password_from_file(connection: &Resolved, loaded: &Loaded) {
     eprintln!();
     eprintln!("  \u{26a0} PASSWORD READ FROM {path}");
     eprintln!("    That file is easily committed to version control. Prefer PGPASSWORD");
-    eprintln!("    in the environment, or --password, and remove it from the file.");
+    eprintln!("    in the environment, and remove it from the file.");
 }
 
 /// About to fetch pgschema (spec §8.5).

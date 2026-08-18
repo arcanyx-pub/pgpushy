@@ -2,9 +2,10 @@
 //!
 //! This crate is the pure half of pgpushy: it takes the *contents* of a source
 //! tree — path and text, already read from disk by the caller — and produces
-//! the single desired-state document that pgschema consumes, plus the order in
-//! which schemas must be reconciled. It performs no IO, opens no connections,
-//! and is deterministic: the same input always yields byte-identical output.
+//! the desired-state documents pgschema consumes, one per managed schema, plus
+//! the order in which those schemas must be reconciled. It performs no IO,
+//! opens no connections, and is deterministic: the same input always yields
+//! byte-identical output.
 //!
 //! [`analyze`] runs the whole offline pipeline, which is spec §3 stages 1–6
 //! minus discovery:
@@ -27,6 +28,7 @@
 
 pub mod error;
 pub mod graph;
+pub mod literal;
 pub mod model;
 pub mod parse;
 pub mod resolve;
@@ -37,7 +39,7 @@ pub use error::{CoreError, Diagnostic, DiagnosticKind};
 pub use graph::{Cycle, CycleEdge};
 pub use model::{Origin, QualifiedName, SchemaName};
 pub use parse::SourceFile;
-pub use synth::GENERATED_MARKER;
+pub use synth::{Documents, GENERATED_MARKER};
 
 /// How to interpret a source tree.
 #[derive(Clone, Debug)]
@@ -75,8 +77,16 @@ pub struct Analysis {
     /// `plan` shows the plans anyway, since those plans are what the operator
     /// needs in order to break the cycle (spec §7).
     pub cycles: Vec<Cycle>,
-    /// The synthesized desired state (spec §5).
-    pub desired_state: String,
+    /// The synthesized desired state: one document per managed schema,
+    /// keyed by the schema it targets (spec §5.4).
+    pub documents: synth::Documents,
+    /// Managed schemas the source tree assigns no object to.
+    ///
+    /// Each reconciles to an empty desired state, which plans a drop of
+    /// everything the target holds there. That is deliberate — it is the only
+    /// way to express a managed-and-empty schema (spec §4.4) — and it is
+    /// destructive, so callers must say so before applying.
+    pub empty_schemas: Vec<SchemaName>,
     /// What the tree contained, for reporting.
     pub counts: Counts,
 }
@@ -95,7 +105,6 @@ pub struct Counts {
     pub files: usize,
     pub tables: usize,
     pub indexes: usize,
-    pub constraints: usize,
     pub foreign_keys: usize,
     pub comments: usize,
 }
@@ -163,18 +172,24 @@ pub fn analyze(files: &[SourceFile], options: &Options) -> Result<Analysis, Anal
     }
 
     let order = graph::order_schemas(&objects, &managed);
-    let desired_state = synth::synthesize(&objects, &managed)?;
+    let documents = synth::synthesize(&objects, &managed)?;
+    let with_objects = objects.schemas_with_objects();
+    let empty_schemas = managed
+        .iter()
+        .filter(|schema| !with_objects.contains(schema))
+        .cloned()
+        .collect();
 
     Ok(Analysis {
         managed_schemas: managed,
         order: order.order,
         cycles: order.cycles,
-        desired_state,
+        documents,
+        empty_schemas,
         counts: Counts {
             files: files.len(),
             tables: objects.tables.len(),
             indexes: objects.indexes.len(),
-            constraints: objects.constraints.len(),
             foreign_keys: objects.foreign_keys.len(),
             comments: objects.comments.len(),
         },

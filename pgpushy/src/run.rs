@@ -14,11 +14,11 @@ use crate::output::Output;
 use crate::plan_file::Plan;
 use crate::provider::{self, PgschemaBin};
 use crate::report;
-use crate::{discovery, hazard, pgschema, tempfile_for};
+use crate::{discovery, hazard, outdir, pgschema};
 use anyhow::{Context, Result, bail};
 use pgpushy_core::{Analysis, AnalysisError, Options, SchemaName, analyze};
 use std::path::{Path, PathBuf};
-use tempfile::{NamedTempFile, TempDir};
+use tempfile::TempDir;
 
 /// What a command decided the process should exit with.
 ///
@@ -188,9 +188,9 @@ struct Session {
     connection: Resolved,
     inspection: Inspection,
     output: Output,
-    /// The synthesized desired state. Held for the whole session because every
-    /// per-schema run is handed the same document (spec §5.4).
-    document: NamedTempFile,
+    /// The synthesized documents, one per managed schema (spec §5.4). Held
+    /// for the whole session; each per-schema run is handed its own.
+    document_dir: TempDir,
     /// Where pgschema writes the JSON plans.
     plan_dir: TempDir,
 }
@@ -244,9 +244,13 @@ impl Session {
             return Ok(Opened::Stop(Outcome::Failed));
         }
 
-        let document = tempfile_for(&analysis.desired_state)?;
+        let document_dir = tempfile::Builder::new()
+            .prefix("pgpushy-desired-")
+            .tempdir()
+            .context("creating a temporary directory for the synthesized documents")?;
+        write_documents(document_dir.path(), &analysis)?;
         if output.verbose {
-            report::desired_state_at(document.path());
+            report::desired_state_at(document_dir.path());
         }
         if let Some(path) = out {
             write_desired_state(path, &analysis)?;
@@ -267,7 +271,7 @@ impl Session {
             connection,
             inspection,
             output,
-            document,
+            document_dir,
             plan_dir,
         })))
     }
@@ -278,6 +282,14 @@ impl Session {
     /// Postgres identifier and may contain path separators.
     fn plan_path(&self, index: usize) -> PathBuf {
         self.plan_dir.path().join(format!("plan-{index}.json"))
+    }
+
+    /// The document for the schema at `index` in apply order, indexed for the
+    /// same reason as the plans above.
+    fn document_path(&self, index: usize) -> PathBuf {
+        self.document_dir
+            .path()
+            .join(format!("desired-{index}.sql"))
     }
 
     /// Plan every managed schema, in apply order, keeping each plan.
@@ -296,7 +308,7 @@ impl Session {
                 &self.binary,
                 &self.connection,
                 schema,
-                self.document.path(),
+                &self.document_path(index),
                 &json,
                 self.plan_dir.path(),
                 self.output,
@@ -427,9 +439,25 @@ fn canonical_root(root: &Path) -> Result<PathBuf> {
     Ok(canonical)
 }
 
+/// Write each schema's document where its pgschema run will read it.
+///
+/// Named by position in apply order rather than by schema, since a schema name
+/// is a Postgres identifier and may contain path separators.
+fn write_documents(dir: &Path, analysis: &Analysis) -> Result<()> {
+    for (index, schema) in analysis.order.iter().enumerate() {
+        let document = analysis
+            .documents
+            .get(schema)
+            .expect("every schema in the apply order has a document");
+        let path = dir.join(format!("desired-{index}.sql"));
+        std::fs::write(&path, document).with_context(|| format!("writing {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Write the documents where the operator asked to see them (spec §8.7).
 fn write_desired_state(path: &Path, analysis: &Analysis) -> Result<()> {
-    std::fs::write(path, &analysis.desired_state)
-        .with_context(|| format!("writing {}", path.display()))?;
-    report::wrote(path, &analysis.desired_state);
+    let written = outdir::write(path, &analysis.documents)?;
+    report::wrote(path, &written);
     Ok(())
 }

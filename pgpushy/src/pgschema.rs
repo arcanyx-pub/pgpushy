@@ -81,7 +81,9 @@ fn base(
 ) -> Command {
     let mut command = Command::new(&binary.path);
     // Never the operator's directory: see the module docs. Every path pgpushy
-    // passes is absolute, so this changes nothing else.
+    // passes as an argument is absolute, and the certificate-path variables
+    // are absolutised before the child inherits them (`conn.rs`), so this
+    // changes nothing else.
     command.current_dir(working_dir);
     command.arg(subcommand);
     command.args(["--schema", schema.as_str()]);

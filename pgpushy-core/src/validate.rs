@@ -55,13 +55,6 @@ fn duplicate_objects(objects: &Objects, diagnostics: &mut Vec<Diagnostic>) {
                 .push(fk.origin.clone());
         }
     }
-    for constraint in &objects.constraints {
-        if let Some(name) = &constraint.name {
-            seen.entry(format!("constraint {name} on {}", constraint.table))
-                .or_default()
-                .push(constraint.origin.clone());
-        }
-    }
 
     for (what, mut origins) in seen {
         if origins.len() < 2 {

@@ -70,6 +70,9 @@ pub enum DiagnosticKind {
     /// A `CREATE SCHEMA` in the nested-element or `AUTHORIZATION`-only form
     /// (spec §4.3).
     UnsupportedSchemaForm,
+    /// An object name inside a string literal that does not name its schema
+    /// (spec §4.3).
+    UnqualifiedNameLiteral,
     /// The same object defined more than once (spec §4.5).
     DuplicateObject,
     /// A foreign key referencing a table the source tree never defines
@@ -90,6 +93,7 @@ impl DiagnosticKind {
             Self::ParseFailure => "parse-failure",
             Self::UnsupportedStatement => "unsupported-statement",
             Self::UnsupportedSchemaForm => "unsupported-schema-form",
+            Self::UnqualifiedNameLiteral => "unqualified-name-literal",
             Self::DuplicateObject => "duplicate-object",
             Self::UnresolvedReference => "unresolved-reference",
             Self::CollidingUnnamedForeignKeys => "colliding-unnamed-foreign-keys",
@@ -112,6 +116,19 @@ pub enum CoreError {
         #[source]
         source: Box<pg_query::Error>,
     },
+    /// A name literal kept its schema in the document for that very schema.
+    ///
+    /// Spec §5.4 requires it to be de-qualified there, because the schema's
+    /// objects live in a scratch schema by the time pgschema executes the
+    /// document. Reaching every literal means walking every node kind an
+    /// expression can hold, and this is what the walk missing one looks like:
+    /// a pgpushy bug, reported here rather than emitted for pgschema to fail
+    /// on with a relation name the author never wrote.
+    #[error(
+        "the name '{literal}' in {context} kept its schema in that schema's own document; \
+         this is a pgpushy bug — please report it with the statement that caused it"
+    )]
+    QualifiedLiteral { context: String, literal: String },
 }
 
 /// Analysis either succeeds or yields every problem it found.

@@ -1,8 +1,8 @@
 # pgpushy Specification
 
-**Version:** 0.3
-**Date:** 2026-07-29
-**Status:** Draft — all 0.x design decisions resolved (§15)
+**Version:** 0.4
+**Date:** 2026-08-18
+**Status:** Draft — all 0.1 design decisions resolved (§15)
 
 This document specifies **pgpushy**, a declarative Postgres schema-management
 tool that manages an entire database — all of its schemas — from a directory
@@ -79,12 +79,16 @@ tested against (§13).
   managed schemas is derived from the source tree, or declared (§4.4).
 - **Default schema** — the schema to which an unqualified object belongs.
   Defaults to `public`; configurable (§10.1).
-- **Desired state** — the single synthesized SQL document pgpushy produces
-  from the source tree and passes to pgschema as `--file` (§5).
+- **Desired state** — the synthesized SQL documents pgpushy produces from the
+  source tree: one per managed schema, each passed as `--file` to that
+  schema's pgschema run (§5).
 - **FK-lift** — the transform that moves foreign-key constraints out of table
   definitions into trailing `ALTER TABLE … ADD CONSTRAINT` statements (§5.3).
 - **Cross-schema foreign key** — a foreign key whose referencing table and
   referenced table are assigned to different schemas.
+- **Closure member** — an object from another schema that appears in a
+  schema's document only so that references into it resolve. It is never
+  diffed, only executed (§5.4).
 - **Target database** — the Postgres database being reconciled.
 
 ## 3. Overview
@@ -99,21 +103,24 @@ referenced section.
 3. Resolve       assign schemas; derive or verify the managed set       (§4.4)
 4. Check         duplicate objects; unresolvable foreign-key referents  (§4.5)
 5. Order         cross-schema FK graph; topological order; cycles       (§7)
-6. Synthesize    FK-lift + qualify + category emission → desired state  (§5)
+6. Synthesize    FK-lift + qualify + category emission → one document   (§5)
+                 per managed schema
 
    online — requires the target database
 7. Inspect       one read-only target query (§6)
-8. Delegate      pgschema plan|apply --schema S --file <desired state>, (§8)
+8. Delegate      pgschema plan|apply --schema S --file <S's document>,  (§8)
                  once per managed schema, in the order from stage 5
 ```
 
 `pgpushy validate` (§8.2) runs stages 1–6 and stops; it never connects to
 anything. `plan` and `apply` run the whole pipeline.
 
-The desired state synthesized in stage 6 is **the same document for every
-schema**; the per-schema loop in stage 8 varies only the `--schema` argument.
-pgschema builds the full multi-schema desired state internally but diffs only
-the named schema, so one synthesized document serves all schemas.
+Stage 6 produces **one document per managed schema**, not one document reused
+for every schema. Each document holds that schema's objects plus the closure
+of what they reference elsewhere (§5.4). The two are not interchangeable: a
+schema reference inside a *string literal* must be spelled differently
+depending on which schema's run reads it, so no single document can be correct
+for all of them (§5.4).
 
 ## 4. Source Tree
 
@@ -125,8 +132,10 @@ semantic meaning; it is organizational only (G1). pgpushy MUST NOT require any
 manifest, index, or include file.
 
 Hidden files and directories (names beginning with `.`) MUST be ignored.
-Symbolic links to directories MUST NOT be followed, so that discovery
-terminates and cannot escape the source tree.
+Symbolic links to **directories** MUST NOT be followed, so that discovery
+terminates and cannot escape the source tree. Symbolic links to **files** MUST
+be followed: they introduce neither risk, and a `.sql` file silently missing
+from the desired state is a file scheduled for deletion.
 
 Discovery MUST yield a deterministic order: files are sorted by their
 source-root-relative path, compared as byte sequences, without locale
@@ -141,6 +150,14 @@ files, and SHOULD report the count matched by each pattern, so that an
 over-broad pattern silently swallowing real tables is visible rather than
 mysterious.
 
+**Generated documents.** pgpushy MUST begin every document it writes with a
+generated-file marker, and MUST skip any discovered file that begins with it,
+reporting the count. Writing the synthesized documents into the source root
+with `--out` (§8.7) is a natural thing to do, and without this every later run
+would report every object in them as a duplicate of itself — a failure that
+outlives the run that caused it and gives no hint where the extra files came
+from.
+
 An empty source tree is not an error; it describes an empty database.
 
 ### 4.2 Parsing
@@ -152,34 +169,55 @@ failures MUST abort the run, naming the file and the location.
 
 ### 4.3 Statement allow-list
 
-pgpushy 0.x manages tables and foreign keys. A source file MUST contain only
-the following statements:
+pgpushy 0.1 manages tables, indexes, foreign keys, user-defined types,
+domains and standalone sequences. A source file MUST contain only the
+following statements:
 
 | Statement | Category (§5.1) |
 |---|---|
 | `CREATE SCHEMA [IF NOT EXISTS] <name>` | 1 |
-| `CREATE TABLE` (with inline constraints) | 2, FKs lifted to 4 |
-| `CREATE [UNIQUE] INDEX` | 3 |
-| `ALTER TABLE … ADD CONSTRAINT` — foreign key | 4 |
-| `ALTER TABLE … ADD CONSTRAINT` — `CHECK`, `UNIQUE`, `PRIMARY KEY`, `EXCLUDE` | 3 |
-| `COMMENT ON` an object of the kinds above | 5 |
+| `CREATE TYPE` | 2 |
+| `CREATE DOMAIN` | 2 |
+| `CREATE SEQUENCE` (standalone) | 2 |
+| `CREATE TABLE` (with inline constraints) | 3, FKs lifted to 5 |
+| `CREATE [UNIQUE] INDEX` | 4 |
+| `ALTER TABLE … ADD CONSTRAINT` — foreign key | 5 |
+| `COMMENT ON` an object of the kinds above | 6 |
 
 Any other statement MUST be a hard error naming the file, the line, and the
 statement kind, and directing the reader to §14 for the object kinds under
 consideration for later versions. This includes, non-exhaustively: `CREATE
-VIEW`, `CREATE FUNCTION`, `CREATE TRIGGER`, `CREATE TYPE`, `CREATE DOMAIN`,
-`CREATE POLICY`, `CREATE EXTENSION`, `GRANT`/`REVOKE`, every `ALTER TABLE`
-subcommand other than `ADD CONSTRAINT`, every `DROP`, and all DML.
+VIEW`, `CREATE FUNCTION`, `CREATE TRIGGER`, `CREATE POLICY`, `CREATE
+EXTENSION`, `GRANT`/`REVOKE`, every `DROP`, and all DML.
 
-Two properties motivate rejection rather than pass-through:
+**`ALTER` is not a declarative statement, with one exception.** A source file
+says what exists, not what steps reach it, so every `ALTER` form MUST be
+rejected — including `ALTER TABLE … ADD CONSTRAINT` for a `CHECK`, `UNIQUE`,
+`PRIMARY KEY` or `EXCLUDE` constraint, which MUST instead be written inline in
+its `CREATE TABLE`. Verified against Postgres 18: an inline table constraint
+can carry an explicit name, so nothing is lost but the spelling.
+
+The exception is `ALTER TABLE … ADD CONSTRAINT` for a **foreign key**, which
+is accepted because it is pgpushy's own canonical output form — §5.3 lifts
+every foreign key into exactly that shape — and because it is what `pg_dump`
+emits, so a source tree derived from one needs no rewriting there. Accepting
+it costs nothing: foreign keys are category 5, so they cannot reintroduce a
+creation-time dependency into any earlier category.
+
+Rejecting the non-foreign-key forms also removes the only way a category-4
+object could depend on another (§5.1). `ALTER TABLE … ADD CONSTRAINT …
+UNIQUE USING INDEX i` requires `i` to exist first; with it gone, category 4 is
+`CREATE INDEX` alone, and no two indexes can depend on each other.
+
+Two further properties motivate rejection rather than pass-through:
 
 - **Qualification cannot be honored.** §5.4 makes schema-qualifying every
-  emitted identifier normative, because an unqualified identifier in the
-  combined document is misattributed to every schema the document is run
-  against. pgpushy can qualify identifiers in statements it models
-  structurally. It cannot qualify the interior of a statement it does not
-  model — a table reference inside a view body, say — so passing such a
-  statement through would emit exactly the construct §5.4 forbids.
+  emitted identifier normative, because an unqualified identifier is
+  misattributed to whichever schema's run reads it. pgpushy can qualify
+  identifiers in statements it models structurally. It cannot qualify the
+  interior of a statement it does not model — a table reference inside a view
+  body, say — so passing such a statement through would emit exactly the
+  construct §5.4 forbids.
 - **The desired state must describe schema, not data or actions.** pgschema
   *executes* the document to build its comparison model. A `DROP` or an
   `INSERT` riding along would run inside that model and silently distort the
@@ -193,14 +231,34 @@ showing the accepted form. `AUTHORIZATION` on a *named* schema MUST likewise be
 rejected: pgpushy does not manage ownership, and silently discarding the clause
 would make the synthesized state say something the author did not write (G4).
 
-Three further restrictions apply within the allowed statements, each for the
+Five further restrictions apply within the allowed statements, each for the
 same reason the allow-list exists at all:
 
-- `CREATE TABLE … INHERITS`, `… PARTITION OF`, `… PARTITION BY`, and
-  `CREATE TABLE … OF <type>` MUST be rejected. Each makes a table's *creation*
-  depend on another object, and FK-lift resolves table-to-table foreign-key
-  ordering only — this is exactly the class of dependency §12.5 keeps out of
-  0.x.
+- `CREATE TABLE … INHERITS`, `… PARTITION OF`, `… PARTITION BY`,
+  `CREATE TABLE … OF <type>`, and `CREATE TABLE … (LIKE <table>)` MUST be
+  rejected. Each makes a table's *creation* depend on another table, and
+  FK-lift resolves table-to-table foreign-key ordering only — this is exactly
+  the class of dependency §12.5 keeps out of 0.1. `LIKE` is the easiest of the
+  five to miss, because it hides inside the column list rather than in a
+  clause of its own, and category 3 is emitted in name order: a `LIKE` that
+  sorts before the table it copies produces a document that cannot execute.
+- `CREATE SEQUENCE … OWNED BY` MUST be rejected. It makes a sequence's
+  creation depend on a table, inverting category 2 and category 3, and it is
+  not a shape pgschema round-trips: pgschema models a column-owned sequence as
+  `SERIAL` rather than as an object of its own, so an explicitly-owned
+  sequence does not survive a dump-and-reapply (verified against pgschema
+  1.12.0 — the standalone sequence is dropped and an owned one created in its
+  place). An owned sequence is spelled `serial` or `GENERATED … AS IDENTITY`.
+- A schema-qualifying name inside a **string literal** — `nextval('s')`,
+  `'x'::regclass` — MUST name its schema explicitly; a bare name MUST be
+  rejected. pgpushy does not infer a schema inside a literal. §4.4's rule for
+  identifiers cannot simply be reused, because the two would then disagree
+  silently the moment cross-schema references are supported: `nextval('s')`
+  inside a table in `billing` legally means `public.s` under one reading and
+  `billing.s` under the other, with no error either way. Requiring the schema
+  keeps that choice open, and costs imported trees nothing — `pg_dump`
+  qualifies inside literals already (verified), and `serial` and `IDENTITY`
+  produce no literal at all.
 - `CREATE INDEX CONCURRENTLY` MUST be rejected. It cannot run inside a
   transaction block, and it describes a strategy for reaching a state rather
   than the state itself; how an index is built is pgschema's decision.
@@ -266,12 +324,32 @@ with a diagnostic naming the offending source locations (G5):
   error naming the constraint, the referencing table, and the unresolved
   referent. This is the diagnostic for a foreign key into a schema pgpushy
   does not manage — an extension schema, an externally-owned `auth` — which is
-  future work (§14), not a supported 0.x configuration.
+  future work (§14), not a supported 0.1 configuration.
+- **Cross-schema references other than foreign keys.** A foreign key is the
+  only reference pgpushy 0.1 permits to cross a schema boundary. A column
+  typed by a domain or type in another schema, and a default calling
+  `nextval` on a sequence in another schema, MUST be errors naming the
+  referring object, the referenced object, and both schemas.
+
+  The restriction is what keeps the closure of §5.4 shallow and its rule
+  uniform: a foreign key is not a creation-time dependency — FK-lift is what
+  bought that — so it is the one reference kind that can cross a schema
+  without dragging a transitive closure of another schema's objects behind
+  it. Widening this is future work (§14) and is additive; the closure is
+  specified over reference edges generally, not over foreign keys
+  specifically.
+- **Colliding unnamed foreign keys.** Two foreign keys on the same table over
+  the identical column set, both left unnamed by the author, MUST be an error
+  naming both. They compete for one generated name whose numeric suffix
+  follows creation order, which pgpushy's emission order need not match; §12.4
+  gives the full reasoning.
 
 ## 5. Desired-State Synthesis
 
-pgpushy transforms the discovered objects into a single desired-state
-document. This section defines that document.
+pgpushy transforms the discovered objects into one desired-state document per
+managed schema. This section defines those documents. §5.1 through §5.3 and
+§5.5 describe how any one document is built; §5.4 defines which objects go
+into which document, and how their names are spelled there.
 
 ### 5.1 Statement categories
 
@@ -280,35 +358,52 @@ category *n* is emitted before every statement in category *n+1*.
 
 | Order | Category | Contents |
 |-------|----------|----------|
-| 1 | Schemas | `CREATE SCHEMA IF NOT EXISTS` for every managed schema (§5.2) |
-| 2 | Tables | `CREATE TABLE`, carrying their inline column, `CHECK`, `UNIQUE`, and `PRIMARY KEY` constraints — but not their foreign keys (§5.3) |
-| 3 | Table-dependent objects | `CREATE INDEX`; standalone non-foreign-key `ALTER TABLE … ADD CONSTRAINT` |
-| 4 | Foreign keys | every foreign key as a trailing `ALTER TABLE … ADD CONSTRAINT` (§5.3) |
-| 5 | Comments | `COMMENT ON` any object above |
+| 1 | Schemas | `CREATE SCHEMA IF NOT EXISTS` for every schema the document names (§5.2) |
+| 2 | Types, domains and sequences | `CREATE TYPE`, `CREATE DOMAIN`, `CREATE SEQUENCE`, topologically sorted among themselves |
+| 3 | Tables | `CREATE TABLE`, carrying their inline column, `CHECK`, `UNIQUE`, and `PRIMARY KEY` constraints — but not their foreign keys (§5.3) |
+| 4 | Indexes | `CREATE INDEX` |
+| 5 | Foreign keys | every foreign key as a trailing `ALTER TABLE … ADD CONSTRAINT` (§5.3) |
+| 6 | Comments | `COMMENT ON` any object above |
 
 Within a category, pgpushy MAY emit statements in any order that is valid for
 that category; a stable, deterministic order (§11.3) is REQUIRED.
 
 The categories exist because emission order is execution order: pgschema
 executes this document, so a statement that references an object must follow
-the statement creating it. Category 2 is internally order-free — once foreign
-keys are lifted to category 4, table definitions have no creation-time
-dependencies on one another. Categories 3, 4, and 5 are not internally
-order-free with respect to category 2, which is precisely why they are
-separate categories rather than intermixed with it: an index, a constraint, or
-a comment depends on its table existing. No category-3 object depends on
-another category-3 object, and comments are emitted last so that they may
-reference any object in the document.
+the statement creating it.
+
+Categories 1, 3, 4 and 6 are internally order-free, each for a reason:
+
+- **Category 3** — once foreign keys are lifted to category 5, no table
+  definition depends on another. This is what FK-lift buys, and §4.3's
+  rejection of `INHERITS`, `PARTITION OF`, `OF <type>` and `LIKE` is what
+  keeps it true, since each of those is a table-to-table creation dependency
+  FK-lift does not resolve.
+- **Category 4** — an index depends only on its own table. §4.3's rejection of
+  standalone `ADD CONSTRAINT` removes the one form that could depend on
+  another category-4 object, `… ADD CONSTRAINT … UNIQUE USING INDEX`.
+- **Category 6** — comments are emitted last, so they may reference anything.
+
+**Category 2 is the exception, and is sorted.** A domain can be defined over
+another domain, a composite type can have a domain-typed field, and a domain
+default can call `nextval` on a sequence — so no fixed order among the three
+kinds is correct in general, and pgschema's own `dump` order (types, then
+domains, then sequences) is a convention rather than a guarantee. pgpushy
+therefore orders category 2 topologically by creation-time dependency, with
+ties broken by `(schema, name)` for determinism (§11.3). A cycle is impossible
+here — Postgres will not create one — but if the sort encounters one, it MUST
+be reported rather than emitted in an arbitrary order.
 
 ### 5.2 Schema declarations
 
-pgpushy MUST emit `CREATE SCHEMA IF NOT EXISTS <s>` for every managed schema
-at the top of the desired state, before any object that references it.
-pgschema executes the desired state in its **plan database** to build its
-comparison model, and a schema-qualified object requires its schema to exist
-in that model; emitting the declarations makes qualified objects in any schema
-resolvable. These declarations run only in the plan database — never against
-the target, which must already contain the schemas (§6.1).
+pgpushy MUST emit `CREATE SCHEMA IF NOT EXISTS <s>` at the top of each
+document for every schema that document names — its own target schema, and the
+schema of every closure member in it (§5.4) — before any object that
+references it. pgschema executes the desired state in its **plan database** to
+build its comparison model, and a schema-qualified object requires its schema
+to exist in that model; emitting the declarations makes qualified objects in
+any schema resolvable. These declarations run only in the plan database —
+never against the target, which must already contain the schemas (§6.1).
 
 `CREATE SCHEMA` statements authored in the source tree are honored and MUST
 NOT be treated as errors. pgpushy MAY normalize them to the `IF NOT EXISTS`
@@ -319,7 +414,7 @@ form.
 For every foreign-key constraint in the source tree — whether written inline
 in a `CREATE TABLE` or as a standalone `ALTER TABLE … ADD CONSTRAINT` —
 pgpushy MUST emit the constraint as a trailing `ALTER TABLE … ADD CONSTRAINT`
-statement in category 4, and MUST NOT emit it inline in category 2.
+statement in category 5, and MUST NOT emit it inline in category 3.
 
 This mirrors how `pg_dump` separates foreign keys from table creation, and it
 is what makes authoring order-free (G1): with all referenced tables created
@@ -359,57 +454,131 @@ that is observable; see §12.4.
 
 ### 5.4 Object identity and qualification
 
-Objects from more than one managed schema coexist in the file handed to each
-per-schema pgschema run. pgschema attributes an **unqualified** object to
+Objects from more than one managed schema coexist in a single document,
+because a document carries closure members from other schemas alongside the
+schema's own objects (below). pgschema attributes an **unqualified** object to
 whatever `--schema` the run targets — unqualified objects land in a scratch
-schema that stands in for `--schema`. Because pgpushy runs the same file once
-per schema, an unqualified object is thereby claimed by *every* schema in turn.
+schema that stands in for `--schema`. An unqualified closure member would
+therefore be silently claimed by the schema being reconciled.
 
-Verified: a combined file with `customers` unqualified (intended for `public`)
+Verified: a file with `customers` unqualified (intended for `public`)
 and `snowdrop.machine_ids` qualified, run with `--schema snowdrop`, plans
 **both** `customers` and `machine_ids` into `snowdrop` — a misattribution.
 Qualifying it as `public.customers` makes `--schema snowdrop` plan only
 `machine_ids`, and `--schema public` plan only `customers`.
 
 pgpushy MUST therefore **schema-qualify every emitted identifier with its
-resolved schema, including the default schema** — `public.customers`, never
-bare `customers` — and likewise qualify the referents of foreign keys and the
-targets of indexes, constraints, and comments. Objects whose schema a given run
-does not target serve only to resolve references and are otherwise ignored by
-that run.
+resolved schema, including the target schema's own objects and the default
+schema** — `public.customers`, never bare `customers` — and likewise qualify
+the referents of foreign keys and the targets of indexes and comments.
+Qualifying an object with the schema the run targets is safe precisely because
+pgschema strips that prefix; qualifying everything is therefore one rule
+rather than two.
+
+#### One document per managed schema
+
+pgpushy MUST synthesize **one document per managed schema**, and MUST NOT
+reuse a single document across runs. This is a correctness requirement, not an
+optimization.
+
+The reason is that pgschema strips a schema qualifier from an **identifier**
+but cannot strip one from inside a **string literal**. A sequence reference in
+a column default is a string literal, and `pg_dump` emits exactly that form.
+So a `nextval` reference to an object in schema `X` must be spelled:
+
+| In the document for… | as | because |
+|---|---|---|
+| `X` itself | **unqualified** | pgschema moved `X`'s objects into the scratch schema, and the real `X` does not hold them |
+| any other schema | **qualified** | `X`'s objects were left in `X`, exactly as written |
+
+The same reference therefore has two correct spellings, chosen by which
+document it appears in — so no single document can serve every run. Verified
+against pgschema 1.12.0: `CREATE SEQUENCE w1.invoice_no`
+plus `DEFAULT nextval('w1.invoice_no')` fails with `relation "w1.invoice_no"
+does not exist`, because the sequence was created in the scratch schema while
+the literal still names the real one; de-qualifying the literal to
+`nextval('invoice_no')` yields `No changes detected.` against a target built
+from the same definition.
+
+Accordingly, in the document for schema `S`, a schema-qualifying name inside a
+string literal MUST be emitted **without its qualifier when it names an object
+in `S`**, and **with its qualifier otherwise**. This is transformation 4 of
+§5.5.
+
+#### What each document contains
+
+The document for schema `S` MUST contain every object assigned to `S`, and the
+**closure** of what those objects reference, and nothing else.
 
 pgschema builds its desired-state model by executing the file it is given,
 resolving every reference from that file alone and **not** from the target
-database. Verified: a cross-schema foreign key to a table absent from the
-file fails (`relation … does not exist`) even when that table exists on the
-target. Therefore the file passed to a given `pgschema --schema S` run MUST
-contain every table referenced by a foreign key in `S`, including tables in
-other schemas — the transitive closure of cross-schema foreign-key
-references. §4.5 rejects a source tree that cannot satisfy this.
+database. Verified: a cross-schema foreign key to a table absent from the file
+fails (`relation … does not exist`) even when that table exists on the target.
+The closure is what makes every such reference resolvable.
 
-Whether pgpushy synthesizes **one combined document** reused for every schema,
-or a **per-schema document** trimmed to that closure, is an implementation
-detail that does not affect observable behavior or this spec. A single
-combined document satisfies the closure requirement trivially and is the
-RECOMMENDED default; per-schema trimming is a possible optimization for very
-large databases (§14). Whichever is chosen, the closure requirement above is
-normative.
+The closure is defined over **execution-time references**:
 
-> **Non-normative.** The combined-document approach was verified end-to-end:
-> one synthesized file, `pgschema … --schema S` per schema, correct per-schema
-> plans and idempotent convergence. A `billing`-only file omitting a
-> referenced `public.customers` failed to build desired state — the evidence
-> behind the closure requirement. Note that the combined document is executed
-> in full by every per-schema run, so plan-database work scales with the
-> product of schema count and total DDL size; this is the cost the trimming
-> optimization would address.
+1. Seed it with every object assigned to `S`, emitted in all six categories.
+2. For every statement emitted, add each object it references at execution
+   time — a foreign key's referent, a column's domain or type, a default's
+   sequence. §4.5 rejects a source tree in which such a referent does not
+   exist.
+3. Objects added this way are **closure members**. A closure member
+   contributes to **categories 1 through 4 only**: its schema declaration, its
+   type, domain or sequence, its `CREATE TABLE`, and its indexes. It MUST NOT
+   contribute a foreign key (category 5) or a comment (category 6).
+4. Repeat from step 2 until no new object is added.
+
+Two consequences are worth stating outright, because getting either wrong
+produces a document that cannot execute:
+
+- **A closure member brings its indexes.** A foreign key may reference a
+  column set whose uniqueness is backed by a standalone `CREATE UNIQUE INDEX`
+  rather than by an inline constraint, and Postgres accepts that as a
+  referent (verified against Postgres 18; a *partial* unique index is not
+  accepted). Emitting a closure member's table without its indexes therefore
+  produces a document in which `S`'s foreign key cannot be created. pgpushy
+  emits all of a closure member's indexes rather than selecting the ones that
+  could back a reference, because the selection rule is exact and fiddly —
+  partial excluded, `NULLS NOT DISTINCT` included — and a wrong answer fails
+  silently in the unbuildable direction.
+- **A closure member does not bring its foreign keys**, which is what bounds
+  the closure. A foreign key is not a creation-time dependency — that is what
+  FK-lift bought — so `S → X.t → Y.u` stops at `X.t`: `Y.u` is only needed by
+  a constraint that `X`'s document emits and `S`'s does not. Since §4.5 admits
+  no cross-schema reference other than a foreign key, every onward reference
+  from a closure member is within its own schema, and the closure terminates
+  quickly.
+
+Objects a given run does not target serve only to resolve references and are
+otherwise ignored by that run — pgschema diffs only `--schema`.
+
+> **Non-normative — why not a combined document.** Earlier drafts of this spec
+> made a single combined document the recommended form, on the evidence that
+> it worked end to end for tables and foreign keys: correct per-schema plans
+> and idempotent convergence. That evidence was real but incomplete. It held
+> only because nothing in that object scope puts a schema name inside a string
+> literal; adding sequences broke it immediately, and no amount of care in
+> choosing *one* document's spelling can fix a requirement that two runs
+> disagree about. The cost of the combined form was also never free: it is
+> executed in full by every per-schema run, so plan-database work scaled with
+> the product of schema count and total DDL size. The per-schema form is both
+> the correct one and the cheaper one.
 
 ### 5.5 Behavior preservation
 
-The synthesized desired state MUST describe exactly the schema the source
-tree describes (G4). pgpushy performs exactly four transformations, and each
-is behavior-preserving — they change the textual order, the attachment site,
-and the spelling of names, never the resulting schema:
+For every managed schema `S`, `S`'s document MUST describe exactly the part of
+the schema the source tree assigns to `S` (G4). Closure members in that
+document are scaffolding rather than description: pgschema diffs only
+`--schema`, so a closure member is executed and never compared, and its
+deliberate incompleteness (§5.4 — no foreign keys, no comments) is not a
+divergence from what the author wrote. Every managed schema gets its own
+document, so every object the source tree describes is described exactly once,
+in the one document that is diffed against it.
+
+pgpushy performs exactly six transformations, and each is behavior-preserving
+— they change the textual order, the attachment site, the spelling of names,
+and which document an object appears in, never the resulting schema:
 
 1. **FK-lift** (§5.3) — relocates a foreign key from a table definition to a
    trailing `ALTER TABLE`.
@@ -417,8 +586,15 @@ and the spelling of names, never the resulting schema:
    leaving Postgres to generate the same name it already generated.
 3. **Qualification** (§5.4) — rewrites each identifier to name the schema the
    object was already resolved to.
-4. **Schema-declaration emission** (§5.2) — adds `CREATE SCHEMA IF NOT EXISTS`
-   for schemas the desired state requires.
+4. **Literal de-qualification** (§5.4) — removes the schema qualifier from a
+   name inside a string literal when that name refers to an object in the
+   document's own target schema, matching what pgschema does to identifiers
+   and cannot do to literals.
+5. **Schema-declaration emission** (§5.2) — adds `CREATE SCHEMA IF NOT EXISTS`
+   for schemas the document requires.
+6. **Partition and closure** (§5.4) — places each object in the document for
+   its own schema, and copies closure members into the documents that need
+   them.
 
 pgpushy MUST NOT perform any other transformation. In particular it MUST NOT
 add constraint attributes the author did not write (for example, it MUST NOT
@@ -439,7 +615,7 @@ MUST name everything that is wrong rather than only the first problem found
 (G5).
 
 A consequence of this section is that **pgpushy issues no DDL of its own to
-the target** in 0.x: schema *and* content changes all flow through pgschema
+the target** in 0.1: schema *and* content changes all flow through pgschema
 (satisfying G3), and every query pgpushy issues directly is read-only, so
 `plan` cannot mutate the target even incidentally.
 
@@ -450,7 +626,7 @@ state for a nonexistent schema fails, and an external plan database does not
 change this — current state is always read from the target (verified). An
 **existing but empty** schema reconciles normally.
 
-For 0.x, pgpushy therefore makes schema existence a **hard precondition**:
+For 0.1, pgpushy therefore makes schema existence a **hard precondition**:
 every managed schema MUST already exist on the target. pgpushy MUST fail,
 naming *every* missing schema, if any is absent.
 
@@ -459,7 +635,7 @@ EXISTS` for each managed schema (§5.2); that executes in pgschema's **plan
 database** to make qualified references resolvable, never against the target.
 
 > **Non-normative.** Creating managed schemas is thus the operator's
-> responsibility in 0.x (a one-time `CREATE SCHEMA` per new schema). Automatic
+> responsibility in 0.1 (a one-time `CREATE SCHEMA` per new schema). Automatic
 > handling of absent schemas — reporting a new schema and its would-be
 > contents without mutating the target — is deferred (§14, option B). pgpushy
 > also never *drops* a schema (§12.3).
@@ -529,14 +705,34 @@ the record of any change.
 ### 6.4 Connection resolution
 
 pgpushy MUST resolve its connection from the named environment (§10.2) into a
-single libpq-compatible connection string, and MUST rely on that string's
-standard interpretation of `sslmode` and the like rather than reimplementing
-those semantics. The resolved parameters are what §6.3 forwards to pgschema.
+single set of parameters. The resolved parameters are what §6.3 forwards to
+pgschema.
 
 Settings that would let the *environment* rather than the configuration decide
 the target — `PGSERVICE`, `PGSERVICEFILE` — MUST be refused rather than
 silently ignored, since pgpushy cannot interpret them and a dropped one would
 mean connecting somewhere the operator did not name.
+
+**`sslmode` MUST be honored in full**, across all five libpq modes:
+
+| `sslmode` | Encryption | Certificate chain | Hostname |
+|---|---|---|---|
+| `disable` | no | — | — |
+| `prefer` | opportunistic | not verified | not verified |
+| `require` | yes | not verified | not verified |
+| `verify-ca` | yes | verified | not verified |
+| `verify-full` | yes | verified | verified |
+
+pgpushy MUST interpret `sslmode` itself rather than delegating to its Postgres
+driver, because the driver models only `disable`, `prefer` and `require` and
+rejects the two verifying modes outright. Delegating would mean either
+refusing a connection string libpq accepts, or — worse — connecting in
+plaintext under a mode the operator chose for verification while pgschema,
+which does implement all five, connects encrypted to the same database. §6.3
+exists to make exactly that kind of divergence impossible.
+
+An unrecognized `sslmode` MUST be a hard error naming the value and listing
+the five accepted modes.
 
 This is the only place pgpushy accesses the target directly, and every
 statement it issues there MUST be read-only.
@@ -555,6 +751,11 @@ MUST process schemas in reverse-dependency order (a schema is processed after
 every schema it references). Same-schema foreign keys do not create edges and
 are handled within pgschema (§5.3). Ties MUST be broken deterministically —
 by schema name — so that the order is reproducible (§11.3).
+
+The graph is complete because a foreign key is the only reference §4.5 permits
+to cross a schema boundary. Widening that (§14) means adding edge kinds here,
+not a different graph: a cross-schema `nextval` would need the same ordering
+for the same reason.
 
 If the graph contains a cycle (a **cross-schema foreign-key cycle**), no valid
 apply order exists. pgpushy MUST report it, naming every schema in the cycle
@@ -580,13 +781,19 @@ binary can be resolved, pgpushy MUST fail with an actionable message.
 
 ### 8.2 Commands
 
+- **`pgpushy init`** — write a starter `pgpushy.toml`, guessing the source
+  root from where the `*.sql` files are. It is the one command that runs
+  *without* a configuration file, since its purpose is to produce one; it MUST
+  decline to guess when the answer is ambiguous, and MUST NOT overwrite an
+  existing file. It connects to nothing.
+
 - **`pgpushy validate`** — run the offline pipeline (§3, stages 1–6) and
   report. It MUST NOT connect to any database, so it is usable in a
   pre-commit hook and in CI with no Postgres service. It MUST report the
   managed-schema set, the file and object counts, the exclusions applied
   (§4.1), and the schema apply order, and MUST fail on any §4.3, §4.5, or §7
-  condition. It SHOULD accept an option to write the synthesized desired state
-  to a path for inspection.
+  condition. It SHOULD accept an option to write the synthesized documents for
+  inspection (§8.7).
 
 - **`pgpushy plan`** — run the offline pipeline, inspect the target (§6), then
   run `pgschema plan --schema S` for every managed schema and present each
@@ -629,12 +836,42 @@ pgschema invocation:
 - `--auto-approve` — pgpushy always passes it, because approval happens once
   at the pgpushy level (§8.6). `pgpushy apply --auto-approve` controls
   pgpushy's own prompt, not pgschema's.
+- **The working directory.** pgschema reads a `.pgschemaignore` from wherever
+  it happens to be run, with no flag to point at one. That makes the operator's
+  shell directory ambient input to what gets reconciled, so pgpushy MUST run
+  pgschema in a directory pgpushy creates and controls.
+- **The contents of that `.pgschemaignore`**, per §8.4.
 
-### 8.4 Unmanaged schemas
+### 8.4 What pgpushy does not manage, pgschema must not touch
 
-pgpushy reconciles exactly the managed-schema set (§4.4). Schemas present in
-the target database but absent from that set are neither planned nor modified
-nor dropped (§6.1, §12.3).
+Two axes of the target lie outside the managed set, and both need pgpushy to
+say so explicitly rather than let silence be read as intent.
+
+**Unmanaged schemas.** pgpushy reconciles exactly the managed-schema set
+(§4.4). Schemas present in the target database but absent from that set are
+neither planned nor modified nor dropped (§6.1, §12.3).
+
+**Privileges.** pgschema reconciles them **by default**, and reads a desired
+state that
+mentions no grants as a statement that there should be none: verified against
+pgschema 1.12.0, a target granting `SELECT, INSERT` to a role has both revoked,
+along with the schema's default privileges.
+
+pgpushy 0.1 does not manage privileges — §4.3 rejects `GRANT` and `REVOKE` in
+source — so their absence from the desired state carries no intent, and
+pgpushy MUST NOT let pgschema read intent into it. pgpushy therefore writes a
+`.pgschemaignore` into the working directory of §8.3 suppressing `[privileges]`
+and `[default_privileges]` for every run.
+
+One rule covers both axes: **what the source tree does not describe, pgpushy
+does not touch.** The consequence of getting either wrong is the same, and it
+is the reason the rule is stated rather than assumed — reconciliation drops
+things.
+
+The suppression is unconditional in 0.1 because there is no way to express a
+grant, so there is nothing for an opt-out to select between. When privileges
+become a managed kind (§14), this becomes an explicit opt-out rather than the
+only mode.
 
 ### 8.5 Resolving the pgschema binary
 
@@ -712,6 +949,28 @@ reserves for pgschema.
 `pgpushy apply --auto-approve` skips step 5 for non-interactive use. When
 standard input is not a terminal and `--auto-approve` was not given, pgpushy
 MUST fail rather than proceed unapproved.
+
+### 8.7 Writing the synthesized documents
+
+`validate`, `plan` and `apply` MAY be given `--out <dir>` to keep the
+documents §5 synthesized. Because there is one document per managed schema
+(§5.4), `--out` names a **directory**, not a file: pgpushy writes one
+`<schema>.sql` per managed schema. The differences between those documents —
+which closure members each carries, and how each spells a literal — are
+exactly what someone reaching for `--out` is trying to see.
+
+A schema name is a Postgres identifier and may contain characters that are not
+safe in a filename. pgpushy MUST emit bytes outside `[A-Za-z0-9_-]`
+percent-encoded, so that a legal but hostile schema name yields a legal
+filename inside the directory and cannot escape it.
+
+**pgpushy owns the directory it is given.** It MUST create it if absent. If it
+exists, every file in it MUST carry pgpushy's generated-file marker (§4.1),
+otherwise pgpushy MUST refuse and name a file it did not write — so `--out`
+can never overwrite an operator's own SQL. On success pgpushy MUST remove
+generated files the current run did not write, so that a schema dropped from
+`managed_schemas` leaves no document behind that reads as current. pgpushy
+MUST NOT delete a file it cannot prove it wrote.
 
 ## 9. Failure Handling
 
@@ -912,7 +1171,7 @@ foreign key with it.
 
 ### 12.3 Managed schemas must pre-exist; pgpushy issues no schema DDL
 
-In 0.x every managed schema MUST already exist on the target (§6.1); pgpushy
+In 0.1 every managed schema MUST already exist on the target (§6.1); pgpushy
 neither creates nor drops schemas. Introducing a new schema requires a
 one-time manual `CREATE SCHEMA` before pgpushy can manage it, and removing a
 schema from management is likewise manual. Automatic handling of absent
@@ -940,9 +1199,13 @@ unaffected.
 
 ### 12.5 Object scope
 
-pgpushy 0.x manages tables, indexes, table constraints, foreign keys, and
-comments (§4.3). A source tree containing any other object kind — a view, a
-function, a trigger, a user-defined type — is rejected, not partially managed.
+pgpushy 0.1 manages tables, indexes, table constraints, foreign keys,
+user-defined types, domains, standalone sequences, and comments (§4.3). A
+source tree containing any other object kind — a view, a function, a trigger,
+a policy — is rejected, not partially managed. `ALTER` is rejected throughout,
+except for the foreign-key form that is pgpushy's own output (§4.3), so a
+constraint is written where the object is defined rather than bolted on
+afterwards.
 
 This is a starting point, not the destination. **The goal is parity with the
 statement set pgschema itself supports** (§14): `CREATE TABLE`, `CREATE INDEX`,
@@ -955,6 +1218,29 @@ permanently out of scope for pgpushy too, since pgpushy delegates the work.
 
 Widening is staged by how much new machinery each kind needs, not by how
 useful it is (§14).
+
+### 12.6 Cross-schema references other than foreign keys
+
+A foreign key is the only reference pgpushy 0.1 permits to cross a schema
+boundary (§4.5). A column in one schema typed by a domain in another, or a
+default calling `nextval` on another schema's sequence, is rejected — write
+the referenced object in the same schema, or the referring object in the
+schema that owns it.
+
+The restriction is what keeps §5.4's closure shallow and its rule uniform, and
+it is the one place where 0.1 trades a real capability for a smaller design.
+Lifting it is future work (§14) and is additive: the closure is already
+specified over reference edges generally, and §7's graph would gain edge kinds
+rather than change shape.
+
+### 12.7 Privileges are not managed, and not touched
+
+pgpushy 0.1 neither reconciles `GRANT`/`REVOKE` nor lets pgschema reconcile
+them on its behalf (§8.4). Permissions on a pgpushy-managed database are
+whatever something else made them, and an `apply` leaves them exactly as it
+found them. This is a deliberate non-feature rather than an oversight: the
+alternative available today is not "pgpushy manages grants" but "pgschema
+revokes every grant pgpushy cannot see."
 
 ## 13. Dependencies and Compatibility
 
@@ -993,37 +1279,58 @@ useful it is (§14).
   widening is mostly adding categories rather than redesigning synthesis.
   Staged by the machinery each kind needs:
 
-  1. **Sequences, types, domains.** Structured names that qualify exactly as a
-     table's does, and no body referencing other objects. Category additions
-     and nothing more.
-  2. **Functions, procedures, aggregates, triggers, policies.** pgschema treats
+  1. **Functions, procedures, aggregates, triggers, policies.** pgschema treats
      function bodies as opaque dollar-quoted text rather than parsing them, and
      Postgres does not resolve a plpgsql body at creation time — so the name is
      qualified and the body passes through byte-for-byte. Trigger and policy
      references are structured AST fields. One question to settle first:
      SQL-standard `BEGIN ATOMIC` bodies (PG14+) *are* resolved at creation,
      unlike dollar-quoted ones.
-  3. **Views and materialized views.** A view's query *is* resolved at creation
+  2. **Views and materialized views.** A view's query *is* resolved at creation
      time, so unqualified references inside it are a live problem, and views
      need a topological sort *within* their category, because a view over a
      view is a genuine creation-time dependency that category order cannot
-     express. Before building an AST-walking qualifier — which would have to
-     track scope, since CTE names and subquery aliases are `RangeVar`s too and
-     qualifying those would break the view — settle whether a **per-schema
-     document** removes the need. With objects of schema `S` qualified as `S`,
-     which pgschema strips, an unqualified reference inside a view body would
-     resolve to the scratch schema standing in for `S`, which is the correct
-     answer. If that holds, only genuinely cross-schema references need
-     rewriting, and an author must write those qualified regardless.
-  4. **`GRANT`/`REVOKE` and `ALTER DEFAULT PRIVILEGES`.** Permissions rather
-     than shape; needs a decision on how they attribute to the managed-schema
-     set, since a grant is not owned by a schema the way a table is.
+     express — the same machinery §5.1 already applies to category 2. The
+     per-schema document (§5.4) has since answered the harder half: with `S`'s
+     objects qualified as `S`, which pgschema strips, an unqualified reference
+     inside a view body resolves to the scratch schema standing in for `S`,
+     which is the correct answer. So an AST-walking qualifier — which would
+     have to track scope, since CTE names and subquery aliases are `RangeVar`s
+     too and qualifying those would break the view — is needed only if
+     cross-schema references are widened past §12.6.
+  3. **`GRANT`/`REVOKE` and `ALTER DEFAULT PRIVILEGES`.** Permissions rather
+     than shape. Attribution is settled: `ALTER DEFAULT PRIVILEGES` requires
+     `IN SCHEMA`, so every such statement names its own schema, and a grant
+     attributes to the schema of the object granted on — both verified to plan
+     correctly per `--schema`. What remains is that grants need their **roles
+     to exist in the plan database**; the embedded one has none and fails with
+     `role "x" does not exist`. Roles are cluster-wide, so an external plan
+     database on the same cluster as the target has them, which makes
+     `[env.*.plan_db]` (§10.4) load-bearing rather than optional. pgpushy
+     should refuse with an explanation — naming the file and line and showing
+     the block to add — rather than letting pgschema fail on a missing role.
+     This is also where §8.4's unconditional privilege suppression becomes an
+     explicit opt-out. One open question: `GRANT … ON SCHEMA` appeared to be
+     silently ignored by pgschema in a spike; confirm, and reject it in the
+     allow-list if so, rather than accepting a statement that does nothing.
 - **References into unmanaged schemas** — for foreign keys targeting schemas
   pgpushy does not manage (extension schemas, an externally-owned `auth`,
   etc.), support pgschema's **external plan database** seeded with those
   external objects. §4.5 rejects these today. Not needed for cross-schema
-  references *among managed schemas* (the combined document already covers
-  those, §5.4).
+  references *among managed schemas*, which §5.4's closure already covers.
+- **Cross-schema references other than foreign keys** (§12.6) — a column typed
+  by another schema's domain, a default calling another schema's sequence.
+  Additive: §5.4's closure is already specified over reference edges rather
+  than over foreign keys, and §7's graph gains edge kinds rather than changing
+  shape. What it needs first is verification that pgschema resolves a
+  cross-schema *type* reference correctly under a per-schema run — the
+  identifier must survive un-stripped while the referring table's own
+  qualifier is stripped to the scratch schema.
+- **Plan-database hygiene** — an external plan database accumulates state
+  across runs (§10.4), and stale objects can make a broken desired state
+  appear to work. With grants making an external plan database mandatory for
+  some projects, this stops being spike hygiene and becomes something pgpushy
+  should either clean, namespace, or check.
 - **`pgpushy dump`** — the inverse: read an existing database and emit a
   per-object source tree, to bootstrap adoption.
 - **Cross-schema FK cycle support** (§12.1). **Single-pass cross-schema FK
@@ -1032,8 +1339,6 @@ useful it is (§14).
   simply be applied in the reverse order, with no target DDL from pgpushy at
   all. Refusing is only the general answer, for runs that both add and remove
   between the same pair.
-- **Per-schema synthesis** trimmed to the cross-schema closure (§5.4), for
-  databases where re-executing the full document per schema is too costly.
 - **Richer configuration** (§10): per-schema overrides, and variable
   interpolation in environments so that a target can be assembled from the
   process environment (Atlas does this with `--var`) rather than written out
@@ -1042,20 +1347,21 @@ useful it is (§14).
 
 ## 15. Decision Log
 
-All decisions identified for 0.x are resolved. Decisions marked **[0.2]** were
+All decisions identified for 0.1 are resolved. Decisions marked **[0.2]** were
 made after draft 2 of v0.1.
 
-- **Object scope for 0.x** — tables, indexes, table constraints, foreign keys,
+- **Object scope** — tables, indexes, table constraints, foreign keys,
   and comments. **[0.2]** Anything else is **rejected** with a diagnostic
   rather than passed through, because pgpushy cannot qualify the interior of a
   statement it does not model, and §5.4 makes qualification normative.
   (§4.3, §12.5)
 - **Schema-assignment mechanism** — schema-qualify **every** emitted
   identifier with its resolved schema, including `public`; an unqualified
-  object would be misattributed to every schema the combined file is run
-  against (verified). Synthesis-file granularity remains an implementation
-  detail; the combined document is the recommended default. (§5.4)
-- **Absent schemas / `plan` mutation** — 0.x makes schema existence a hard
+  object would be misattributed to whichever schema's run reads it (verified).
+  **[0.4]** Synthesis-file granularity is *not* an implementation detail, and
+  the combined document — recommended through v0.3 — is wrong. See the
+  per-schema entry below. (§5.4)
+- **Absent schemas / `plan` mutation** — 0.1 makes schema existence a hard
   precondition, checked read-only, else pgpushy fails before delegating.
   pgpushy issues no DDL of its own to the target, and `plan` cannot mutate it.
   (§6.1, §8.2)
@@ -1097,9 +1403,10 @@ made after draft 2 of v0.1.
   (`>= v1.12.0` today), tracking pgpushy's CI matrix, **not overridable**.
   pgpushy resolves the binary through a provider: managed download (intended
   default, pinned + SHA-256-verified) with a permanent BYO override that
-  parses `pgschema --help` and enforces the floor. First 0.x release ships
-  BYO + version check; **[0.3]** managed landed and is now the default, with
-  BYO selected by naming a binary or setting `backend = "byo"`. (§8.5, §13)
+  parses `pgschema --help` and enforces the floor. The plan was for the first
+  release to ship BYO + version check only; **[0.3]** managed landed early and
+  is the default, with BYO selected by naming a binary or setting
+  `backend = "byo"`. (§8.5, §13)
 - **Configuration file** — **[0.3]** `pgpushy.toml` is **required**, read from
   the working directory only (not searched upward; `--config` for an explicit
   path), and holds everything about the project: structure, `managed_schemas`,
@@ -1129,3 +1436,89 @@ made after draft 2 of v0.1.
 - **[0.2] `CREATE SCHEMA` forms** — only the bare
   `CREATE SCHEMA [IF NOT EXISTS] <name>` form is accepted; the nested-element
   form and the `AUTHORIZATION`-only form are rejected. (§4.3)
+- **[0.4] One document per managed schema** — reverses the combined-document
+  recommendation of v0.1–v0.3. pgschema strips a schema qualifier from an
+  identifier but not from inside a string literal, and a `nextval` reference
+  to an object in `S` must be spelled *unqualified* in `S`'s own document and
+  *qualified* in every other. Those two requirements contradict, so no single
+  document can be correct for every run. The earlier evidence was sound but
+  incomplete: it held only because tables and foreign keys put no schema name
+  inside a literal. Verified against pgschema 1.12.0 in both directions —
+  the qualified literal fails with `relation … does not exist`, the
+  de-qualified one converges. The per-schema form is also the cheaper one.
+  (§5.4, §5.5)
+- **[0.4] Closure contents** — a document holds its schema's objects plus the
+  transitive closure of what they reference at execution time. A closure
+  member contributes categories 1–4 (schema, type/domain/sequence, table,
+  indexes) and never a foreign key or a comment. It brings **all** its
+  indexes, not a selected subset: a foreign key may reference a column set
+  whose uniqueness is backed by a standalone unique index (verified against
+  Postgres 18; a *partial* unique index is not accepted), and the selection
+  rule is fiddly enough that a wrong answer fails silently in the unbuildable
+  direction. Omitting a closure member's foreign keys is what bounds the
+  closure — FK-lift is what makes a foreign key not a creation-time
+  dependency. (§5.4)
+- **[0.4] Cross-schema references capped at foreign keys** — a foreign key is
+  the only reference permitted to cross a schema boundary in 0.1; a
+  cross-schema type, domain or sequence reference is rejected. This keeps the
+  closure shallow and its rule uniform, and it avoids shipping on an
+  unverified assumption about how pgschema resolves a cross-schema type
+  reference under a per-schema run. Additive to widen later: the closure is
+  specified over reference edges generally. (§4.5, §12.6, §14)
+- **[0.4] `ALTER` is not a declarative statement** — every `ALTER` form is
+  rejected in source except `ALTER TABLE … ADD CONSTRAINT` for a foreign key.
+  A `CHECK`, `UNIQUE`, `PRIMARY KEY` or `EXCLUDE` constraint is written inline
+  in its `CREATE TABLE`; verified against Postgres 18 that an inline table
+  constraint can carry an explicit name, so only the spelling changes. The
+  foreign-key form stays because it is pgpushy's own output shape and what
+  `pg_dump` emits, and because category 5 cannot reintroduce an earlier
+  category's ordering problem. This also removes `… ADD CONSTRAINT … UNIQUE
+  USING INDEX`, the one form that made category 4 not internally order-free.
+  (§4.3, §5.1)
+- **[0.4] Names inside string literals must be qualified** — `nextval('s')` is
+  rejected; write `nextval('public.s')`. §4.4's rule for identifiers is
+  deliberately *not* reused, because the two readings — the default schema
+  versus the owning object's schema — diverge silently once cross-schema
+  references are supported, and both are legal. Requiring the schema keeps the
+  choice open and costs imported trees nothing: `pg_dump` qualifies inside
+  literals already (verified), and `serial`/`IDENTITY` produce no literal.
+  (§4.3, §5.4)
+- **[0.4] Object scope for 0.1** — adds user-defined types, domains and
+  standalone sequences to tables, indexes, constraints, foreign keys and
+  comments. `CREATE SEQUENCE … OWNED BY` is rejected: it inverts the category
+  order, and pgschema models a column-owned sequence as `SERIAL` rather than
+  an object of its own, so the shape does not survive a dump-and-reapply
+  (verified — the standalone sequence is dropped and an owned one created).
+  `CREATE TABLE … (LIKE t)` is rejected alongside `INHERITS`, `PARTITION OF`
+  and `OF <type>`, being the same table-to-table creation dependency hiding
+  inside the column list. (§4.3, §12.5)
+- **[0.4] Category 2 is sorted, not fixed** — types, domains and sequences
+  share one category ordered topologically by creation-time dependency, rather
+  than following pgschema's fixed dump order. No fixed order among the three
+  is correct in general: a domain over a domain, a composite type with a
+  domain-typed field, and a domain default calling `nextval` each invert a
+  different pair. The sort is also what views will need within their own
+  category (§14). (§5.1)
+- **[0.4] `--out` is a directory pgpushy owns** — one `<schema>.sql` per
+  managed schema, with bytes outside `[A-Za-z0-9_-]` percent-encoded so a
+  legal-but-hostile schema name cannot escape the directory. pgpushy creates
+  it, refuses it if it holds a file pgpushy did not write, and prunes its own
+  stale documents so a schema dropped from `managed_schemas` leaves nothing
+  behind that reads as current. (§8.7)
+- **[0.4] `sslmode` is honored in full** — all five libpq modes, interpreted
+  by pgpushy rather than by its Postgres driver, which models only three and
+  rejects the two verifying ones. Delegating would mean refusing a connection
+  string libpq accepts, or connecting in plaintext under a mode chosen for
+  verification while pgschema — which implements all five — connects encrypted
+  to the same database. That is precisely the divergence §6.3 exists to
+  prevent. (§6.4)
+- **[0.4] Privileges are suppressed, not managed** — pgpushy writes a
+  `.pgschemaignore` covering `[privileges]` and `[default_privileges]` into a
+  working directory it owns, because pgschema reconciles privileges by default
+  and reads a desired state mentioning no grants as a request to have none
+  (verified: every grant on the target revoked). Unconditional in 0.1, since
+  §4.3 admits no way to express a grant and an opt-out would have nothing to
+  select between; it becomes an explicit opt-out when privileges become a
+  managed kind. Owning the working directory is part of the decision: pgschema
+  auto-loads that file from wherever it runs, so the operator's shell
+  directory would otherwise be ambient input. (§8.3, §8.4, §12.7)

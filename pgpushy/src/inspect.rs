@@ -8,6 +8,7 @@
 //! One connection answers everything the commands need before delegating.
 
 use crate::conn::Resolved;
+use crate::tls;
 use anyhow::{Context, Result};
 use pgpushy_core::SchemaName;
 use postgres::{Client, NoTls};
@@ -66,8 +67,16 @@ impl std::fmt::Display for Identity {
 
 /// Inspect the target. Read-only.
 pub fn inspect(connection: &Resolved, managed: &[SchemaName]) -> Result<Inspection> {
-    let mut client = Client::connect(&connection.conninfo(), NoTls)
-        .with_context(|| format!("connecting to {}", connection.describe()))?;
+    let config = connection.pg_config();
+    // The two halves of `sslmode` (spec §6.4): the config carries what happens
+    // when the server declines TLS, and the connector carries how much of the
+    // certificate is checked once it does not. `None` is `disable` alone — the
+    // driver then never even asks for TLS.
+    let mut client = match tls::connector(connection.sslmode)? {
+        Some(tls) => config.connect(tls),
+        None => config.connect(NoTls),
+    }
+    .with_context(|| format!("connecting to {}", connection.describe()))?;
 
     let identity = read_identity(&mut client)?;
     let missing_schemas = missing_schemas(&mut client, managed)?;

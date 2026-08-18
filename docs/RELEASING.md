@@ -1,9 +1,10 @@
 # Releasing
 
-> **Nothing has been released yet.** This documents the intended flow, which
-> mirrors `snowdrop-id-rs`. The publish workflow itself lands with M6, since
-> there is no point publishing a tool whose default pgschema provider is still
-> "bring your own binary".
+> **Nothing has been released yet, and the flow below cannot be run yet.** It
+> documents the intended process, which mirrors `snowdrop-id-rs`, but two
+> pieces of it are missing — see *Before the first release*. The important one
+> is that there is no publish workflow, so `just publish` pushes a tag nothing
+> is listening for.
 
 The two crates (`pgpushy-core`, `pgpushy`) are versioned in lockstep and
 published to crates.io from CI using **Trusted Publishing (OIDC)** — GitHub
@@ -20,9 +21,29 @@ through a bump it did not earn stops being free.
 
 ## Before the first release
 
-The version floor is **the pgschema version pgpushy is tested against**
-(spec §13), which is a promise about CI rather than about the code. So a
-release means the CI matrix in [`ci.yml`](../.github/workflows/ci.yml) and
+Two pieces of the flow below do not exist yet.
+
+**Missing: the publish workflow.** `.github/workflows/` holds only `ci.yml`.
+`just publish` tags `vX.Y.Z`, pushes it, and reports that the publish workflow
+will build and publish the crates — nothing is listening for that tag. The
+failure is silent at the moment it happens and awkward afterwards: the tag now
+exists, so `just publish` refuses the retry (`tag vX.Y.Z already exists`), and
+the tag has to be deleted locally and on the remote before a second attempt.
+The workflow needs to fire on `v*` tags, claim crates.io Trusted Publishing for
+both crates, and publish `pgpushy-core` before `pgpushy`, which depends on it.
+
+**Missing: the licence in the published crates.** `LICENSE` exists only at the
+repo root, and neither `pgpushy/Cargo.toml` nor `pgpushy-core/Cargo.toml` sets
+`include` or `license-file`, so cargo packages neither copy of it — verified
+against the `.crate` tarballs under `target/package/`, which carry `README.md`
+(through `readme = "../README.md"`) and no licence text at all. Both crates
+would ship declaring `license = "Apache-2.0"` with nothing in them saying what
+that grants. A published version is immutable, so this is a fix before the
+first publish rather than after it.
+
+Beyond those, the version floor is **the pgschema version pgpushy is tested
+against** (spec §13), which is a promise about CI rather than about the code.
+So a release means the CI matrix in [`ci.yml`](../.github/workflows/ci.yml) and
 `MIN_PGSCHEMA` in [`provider/mod.rs`](../pgpushy/src/provider/mod.rs) must
 agree. Raising one without the other makes the floor a lie in whichever
 direction is worse.
@@ -67,10 +88,16 @@ so do that rather than copying from anywhere.
    $ git switch main && git pull
    $ just publish
    ```
-   `just publish` pushes the `vX.Y.Z` tag, which triggers the publish workflow.
+   `just publish` pushes the `vX.Y.Z` tag. Once the publish workflow exists
+   that tag is what starts it; until then the push is inert and leaves a tag
+   behind that must be deleted, locally and on the remote, before a second
+   attempt — `just publish` refuses to run while it is there.
 
 ## Checklist for a release that is not just code
 
+- Both crates carry the Apache-2.0 text —
+  `tar tzf target/package/pgpushy-*.crate | grep LICENSE`. They do not today;
+  see *Before the first release*.
 - `CHANGELOG.md` has a real `## [Unreleased]` section. `just bump` stamps it
   with the version and date; it does not write it.
 - `docs/spec.md` version and date reflect any decisions the release changed.

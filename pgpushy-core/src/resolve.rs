@@ -93,12 +93,6 @@ fn enlisting_origins(objects: &Objects) -> BTreeMap<SchemaName, Vec<Origin>> {
     );
     all.extend(
         objects
-            .constraints
-            .iter()
-            .map(|c| (c.table.schema.clone(), c.origin.clone())),
-    );
-    all.extend(
-        objects
             .foreign_keys
             .iter()
             .map(|f| (f.table.schema.clone(), f.origin.clone())),

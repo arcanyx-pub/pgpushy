@@ -120,9 +120,8 @@ fn summarize(analysis: &Analysis, plans: &[(SchemaName, Plan)]) {
     // drop of everything the target holds there. Said again here because this
     // is the last moment before it happens.
     let empty: Vec<_> = analysis
-        .managed_schemas
+        .empty_schemas
         .iter()
-        .filter(|schema| !analysis.desired_state.contains(&format!("{schema}.")))
         .map(|schema| schema.as_str())
         .collect();
     if !empty.is_empty() {

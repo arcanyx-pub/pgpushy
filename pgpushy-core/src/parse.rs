@@ -17,9 +17,9 @@
 //! already separate.
 
 use crate::error::{Diagnostic, DiagnosticKind};
+use crate::literal;
 use crate::model::{
     Comment, ForeignKey, Index, Objects, Origin, QualifiedName, SchemaDecl, SchemaName, Table,
-    TableConstraint,
 };
 use pg_query::NodeEnum;
 use pg_query::protobuf::{
@@ -155,6 +155,15 @@ fn classify(
     objects: &mut Objects,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    // Spec §4.3: an object name inside a string literal must name its schema.
+    // Checked here, over the statement as written, so the diagnostic can quote
+    // the literal the author typed. Only for statements the allow-list admits
+    // — an unsupported statement already has its own diagnostic, and a second
+    // one about its interior would be noise.
+    if is_allowed_kind(node) {
+        check_name_literals(node, origin, diagnostics);
+    }
+
     match node {
         NodeEnum::CreateSchemaStmt(stmt) => match classify_create_schema(stmt, origin) {
             Ok(decl) => objects.schemas.push(decl),
@@ -175,6 +184,52 @@ fn classify(
             Err(diag) => diagnostics.push(diag),
         },
         other => diagnostics.push(unsupported(other, origin)),
+    }
+}
+
+fn is_allowed_kind(node: &NodeEnum) -> bool {
+    matches!(
+        node,
+        NodeEnum::CreateSchemaStmt(_)
+            | NodeEnum::CreateStmt(_)
+            | NodeEnum::IndexStmt(_)
+            | NodeEnum::AlterTableStmt(_)
+            | NodeEnum::CommentStmt(_)
+    )
+}
+
+/// Reject an object name inside a string literal that does not name a schema.
+///
+/// pgpushy will not infer one. §4.4's rule for identifiers is deliberately not
+/// reused: the default schema and the owning object's schema are both
+/// defensible readings, they disagree, and neither disagreement is visible as
+/// an error — so choosing now would quietly fix the answer for good. Demanding
+/// the schema keeps it open, and costs an imported tree nothing, since pg_dump
+/// qualifies inside literals already.
+fn check_name_literals(node: &NodeEnum, origin: &Origin, diagnostics: &mut Vec<Diagnostic>) {
+    for found in literal::find(node) {
+        let raw = &found.raw;
+        let what = found.what;
+        let problem = match literal::name_parts(raw) {
+            Some(parts) if parts.len() == 2 => continue,
+            Some(parts) if parts.len() == 1 => {
+                format!("the {what} name '{raw}' does not say which schema it is in")
+            }
+            Some(_) => format!("the {what} name '{raw}' names more than a schema and an object"),
+            None => format!("'{raw}' is not a name pgpushy can read"),
+        };
+        diagnostics.push(
+            Diagnostic::new(
+                DiagnosticKind::UnqualifiedNameLiteral,
+                problem,
+                vec![origin.clone()],
+            )
+            .with_help(
+                "pgschema strips a schema qualifier from an identifier but cannot reach \
+                 inside a string literal, so pgpushy must know which schema this names; \
+                 write it as 'schema.name' (spec §4.3)",
+            ),
+        );
     }
 }
 
@@ -268,7 +323,33 @@ fn classify_create_table(
                 "CREATE TABLE OF <type>",
                 vec![origin.clone()],
             )
-            .with_help("pgpushy 0.x does not manage user-defined types (spec §12.5)"),
+            .with_help(
+                "a table whose shape comes from a type cannot be created before that type; \
+                 write the columns out (spec §12.5)",
+            ),
+        );
+        return;
+    }
+    // `LIKE` arrives inside the column list rather than in a clause of its
+    // own, which is what makes it easy to miss beside the three above. It is
+    // the same hazard: the copied-from table must exist first, and category 3
+    // is emitted in name order, so a `LIKE` naming a table that sorts after it
+    // produces a document that cannot execute.
+    if stmt
+        .table_elts
+        .iter()
+        .any(|elt| matches!(elt.node.as_ref(), Some(NodeEnum::TableLikeClause(_))))
+    {
+        diagnostics.push(
+            Diagnostic::new(
+                DiagnosticKind::UnsupportedStatement,
+                "CREATE TABLE with LIKE",
+                vec![origin.clone()],
+            )
+            .with_help(
+                "a table copied from another cannot be created before it; write the columns \
+                 out (spec §12.5)",
+            ),
         );
         return;
     }
@@ -394,11 +475,11 @@ fn classify_alter_table(
             ));
             continue;
         };
-        // Spec §4.3: ADD CONSTRAINT is the one ALTER TABLE subcommand a
-        // desired-state document may use, because it is how pg_dump — and
-        // therefore pgpushy — expresses a constraint separately from its
-        // table. Every other subcommand describes a change to reach a state,
-        // not the state itself.
+        // Spec §4.3: a source file says what exists, not the steps that reach
+        // it, so `ALTER` is rejected. `ADD CONSTRAINT` for a foreign key is
+        // the single exception, because it is pgpushy's own output shape —
+        // §5.3 lifts every foreign key into exactly that form — and it is what
+        // pg_dump emits, so a tree derived from one needs no rewriting there.
         if cmd.subtype != AlterTableType::AtAddConstraint as i32 {
             diagnostics.push(
                 Diagnostic::new(
@@ -444,12 +525,30 @@ fn classify_alter_table(
                 ast: constraint,
             });
         } else {
-            objects.constraints.push(TableConstraint {
-                table: table.clone(),
-                name: non_empty(&constraint.conname),
-                origin: origin.clone(),
-                ast: constraint,
-            });
+            // A CHECK, UNIQUE, PRIMARY KEY or EXCLUDE constraint written
+            // standalone. Rejecting it is what keeps the index category
+            // internally order-free (spec §5.1): `ADD CONSTRAINT … UNIQUE
+            // USING INDEX` needs its index to exist first, and no other form
+            // in that category depends on anything but its own table.
+            //
+            // Verified against Postgres 18 that an inline table constraint can
+            // carry an explicit name, so the inline form loses nothing.
+            diagnostics.push(
+                Diagnostic::new(
+                    DiagnosticKind::UnsupportedStatement,
+                    format!(
+                        "ALTER TABLE … ADD CONSTRAINT {}",
+                        constraint_kind(&constraint)
+                    ),
+                    vec![origin.clone()],
+                )
+                .with_help(format!(
+                    "only a FOREIGN KEY may be added this way; write it inline in \
+                     CREATE TABLE {table} instead, as `CONSTRAINT {} …` if you want to keep \
+                     the name (spec §4.3)",
+                    non_empty(&constraint.conname).unwrap_or_else(|| "<name>".to_owned()),
+                )),
+            );
         }
     }
 }
@@ -619,6 +718,18 @@ fn is_foreign_key(c: &Constraint) -> bool {
     c.contype == ConstrType::ConstrForeign as i32
 }
 
+/// Name a constraint's kind for a diagnostic, so the message says which
+/// statement the author is looking at rather than making them work it out.
+fn constraint_kind(c: &Constraint) -> &'static str {
+    match c.contype {
+        t if t == ConstrType::ConstrCheck as i32 => "CHECK",
+        t if t == ConstrType::ConstrUnique as i32 => "UNIQUE",
+        t if t == ConstrType::ConstrPrimary as i32 => "PRIMARY KEY",
+        t if t == ConstrType::ConstrExclusion as i32 => "EXCLUDE",
+        _ => "constraint",
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Qualification helpers (spec §5.4)
 // ---------------------------------------------------------------------------
@@ -695,8 +806,8 @@ fn unsupported(node: &NodeEnum, origin: &Origin) -> Diagnostic {
         vec![origin.clone()],
     )
     .with_help(
-        "pgpushy 0.x manages tables, indexes, table constraints, foreign keys and comments; \
-         see spec §4.3 for the full list and §14 for what may come later",
+        "pgpushy 0.1 manages tables, indexes, foreign keys, types, domains, sequences and \
+         comments; see spec §4.3 for the full list and §14 for what may come later",
     )
 }
 

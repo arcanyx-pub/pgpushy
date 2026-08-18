@@ -1,7 +1,7 @@
 //! The object model: what pgpushy understands a source tree to contain.
 //!
-//! Scope is spec §4.3 — tables, indexes, table constraints, foreign keys and
-//! comments — and nothing else. There is deliberately no catch-all variant:
+//! Scope is spec §4.3 — tables, indexes, foreign keys and comments — and
+//! nothing else. There is deliberately no catch-all variant:
 //! a statement outside the allow-list becomes a diagnostic during parsing, not
 //! an unmodelled node carried through synthesis (see [`crate::parse`]).
 
@@ -128,7 +128,7 @@ pub struct ForeignKey {
     pub ast: Constraint,
 }
 
-/// An index. Depends on its table existing, hence category 3 (spec §5.1).
+/// An index. Depends on its table existing, hence category 4 (spec §5.1).
 #[derive(Clone, Debug)]
 pub struct Index {
     /// The index's own name, qualified by the schema of the table it indexes.
@@ -137,20 +137,6 @@ pub struct Index {
     pub table: QualifiedName,
     pub origin: Origin,
     pub ast: IndexStmt,
-}
-
-/// A standalone non-foreign-key `ALTER TABLE … ADD CONSTRAINT`.
-///
-/// `CHECK`, `UNIQUE`, `PRIMARY KEY` and `EXCLUDE` constraints written this way
-/// rather than inline. Like indexes, they depend on their table (category 3).
-#[derive(Clone, Debug)]
-pub struct TableConstraint {
-    pub table: QualifiedName,
-    /// Constraint name if the author gave one. Used only for duplicate
-    /// detection; the constraint is re-emitted from `ast` either way.
-    pub name: Option<String>,
-    pub origin: Origin,
-    pub ast: Constraint,
 }
 
 /// A `COMMENT ON`, emitted last so it may reference anything (spec §5.1).
@@ -171,7 +157,6 @@ pub struct Objects {
     pub schemas: Vec<SchemaDecl>,
     pub tables: Vec<Table>,
     pub indexes: Vec<Index>,
-    pub constraints: Vec<TableConstraint>,
     pub foreign_keys: Vec<ForeignKey>,
     pub comments: Vec<Comment>,
 }
@@ -182,6 +167,26 @@ impl Objects {
     /// This is the raw material for the managed-schema set (spec §4.4); it is
     /// deliberately *not* the set itself, since a declaration in configuration
     /// may override it.
+    /// Every schema at least one object is assigned to.
+    ///
+    /// Unlike [`Self::mentioned_schemas`] this excludes a schema that only a
+    /// `CREATE SCHEMA` names. The difference is what tells a managed schema
+    /// with contents from one that reconciles to empty (spec §4.4), which is
+    /// destructive and has to be said out loud before it happens.
+    pub fn schemas_with_objects(&self) -> Vec<SchemaName> {
+        let mut out: Vec<SchemaName> = self
+            .tables
+            .iter()
+            .map(|t| t.name.schema.clone())
+            .chain(self.indexes.iter().map(|i| i.table.schema.clone()))
+            .chain(self.foreign_keys.iter().map(|f| f.table.schema.clone()))
+            .chain(self.comments.iter().map(|c| c.schema.clone()))
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
     pub fn mentioned_schemas(&self) -> Vec<SchemaName> {
         let mut out: Vec<SchemaName> = self
             .schemas
@@ -189,7 +194,6 @@ impl Objects {
             .map(|s| s.name.clone())
             .chain(self.tables.iter().map(|t| t.name.schema.clone()))
             .chain(self.indexes.iter().map(|i| i.table.schema.clone()))
-            .chain(self.constraints.iter().map(|c| c.table.schema.clone()))
             .chain(self.foreign_keys.iter().map(|f| f.table.schema.clone()))
             .chain(self.comments.iter().map(|c| c.schema.clone()))
             .collect();

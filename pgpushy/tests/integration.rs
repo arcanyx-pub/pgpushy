@@ -309,15 +309,17 @@ fn an_applied_tree_replans_empty() {
     );
 
     let outputs = TempDir::new().expect("temp dir");
-    let document = outputs.path().join("desired.sql");
+    let out = outputs.path().join("desired");
     project
         .command("validate")
         .arg("--out")
-        .arg(&document)
+        .arg(&out)
         .assert()
         .success();
 
-    target.apply_directly(&document, &[&schema]);
+    // `--out` writes one document per managed schema (spec §8.7); this tree
+    // has exactly one, and it is the one to apply.
+    target.apply_directly(&out.join(format!("{schema}.sql")), &[&schema]);
 
     project
         .command("plan")

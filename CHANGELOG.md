@@ -22,15 +22,18 @@ and [`docs/impl-plan.md`](docs/impl-plan.md) for the build plan.
 - `pgpushy-core` — the pure half: parsing, FK-lift, qualification, validity
   checks, cross-schema ordering and synthesis, with no IO of any kind.
 - `pgpushy plan` — one pgschema plan per managed schema, in cross-schema
-  dependency order. Read-only throughout: pgpushy's own inspection is a single
-  `SELECT`, and pgschema builds its comparison model in a separate plan
-  database.
+  dependency order. Read-only throughout: every statement pgpushy's own
+  inspection issues is a `SELECT`, and pgschema builds its comparison model in
+  a separate plan database.
 - A bring-your-own pgschema provider: `--pgschema-path` or a `PATH` lookup,
   with the version floor enforced from the `Version:` line of `pgschema
   --help`. Below the floor is a hard error; an unreadable version warns.
-- Connection resolution that pgschema does not repeat: pgpushy folds flags and
-  `PG*` into one answer and passes every parameter explicitly, so the two
-  cannot reach different databases.
+- One connection resolution, not two: pgpushy resolves the target itself and
+  hands pgschema every parameter explicitly, so pgschema resolves nothing and
+  the two cannot reach different databases. `PG*` and the `PGSCHEMA_PLAN_*`
+  family are stripped from the subprocess environment for the same reason, and
+  `PGSERVICE`/`PGSERVICEFILE` are refused rather than silently dropped, since
+  pgpushy cannot interpret them.
 - `pgpushy apply` — plans every managed schema, presents them as one reviewable
   unit with destructive changes named individually, asks once, then applies the
   plans it just showed. Declining leaves the target untouched. `--auto-approve`

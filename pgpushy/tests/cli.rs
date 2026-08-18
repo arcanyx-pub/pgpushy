@@ -146,11 +146,57 @@ fn does_not_follow_symlinked_directories() {
         .stdout(predicates::str::contains("1 table"));
 }
 
+/// A link to a file is desired state like any other file: a `.sql` file
+/// missing from it is a file scheduled for deletion.
+#[cfg(unix)]
+#[test]
+fn follows_symlinked_files() {
+    let dir = project(
+        "source_root = \"schema\"",
+        &[
+            ("schema/orders.sql", ORDERS),
+            ("shared/customers.sql", CUSTOMERS),
+        ],
+    );
+    std::os::unix::fs::symlink(
+        dir.path().join("shared/customers.sql"),
+        dir.path().join("schema/customers.sql"),
+    )
+    .expect("create symlink");
+
+    validate(dir.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("(2 files)"))
+        // Dropping the link would leave orders' foreign key pointing at nothing.
+        .stdout(predicates::str::contains("2 tables, 1 foreign key"));
+}
+
+/// Passing over a link pgpushy cannot read would drop the objects it defines
+/// from the desired state, and pgschema deletes what the desired state omits.
+#[cfg(unix)]
+#[test]
+fn rejects_a_symlink_that_cannot_be_resolved() {
+    let dir = project("source_root = \"schema\"", &[("schema/orders.sql", ORDERS)]);
+    std::os::unix::fs::symlink(
+        dir.path().join("shared/customers.sql"),
+        dir.path().join("schema/customers.sql"),
+    )
+    .expect("create symlink");
+
+    validate(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("1 symbolic link"))
+        .stderr(predicates::str::contains("customers.sql -> "))
+        .stderr(predicates::str::contains("No such file or directory"));
+}
+
 #[test]
 fn writes_the_desired_state_with_out() {
     let dir = tree(&[("orders.sql", ORDERS), ("customers.sql", CUSTOMERS)]);
     let outputs = TempDir::new().expect("temp dir");
-    let out = outputs.path().join("desired.sql");
+    let out = outputs.path().join("desired");
 
     validate(dir.path())
         .arg("--out")
@@ -158,7 +204,8 @@ fn writes_the_desired_state_with_out() {
         .assert()
         .success();
 
-    let contents = std::fs::read_to_string(&out).expect("desired state written");
+    // One document per managed schema, named after it (spec §8.7).
+    let contents = std::fs::read_to_string(out.join("public.sql")).expect("desired state written");
     assert!(
         contents.contains("CREATE TABLE public.customers"),
         "{contents}"
@@ -223,8 +270,8 @@ fn output_is_byte_identical_across_runs() {
     ]);
 
     let outputs = TempDir::new().expect("temp dir");
-    let first = outputs.path().join("first.sql");
-    let second = outputs.path().join("second.sql");
+    let first = outputs.path().join("first");
+    let second = outputs.path().join("second");
     validate(dir.path())
         .arg("--out")
         .arg(&first)
@@ -237,8 +284,8 @@ fn output_is_byte_identical_across_runs() {
         .success();
 
     assert_eq!(
-        std::fs::read_to_string(&first).unwrap(),
-        std::fs::read_to_string(&second).unwrap(),
+        std::fs::read_to_string(first.join("public.sql")).unwrap(),
+        std::fs::read_to_string(second.join("public.sql")).unwrap(),
     );
 }
 

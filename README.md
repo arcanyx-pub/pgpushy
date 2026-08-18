@@ -60,7 +60,7 @@ CREATE TABLE customers (id int PRIMARY KEY, name text NOT NULL);
 ```console
 $ pgpushy validate
   config: pgpushy.toml
-  db/schema (2 files)
+  /home/joe/myapp/db/schema (2 files)
   2 tables, 1 foreign key, 1 index
 
   managed schemas: public
@@ -72,7 +72,7 @@ $ pgpushy validate
 
 $ pgpushy apply --env local
   config: pgpushy.toml
-  db/schema (2 files)
+  /home/joe/myapp/db/schema (2 files)
   2 tables, 1 foreign key, 1 index
 
   managed schemas: public
@@ -228,9 +228,13 @@ sudo apt-get install libclang-dev
 Then:
 
 ```sh
-just ci      # fmt-check, clippy, test, doc
+just ci      # fmt-check, clippy, test, doc, msrv
 just test    # tests; integration tests skip without a database
 ```
+
+`just ci` ends with the `msrv` step, which checks that the workspace still
+builds on the minimum supported Rust version and installs that toolchain
+through `rustup` when it is not already there.
 
 Integration tests need a target database (`PGPUSHY_TEST_PG_URL`) and a
 pgschema binary (`PGPUSHY_TEST_PGSCHEMA`); they skip when either is absent

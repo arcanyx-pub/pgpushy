@@ -18,6 +18,7 @@
 //! version-controlled file.
 
 use crate::config::{ResolvedPlanDatabase, Target};
+use crate::tls::Security;
 use anyhow::{Result, bail};
 
 /// A fully resolved connection: one answer, used by both pgpushy and pgschema.
@@ -31,7 +32,7 @@ pub struct Resolved {
     pub user: String,
     pub password: Option<String>,
     pub password_source: PasswordSource,
-    pub sslmode: String,
+    pub sslmode: SslMode,
     /// An external plan database, if the environment named one (spec §10.4).
     pub plan_db: Option<PlanConnection>,
     /// The environment's lock timeout, before any flag overrides it (§10.5).
@@ -42,7 +43,9 @@ pub struct Resolved {
 ///
 /// Kept separate from [`Resolved`] rather than folded in: pgpushy never
 /// connects here itself. This is only ever forwarded to pgschema, which is why
-/// it has a flag rendering and no `conninfo`.
+/// it has a flag rendering and no driver configuration — and why its `sslmode`
+/// stays a string: the mode governs a connection pgschema alone makes, and
+/// pgschema interprets it.
 #[derive(Debug, Clone)]
 pub struct PlanConnection {
     pub host: String,
@@ -97,6 +100,65 @@ pub enum PasswordSource {
     Environment,
     File,
     None,
+}
+
+/// A libpq `sslmode`, as pgpushy understands it (spec §6.4).
+///
+/// Resolved into this enum before anything connects, so an unusable mode is a
+/// configuration error rather than a connection failure — and so the string
+/// pgschema is handed is one pgpushy has also understood.
+///
+/// The Postgres driver models three of these five and rejects `verify-ca` and
+/// `verify-full` outright, which is why pgpushy interprets the mode itself and
+/// [`crate::tls`] maps it to what the driver and the TLS stack each need.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SslMode {
+    Disable,
+    Prefer,
+    Require,
+    VerifyCa,
+    VerifyFull,
+}
+
+impl SslMode {
+    /// Interpret an environment's `sslmode`.
+    ///
+    /// Spelled exactly as libpq spells it, because pgschema compares the same
+    /// way: accepting a spelling pgschema would reject would produce a run that
+    /// inspects the target and then cannot delegate.
+    fn parse(value: &str, env: &str) -> Result<Self> {
+        match value {
+            "disable" => Ok(Self::Disable),
+            "prefer" => Ok(Self::Prefer),
+            "require" => Ok(Self::Require),
+            "verify-ca" => Ok(Self::VerifyCa),
+            "verify-full" => Ok(Self::VerifyFull),
+            other => bail!(
+                "[env.{env}]: sslmode = {other:?} is not a mode pgpushy understands\n\
+                 \n\
+                 Write one of: disable, prefer, require, verify-ca, verify-full — \
+                 lower case, as libpq spells them.\n\
+                 require encrypts without checking the target's certificate; \
+                 verify-ca additionally checks that the certificate chains to a \
+                 trusted authority; verify-full also checks that it was issued for \
+                 the host being connected to."
+            ),
+        }
+    }
+
+    /// The spelling pgschema is handed, which is the one that was written.
+    ///
+    /// pgschema implements all five itself, so the mode crosses to it unchanged
+    /// rather than reduced to whatever pgpushy's own driver could express.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disable => "disable",
+            Self::Prefer => "prefer",
+            Self::Require => "require",
+            Self::VerifyCa => "verify-ca",
+            Self::VerifyFull => "verify-full",
+        }
+    }
 }
 
 /// Environment variables libpq and pgx read, which must not reach the child
@@ -165,13 +227,13 @@ impl Resolved {
         }
 
         let from_env = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
-        Ok(Self::build(
+        Self::build(
             target,
             from_env("PGPASSWORD"),
             // A separate variable, because the plan database is a separate
             // server with separate credentials (spec §10.4).
             from_env("PGPUSHY_PLAN_PASSWORD"),
-        ))
+        )
     }
 
     /// The resolution itself, with the environment's contribution passed in.
@@ -179,7 +241,11 @@ impl Resolved {
     /// Split out from [`Resolved::from`] so it can be tested without mutating
     /// the process environment — which `forbid(unsafe_code)` rules out anyway,
     /// and which would make these tests order-dependent besides.
-    fn build(target: &Target, env_password: Option<String>, plan_password: Option<String>) -> Self {
+    fn build(
+        target: &Target,
+        env_password: Option<String>,
+        plan_password: Option<String>,
+    ) -> Result<Self> {
         let (password, password_source) = match env_password {
             Some(password) => (Some(password), PasswordSource::Environment),
             None => match target.password.clone() {
@@ -188,7 +254,7 @@ impl Resolved {
             },
         };
 
-        Self {
+        Ok(Self {
             env: target.name.clone(),
             host: target.host.clone(),
             port: target.port,
@@ -196,28 +262,36 @@ impl Resolved {
             user: target.user.clone(),
             password,
             password_source,
-            sslmode: target.sslmode.clone(),
+            sslmode: SslMode::parse(&target.sslmode, &target.name)?,
             plan_db: target
                 .plan_db
                 .as_ref()
                 .map(|plan| PlanConnection::from(plan, plan_password)),
             lock_timeout: target.lock_timeout.clone(),
-        }
+        })
     }
 
-    /// A libpq-style connection string for pgpushy's own driver.
-    pub fn conninfo(&self) -> String {
-        let mut parts = vec![
-            format!("host={}", quote(&self.host)),
-            format!("port={}", self.port),
-            format!("dbname={}", quote(&self.dbname)),
-            format!("user={}", quote(&self.user)),
-            format!("sslmode={}", quote(&self.sslmode)),
-        ];
+    /// The driver configuration for pgpushy's own connection.
+    ///
+    /// Built field by field rather than from a connection string, because a
+    /// string is parsed by the driver — whose `sslmode` grammar covers three of
+    /// the five modes and hard-errors on the other two. The round trip would
+    /// hand the driver back the one setting spec §6.4 gives to pgpushy.
+    ///
+    /// This carries the mode's fallback half; its verification half is the
+    /// connector [`crate::tls::connector`] returns for the same mode.
+    pub fn pg_config(&self) -> postgres::Config {
+        let mut config = postgres::Config::new();
+        config
+            .host(&self.host)
+            .port(self.port)
+            .dbname(&self.dbname)
+            .user(&self.user)
+            .ssl_mode(Security::for_mode(self.sslmode).fallback);
         if let Some(password) = &self.password {
-            parts.push(format!("password={}", quote(password)));
+            config.password(password);
         }
-        parts.join(" ")
+        config
     }
 
     /// The flags to hand pgschema, so it resolves nothing for itself.
@@ -232,7 +306,7 @@ impl Resolved {
             "--user".into(),
             self.user.clone(),
             "--sslmode".into(),
-            self.sslmode.clone(),
+            self.sslmode.as_str().to_owned(),
         ];
         if let Some(plan) = &self.plan_db {
             flags.extend(plan.flags());
@@ -263,6 +337,7 @@ impl Resolved {
         {
             command.env("PGSCHEMA_PLAN_PASSWORD", password);
         }
+        absolutise_certificate_paths(command);
     }
 
     /// How the target is named in output, without the password.
@@ -271,13 +346,24 @@ impl Resolved {
     }
 }
 
-/// Quote a conninfo value if it contains anything that would break parsing.
-fn quote(value: &str) -> String {
-    if value.is_empty() || value.contains([' ', '\'', '\\']) {
-        let escaped = value.replace('\\', r"\\").replace('\'', r"\'");
-        format!("'{escaped}'")
-    } else {
-        value.to_owned()
+/// Make the certificate-path variables mean the same thing to both connections.
+///
+/// pgpushy and pgschema each build their own TLS trust from `SSL_CERT_FILE` and
+/// `SSL_CERT_DIR`, and both read them from the environment. pgpushy resolves a
+/// relative one against the operator's working directory, while pgschema runs
+/// in a directory pgpushy chooses — so the same relative path would name two
+/// different files, and pgpushy would verify a certificate pgschema then
+/// rejects. Spec §6.3 requires that divergence to be impossible by
+/// construction rather than diagnosed afterwards, so the child is handed the
+/// path pgpushy itself resolved.
+fn absolutise_certificate_paths(command: &mut std::process::Command) {
+    for var in ["SSL_CERT_FILE", "SSL_CERT_DIR"] {
+        let Ok(value) = std::env::var(var) else {
+            continue;
+        };
+        if let Ok(absolute) = std::path::absolute(&value) {
+            command.env(var, absolute);
+        }
     }
 }
 
@@ -299,13 +385,36 @@ mod tests {
         }
     }
 
+    /// Everything pgpushy's own driver needs, set on the config rather than
+    /// spelled into a string the driver would have to parse back.
     #[test]
-    fn renders_a_conninfo_string() {
-        let resolved = Resolved::build(&target(), None, None);
+    fn builds_the_drivers_configuration_from_the_resolved_target() {
+        let config = Resolved::build(&target(), None, None).unwrap().pg_config();
         assert_eq!(
-            resolved.conninfo(),
-            "host=db.example port=6543 dbname=shop user=joe sslmode=require password=s3cret",
+            config.get_hosts(),
+            [postgres::config::Host::Tcp("db.example".to_owned())]
         );
+        assert_eq!(config.get_ports(), [6543]);
+        assert_eq!(config.get_dbname(), Some("shop"));
+        assert_eq!(config.get_user(), Some("joe"));
+        assert_eq!(config.get_password(), Some(b"s3cret".as_slice()));
+        assert_eq!(config.get_ssl_mode(), postgres::config::SslMode::Require);
+    }
+
+    /// The driver has no mode for the verifying two, so they reach it as
+    /// `require` — mandatory encryption — and [`crate::tls`] adds the checking.
+    #[test]
+    fn the_verifying_modes_reach_the_driver_as_require() {
+        for mode in ["verify-ca", "verify-full"] {
+            let mut target = target();
+            target.sslmode = mode.into();
+            let resolved = Resolved::build(&target, None, None).unwrap();
+            assert_eq!(
+                resolved.pg_config().get_ssl_mode(),
+                postgres::config::SslMode::Require,
+                "sslmode={mode}",
+            );
+        }
     }
 
     /// Every parameter pgpushy resolved is passed on, so pgschema has nothing
@@ -313,6 +422,7 @@ mod tests {
     #[test]
     fn forwards_every_parameter_to_pgschema() {
         let flags = Resolved::build(&target(), None, None)
+            .unwrap()
             .pgschema_flags()
             .join(" ");
         assert_eq!(
@@ -325,9 +435,47 @@ mod tests {
         );
     }
 
+    /// All five modes resolve (spec §6.4), and each crosses to pgschema as the
+    /// word that was written: pgschema implements all five, so nothing here has
+    /// to be reduced to what pgpushy's own driver can express.
+    #[test]
+    fn every_mode_the_spec_lists_resolves_and_reaches_pgschema_unchanged() {
+        for mode in ["disable", "prefer", "require", "verify-ca", "verify-full"] {
+            let mut target = target();
+            target.sslmode = mode.into();
+            let resolved = Resolved::build(&target, None, None)
+                .unwrap_or_else(|error| panic!("sslmode={mode} should resolve: {error}"));
+
+            assert_eq!(resolved.sslmode.as_str(), mode);
+            let flags = resolved.pgschema_flags();
+            let position = flags
+                .iter()
+                .position(|flag| flag == "--sslmode")
+                .expect("--sslmode is always passed");
+            assert_eq!(flags[position + 1], mode);
+        }
+    }
+
+    /// An unusable mode fails at resolution, before pgpushy has connected to
+    /// anything — and the message says what may be written instead (spec §6.4).
+    #[test]
+    fn an_unrecognized_mode_is_refused_and_lists_all_five() {
+        let mut target = target();
+        target.sslmode = "verify_full".into();
+        let error = Resolved::build(&target, None, None)
+            .expect_err("verify_full is not a libpq spelling")
+            .to_string();
+
+        assert!(error.contains("verify_full"), "{error}");
+        assert!(error.contains("[env.prod]"), "{error}");
+        for mode in ["disable", "prefer", "require", "verify-ca", "verify-full"] {
+            assert!(error.contains(mode), "{mode} is not named: {error}");
+        }
+    }
+
     #[test]
     fn the_environments_password_is_used_when_nothing_overrides_it() {
-        let resolved = Resolved::build(&target(), None, None);
+        let resolved = Resolved::build(&target(), None, None).unwrap();
         assert_eq!(resolved.password.as_deref(), Some("s3cret"));
         assert_eq!(resolved.password_source, PasswordSource::File);
     }
@@ -336,7 +484,7 @@ mod tests {
     /// environment wins — and there is then nothing to warn about.
     #[test]
     fn pgpassword_overrides_the_environments_password() {
-        let resolved = Resolved::build(&target(), Some("from-env".into()), None);
+        let resolved = Resolved::build(&target(), Some("from-env".into()), None).unwrap();
         assert_eq!(resolved.password.as_deref(), Some("from-env"));
         assert_eq!(resolved.password_source, PasswordSource::Environment);
     }
@@ -345,23 +493,15 @@ mod tests {
     fn no_password_anywhere_is_not_an_error() {
         let mut target = target();
         target.password = None;
-        let resolved = Resolved::build(&target, None, None);
+        let resolved = Resolved::build(&target, None, None).unwrap();
         assert!(resolved.password.is_none());
         assert_eq!(resolved.password_source, PasswordSource::None);
     }
 
     #[test]
     fn describes_the_target_without_the_password() {
-        let described = Resolved::build(&target(), None, None).describe();
+        let described = Resolved::build(&target(), None, None).unwrap().describe();
         assert_eq!(described, "joe@db.example:6543/shop");
         assert!(!described.contains("s3cret"));
-    }
-
-    #[test]
-    fn quotes_values_that_would_break_conninfo_parsing() {
-        assert_eq!(quote("simple"), "simple");
-        assert_eq!(quote("with space"), "'with space'");
-        assert_eq!(quote("it's"), r"'it\'s'");
-        assert_eq!(quote(""), "''");
     }
 }

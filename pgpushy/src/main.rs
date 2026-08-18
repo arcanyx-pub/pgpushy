@@ -13,17 +13,17 @@ mod discovery;
 mod hazard;
 mod init;
 mod inspect;
+mod outdir;
 mod output;
 mod pgschema;
 mod plan_file;
 mod provider;
 mod report;
 mod run;
+mod tls;
 
-use anyhow::{Context, Result};
 use clap::Parser;
 use cli::{Cli, Command};
-use std::io::Write;
 
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
@@ -93,21 +93,4 @@ error: {err:#}"
             std::process::ExitCode::FAILURE
         }
     }
-}
-
-/// Write the desired state somewhere pgschema can read it.
-///
-/// A temporary file rather than a pipe because pgschema takes a `--file` path,
-/// and the same document is handed to every per-schema run (spec §5.4) — so it
-/// is written once and the handle outlives the loop.
-pub fn tempfile_for(contents: &str) -> Result<tempfile::NamedTempFile> {
-    let mut file = tempfile::Builder::new()
-        .prefix("pgpushy-desired-")
-        .suffix(".sql")
-        .tempfile()
-        .context("creating a temporary file for the desired state")?;
-    file.write_all(contents.as_bytes())
-        .context("writing the desired state to a temporary file")?;
-    file.flush().context("flushing the desired state")?;
-    Ok(file)
 }

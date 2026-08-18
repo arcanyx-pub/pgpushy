@@ -81,8 +81,8 @@ pub enum Command {
     /// Show what would change, one plan per managed schema.
     ///
     /// Read-only: pgschema reads the target and builds its comparison model in
-    /// a separate plan database, and pgpushy's own inspection is a single
-    /// read-only query. Nothing here modifies the target.
+    /// a separate plan database, and every statement pgpushy's own inspection
+    /// issues is read-only. Nothing here modifies the target.
     Plan {
         #[command(flatten)]
         target: TargetArgs,
