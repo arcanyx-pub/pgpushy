@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Integration tests that need a target database or a pgschema binary
+      # skip without PGPUSHY_TEST_PG_URL / PGPUSHY_TEST_PGSCHEMA; the
+      # `integration` job below supplies both.
+      - run: cargo test --workspace --all-features
+
+  integration:
+    name: Integration (pgschema ${{ matrix.pgschema }}, Postgres ${{ matrix.postgres }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both ends of this list are load-bearing (spec §13). The lowest is
+        # the supported floor, so `MIN_PGSCHEMA` must equal it; the highest is
+        # what the managed backend downloads, so `PINNED_PGSCHEMA` must equal
+        # that. Changing either constant without changing this matrix makes
+        # one of them a claim nothing tests.
+        pgschema: ["1.12.0", "1.12.3"]
+        postgres: ["18"]
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      PGPUSHY_TEST_PG_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # This job already has network, so it is where the managed backend's
+      # real download is exercised. Ordinary `cargo test` must not fetch
+      # ~19 MB from GitHub, so those tests are opt-in everywhere else.
+      PGPUSHY_TEST_DOWNLOAD: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Fetch pgschema
+        run: |
+          set -euo pipefail
+          ver="${{ matrix.pgschema }}"
+          url="https://github.com/pgplex/pgschema/releases/download/v${ver}/pgschema-${ver}-linux-amd64"
+          curl -fsSL "$url" -o /usr/local/bin/pgschema
+          chmod +x /usr/local/bin/pgschema
+          echo "PGPUSHY_TEST_PGSCHEMA=/usr/local/bin/pgschema" >> "$GITHUB_ENV"
+      - run: cargo test --workspace --all-features
+
+  lint:
+    name: Rustfmt & Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  doc:
+    name: Docs
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --workspace --all-features --no-deps
+
+  msrv:
+    name: MSRV (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-features

@@ -1,0 +1,10 @@
+[workspace]
+resolver = "3"
+members = ["pgpushy-core", "pgpushy"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+repository = "https://github.com/arcanyx-pub/pgpushy"

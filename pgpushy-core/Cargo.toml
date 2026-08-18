@@ -1,0 +1,20 @@
+[package]
+name = "pgpushy-core"
+description = "Order-free desired-state synthesis for pgpushy: parse a tree of Postgres DDL, lift foreign keys, qualify every identifier, and emit one deterministic desired-state document per schema"
+readme = "../README.md"
+keywords = ["postgres", "schema", "migration", "declarative", "pgschema"]
+categories = ["database"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+pg_query = "6"
+# The AST is searched for object names inside string literals by serializing
+# it: pg_query's own node walk does not descend into every field. See
+# `literal.rs`. No IO — this crate stays pure.
+serde_json = "1"
+thiserror = "2"
+
