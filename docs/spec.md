@@ -182,7 +182,7 @@ following statements:
 | `CREATE TABLE` (with inline constraints) | 3, FKs lifted to 5 |
 | `CREATE [UNIQUE] INDEX` | 4 |
 | `ALTER TABLE … ADD CONSTRAINT` — foreign key | 5 |
-| `COMMENT ON` an object of the kinds above | 6 |
+| `COMMENT ON` a schema, table, column, index, table constraint or sequence | 6 |
 
 Any other statement MUST be a hard error naming the file, the line, and the
 statement kind, and directing the reader to §14 for the object kinds under
@@ -249,6 +249,12 @@ same reason the allow-list exists at all:
   sequence does not survive a dump-and-reapply (verified against pgschema
   1.12.0 — the standalone sequence is dropped and an owned one created in its
   place). An owned sequence is spelled `serial` or `GENERATED … AS IDENTITY`.
+- **`COMMENT ON` a type or a domain** MUST be rejected, though a comment on a
+  sequence is accepted. pgschema generates no DDL for either: verified against
+  pgschema 1.12.3 by applying and re-planning, it emits the sequence's comment,
+  omits the other two, applies everything else, and then reports no changes —
+  so the comment never reaches the target and nothing ever says so. A comment
+  that silently does not exist is worse than one that is refused (§12.9).
 - A **default calling `nextval`** — on a column or on a domain — MUST be
   rejected. pgschema models any such default as `SERIAL`: verified against
   pgschema 1.12.0, applying `CREATE SEQUENCE s` together with a column
@@ -1273,6 +1279,14 @@ parameters, and idempotent afterwards (verified). That covers a sequence drawn
 from by application code, which is the common reason to declare one; it does
 not cover using a shared sequence as a column default, for which `serial` or
 `GENERATED … AS IDENTITY` is the supported spelling.
+
+### 12.9 A type or a domain cannot be commented
+
+pgschema drops `COMMENT ON TYPE` and `COMMENT ON DOMAIN` without applying them
+and without reporting it — the surrounding statements apply, the plan
+afterwards is empty, and the comment simply is not there. §4.3 rejects both
+rather than letting a comment quietly not exist. `COMMENT ON SEQUENCE` is
+unaffected and is managed normally (verified).
 
 ## 13. Dependencies and Compatibility
 

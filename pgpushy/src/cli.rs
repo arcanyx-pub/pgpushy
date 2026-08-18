@@ -73,7 +73,8 @@ pub enum Command {
     /// a CI job with no database available. Takes no `--env`, because it has
     /// no target.
     Validate {
-        /// Write the synthesized desired state to a file.
+        /// Write the synthesized desired state into a directory, one
+        /// `<schema>.sql` per managed schema.
         #[arg(long, value_name = "PATH")]
         out: Option<PathBuf>,
     },
@@ -90,7 +91,8 @@ pub enum Command {
         #[command(flatten)]
         pgschema: PgschemaArgs,
 
-        /// Write the synthesized desired state to a file.
+        /// Write the synthesized desired state into a directory, one
+        /// `<schema>.sql` per managed schema.
         #[arg(long, value_name = "PATH")]
         out: Option<PathBuf>,
     },
@@ -108,7 +110,8 @@ pub enum Command {
         #[command(flatten)]
         pgschema: PgschemaArgs,
 
-        /// Write the synthesized desired state to a file.
+        /// Write the synthesized desired state into a directory, one
+        /// `<schema>.sql` per managed schema.
         #[arg(long, value_name = "PATH")]
         out: Option<PathBuf>,
 

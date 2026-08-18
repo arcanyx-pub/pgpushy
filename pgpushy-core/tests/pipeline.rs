@@ -1069,3 +1069,63 @@ fn a_name_literal_is_dequalified_in_its_own_document_only() {
         "every other document must keep it:\n{billing}"
     );
 }
+
+/// Spec §4.3: a comment may name any object kind pgpushy manages, which after
+/// types, domains and sequences joined the allow-list means those too.
+#[test]
+fn comments_reach_every_managed_object_kind() {
+    let analysis = ok(vec![file(
+        "t.sql",
+        "CREATE TYPE mood AS ENUM ('ok');
+         CREATE DOMAIN zip AS text;
+         CREATE SEQUENCE ticket_no;
+         CREATE TABLE t (id int PRIMARY KEY, how mood);
+         CREATE INDEX t_how_idx ON t (how);
+         COMMENT ON SCHEMA public IS 'the default';
+         COMMENT ON SEQUENCE ticket_no IS 'shared counter';
+         COMMENT ON TABLE t IS 'one per thing';
+         COMMENT ON COLUMN t.id IS 'the key';
+         COMMENT ON INDEX t_how_idx IS 'for the mood lookup';",
+    )]);
+
+    let body = body(&analysis);
+    // Every one is qualified, like every other emitted identifier (§5.4).
+    for expected in [
+        "COMMENT ON SEQUENCE public.ticket_no IS 'shared counter'",
+        "COMMENT ON TABLE public.t IS 'one per thing'",
+        "COMMENT ON COLUMN public.t.id IS 'the key'",
+        "COMMENT ON INDEX public.t_how_idx IS 'for the mood lookup'",
+        "COMMENT ON SCHEMA public IS 'the default'",
+    ] {
+        assert!(body.contains(expected), "missing {expected:?} in:\n{body}");
+    }
+    assert_eq!(analysis.counts.comments, 5);
+}
+
+/// A comment on a kind pgpushy does not manage still says so.
+#[test]
+fn rejects_a_comment_on_an_unmanaged_object_kind() {
+    let diagnostics = err(vec![file(
+        "t.sql",
+        "CREATE TABLE t (id int);\nCOMMENT ON COLLATION \"C\" IS 'nope';",
+    )]);
+    only(&diagnostics, DiagnosticKind::UnsupportedStatement);
+}
+
+/// Verified against pgschema 1.12.3: it generates no DDL for a comment on a
+/// type or a domain, applies everything else, and then reports no changes — so
+/// the comment never lands and nothing says so. Refusing beats vanishing.
+#[test]
+fn rejects_comments_on_types_and_domains() {
+    for sql in [
+        "CREATE TYPE mood AS ENUM ('ok');\nCOMMENT ON TYPE public.mood IS 'x';",
+        "CREATE DOMAIN zip AS text;\nCOMMENT ON DOMAIN public.zip IS 'x';",
+    ] {
+        let diagnostics = err(vec![file("t.sql", sql)]);
+        let diagnostic = only(&diagnostics, DiagnosticKind::UnsupportedStatement);
+        assert!(
+            diagnostic.to_string().contains("without reporting it"),
+            "{diagnostic}"
+        );
+    }
+}

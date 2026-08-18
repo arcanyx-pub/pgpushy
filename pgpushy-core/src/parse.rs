@@ -627,15 +627,35 @@ fn classify_comment(
         CommentTarget::Constraint
     } else if objtype == ObjectType::ObjectSchema as i32 {
         CommentTarget::Schema
+    } else if objtype == ObjectType::ObjectType as i32 || objtype == ObjectType::ObjectDomain as i32
+    {
+        // Verified against pgschema 1.12.3 by applying and re-planning:
+        // pgschema generates no DDL for either, applies the rest, and then
+        // reports no changes — so the comment never reaches the database and
+        // nothing ever says so. A comment that silently does not exist is
+        // worse than one that is refused (spec §4.3, §12.9).
+        return Err(Diagnostic::new(
+            DiagnosticKind::UnsupportedStatement,
+            "COMMENT ON a type or a domain",
+            vec![origin.clone()],
+        )
+        .with_help(
+            "pgschema drops these without applying them and without reporting it, so the \
+             comment would never appear on the target; describe the type in the source \
+             file instead (spec §12.9)",
+        ));
+    } else if objtype == ObjectType::ObjectSequence as i32 {
+        CommentTarget::Sequence
     } else {
-        return Err(
-            Diagnostic::new(
-                DiagnosticKind::UnsupportedStatement,
-                "COMMENT ON an object kind pgpushy does not manage",
-                vec![origin.clone()],
-            )
-            .with_help("pgpushy 0.x manages comments on schemas, tables, columns, indexes and table constraints"),
-        );
+        return Err(Diagnostic::new(
+            DiagnosticKind::UnsupportedStatement,
+            "COMMENT ON an object kind pgpushy does not manage",
+            vec![origin.clone()],
+        )
+        .with_help(
+            "pgpushy 0.1 manages comments on schemas, tables, columns, indexes, table \
+             constraints and sequences",
+        ));
     };
 
     let mut ast = stmt.clone();
@@ -648,11 +668,11 @@ fn classify_comment(
     // COLUMN takes (table, column) or (schema, table, column), and so on.
     let (schema, target) = match (kind, parts.len()) {
         (CommentTarget::Schema, 1) => (SchemaName::new(&parts[0]), parts[0].clone()),
-        (CommentTarget::Table | CommentTarget::Index, 1) => (
+        (CommentTarget::Table | CommentTarget::Index | CommentTarget::Sequence, 1) => (
             default_schema.clone(),
             format!("{default_schema}.{}", parts[0]),
         ),
-        (CommentTarget::Table | CommentTarget::Index, 2) => {
+        (CommentTarget::Table | CommentTarget::Index | CommentTarget::Sequence, 2) => {
             (SchemaName::new(&parts[0]), parts.join("."))
         }
         (CommentTarget::Column | CommentTarget::Constraint, 2) => (
@@ -689,6 +709,7 @@ enum CommentTarget {
     Column,
     Index,
     Constraint,
+    Sequence,
 }
 
 impl CommentTarget {
@@ -699,13 +720,14 @@ impl CommentTarget {
             Self::Column => "COLUMN",
             Self::Index => "INDEX",
             Self::Constraint => "CONSTRAINT",
+            Self::Sequence => "SEQUENCE",
         }
     }
 
     /// How many trailing parts are the object itself rather than its schema.
     fn unqualified_len(self) -> usize {
         match self {
-            Self::Schema | Self::Table | Self::Index => 1,
+            Self::Schema | Self::Table | Self::Index | Self::Sequence => 1,
             Self::Column | Self::Constraint => 2,
         }
     }
@@ -816,6 +838,13 @@ fn comment_object_parts(stmt: &CommentStmt) -> Option<Vec<String>> {
             let parts = string_list(&list.items);
             (parts.len() == list.items.len()).then_some(parts)
         }
+        // `COMMENT ON TYPE` and `COMMENT ON DOMAIN` name their object with a
+        // `TypeName` rather than a plain list, since either could name an
+        // array or a parameterised type.
+        NodeEnum::TypeName(type_name) => {
+            let parts = string_list(&type_name.names);
+            (parts.len() == type_name.names.len()).then_some(parts)
+        }
         NodeEnum::String(s) => Some(vec![s.sval.clone()]),
         _ => None,
     }
@@ -823,11 +852,13 @@ fn comment_object_parts(stmt: &CommentStmt) -> Option<Vec<String>> {
 
 /// Prepend the resolved schema to a comment's target if it lacks one.
 fn qualify_comment_object(stmt: &mut CommentStmt, kind: CommentTarget, schema: &SchemaName) {
-    let Some(NodeEnum::List(list)) = stmt.object.as_mut().and_then(|o| o.node.as_mut()) else {
-        return;
+    let items = match stmt.object.as_mut().and_then(|o| o.node.as_mut()) {
+        Some(NodeEnum::List(list)) => &mut list.items,
+        Some(NodeEnum::TypeName(type_name)) => &mut type_name.names,
+        _ => return,
     };
-    if list.items.len() == kind.unqualified_len() {
-        list.items.insert(0, string_node(schema.as_str()));
+    if items.len() == kind.unqualified_len() {
+        items.insert(0, string_node(schema.as_str()));
     }
 }
 
