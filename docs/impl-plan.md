@@ -111,6 +111,45 @@ commands are in [Appendix A](#appendix-a-reproduction-harness).
 - pgschema has its own `.pgschemaignore` (for target objects) — unrelated to
   pgpushy's `exclude` (source files), but worth not confusing.
 
+**Verified while spiking W1/W4 (2026-08-16)**
+- **`--lock-timeout` is apply-only.** `plan` rejects it: `unknown flag`.
+- **pgschema reconciles privileges by default.** A desired state that mentions
+  no grants reads as "there should be none", and pgschema plans `REVOKE` for
+  every grant on the target, plus `ALTER DEFAULT PRIVILEGES … REVOKE`. This is
+  the §4.4 hazard in a different costume, and is why pgpushy writes a
+  `.pgschemaignore` until grants are a managed kind.
+- **`.pgschemaignore` is TOML, auto-loaded from pgschema's working directory**,
+  with no flag to point at it. Sections include `[privileges]` and
+  `[default_privileges]`; `patterns = ["*"]` suppresses a kind entirely.
+  Because it is ambient, pgpushy runs pgschema in a directory it owns.
+- **Grants need their roles to exist in the plan database.** The embedded one
+  fails with `role "x" does not exist`. Roles are **cluster-wide**, so an
+  external plan database on the *same cluster* as the target has them — which
+  is what makes W4 workable at all.
+- **An external plan database accumulates state across runs.** After a few
+  spikes ours held seven leftover schemas, and stale objects made a *broken*
+  desired state appear to work. It must be genuinely disposable; a spike that
+  reuses one is not measuring what it thinks it is.
+- **pgschema strips schema qualifiers from identifiers but not from string
+  literals.** `CREATE SEQUENCE w1.s` becomes `CREATE SEQUENCE s` in the scratch
+  schema, while `nextval('w1.s')` keeps its qualifier and then cannot resolve.
+  `pg_dump` emits exactly that form (`nextval('s.seq'::regclass)`), so real
+  source trees hit it immediately.
+- **No single document satisfies every schema's run** once sequences are in
+  scope: a same-schema `nextval` must be unqualified for its own run and
+  qualified for every other. And a cross-schema reference *into* the target
+  schema is unresolvable outright, because the target's objects live in a
+  scratch schema whose name is unpredictable. → **per-schema documents trimmed
+  to the closure** (spec §5.4), verified working.
+- **pgschema's canonical order** (from `dump`): TYPE → DOMAIN → SEQUENCE →
+  TABLE. An **owned** sequence renders as `SERIAL` on its column and does not
+  appear as its own object; a **standalone** one does.
+- **`ALTER DEFAULT PRIVILEGES` requires `IN SCHEMA`**, so every such statement
+  names its own schema — which answers the "how does a grant attribute to a
+  schema" question W4 was blocked on.
+- Grants and ADP **attribute correctly per `--schema`**: a run for one schema
+  plans only that schema's privileges.
+
 **Release/distribution facts (for the provider, §7)**
 - Assets are **standalone per-platform binaries**: `pgschema-<ver>-{darwin,
   linux}-{amd64,arm64}` (~18 MB static Go), plus `.deb`/`.rpm`. **No Windows
@@ -549,16 +588,30 @@ tested end to end, so every one added early is code resting on unverified
 assumptions. Once M3 lands, each kind below gets a real regression test the day
 it is written.
 
+- **W0 — Per-schema trimmed synthesis.** *Prerequisite for W1, discovered by
+  spiking it.* `synthesize` becomes per-target-schema: the target schema's
+  objects plus the transitive closure of what they reference elsewhere, with
+  string-literal references (`nextval`) unqualified for the target schema and
+  qualified for the rest. `--out` becomes a directory of one file per schema
+  (decided 2026-08-16). Also unblocks W3, where views need the same thing.
 - **W1 — Sequences, types, domains.** Structured names, no bodies. Category
-  additions: types and domains before tables, sequences alongside.
+  order is pgschema's own: types and domains before sequences before tables.
+  Owned sequences are part of their column (`SERIAL`) rather than separate
+  objects, so only standalone ones get their own entry.
 - **W2 — Functions, procedures, aggregates, triggers, policies.** Qualify the
   name, pass the body through. Spike `BEGIN ATOMIC` first.
 - **W3 — Views and materialized views.** The real work: bodies are resolved at
   creation, and views need a topological sort within their category. Spike the
   per-schema-document question before writing an AST-walking qualifier — it may
   remove the need entirely (spec §14).
-- **W4 — `GRANT`/`REVOKE`, `ALTER DEFAULT PRIVILEGES`.** Needs a decision on
-  how a grant attributes to the managed-schema set.
+- **W4 — `GRANT`/`REVOKE`, `ALTER DEFAULT PRIVILEGES`.** Attribution is
+  settled: `ALTER DEFAULT PRIVILEGES` requires `IN SCHEMA`, and a grant
+  attributes to the schema of the object granted on — both verified to plan
+  correctly per `--schema`. What remains is that grants need their roles in the
+  plan database, so pgpushy must **refuse with an explanation** when a source
+  tree grants and no plan database is configured (decided 2026-08-16), and an
+  `ignore_grants` setting must keep today's leave-them-alone behaviour
+  available as an explicit opt-out.
 
 - **Later (spec §14):** `pgpushy dump`; references into unmanaged schemas via
   external plan DB; cross-schema-cycle and single-pass-removal support;
