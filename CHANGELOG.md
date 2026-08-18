@@ -70,6 +70,12 @@ and [`docs/impl-plan.md`](docs/impl-plan.md) for the build plan.
   on every run rather than trusted for existing, and a mismatch is reported and
   replaced. `backend = "byo"` or naming a binary opts out — required on
   Windows and in air-gapped environments.
+- pgpushy no longer revokes privileges it does not manage. pgschema reads a
+  desired state that mentions no grants as a request to have none, and planned
+  `REVOKE` for every grant on the target; pgpushy now tells it to leave
+  privileges alone, the same way an unmentioned schema is left alone.
+- pgschema runs in a directory pgpushy owns, so a stray `.pgschemaignore` in
+  the operator's shell directory cannot silently change what gets reconciled.
 - A source tree with no managed schemas now says so rather than succeeding
   silently, and a `source_root` pointing at a file explains itself instead of
   failing with a bare "Not a directory".

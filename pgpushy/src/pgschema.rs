@@ -6,6 +6,13 @@
 //! let the user set: `--schema`, because it loops over the managed set;
 //! `--file` and `--plan`, because it supplies both; and `--auto-approve`,
 //! because approval happens once at the pgpushy level.
+//!
+//! pgpushy also owns the **working directory**. pgschema auto-loads a
+//! `.pgschemaignore` from wherever it is run, which is ambient state of exactly
+//! the kind §6.3 refuses for connections — a file in the operator's shell
+//! directory would silently change what gets reconciled. Running pgschema in a
+//! directory pgpushy controls makes that impossible, and gives pgpushy a place
+//! to put an ignore file it wrote deliberately.
 
 use crate::conn::Resolved;
 use crate::output::Output;
@@ -27,9 +34,10 @@ pub fn plan(
     schema: &SchemaName,
     file: &Path,
     json_out: &Path,
+    working_dir: &Path,
     output: Output,
 ) -> Result<bool> {
-    let mut command = base(binary, connection, "plan", schema, output);
+    let mut command = base(binary, connection, "plan", schema, working_dir, output);
     command.arg("--file").arg(file);
     command.arg("--output-human").arg("stdout");
     command.arg("--output-json").arg(json_out);
@@ -49,9 +57,10 @@ pub fn apply_plan(
     schema: &SchemaName,
     plan_file: &Path,
     lock_timeout: Option<&str>,
+    working_dir: &Path,
     output: Output,
 ) -> Result<bool> {
-    let mut command = base(binary, connection, "apply", schema, output);
+    let mut command = base(binary, connection, "apply", schema, working_dir, output);
     command.arg("--plan").arg(plan_file);
     // Approval already happened, once, for the whole database (spec §8.6).
     command.arg("--auto-approve");
@@ -67,9 +76,13 @@ fn base(
     connection: &Resolved,
     subcommand: &str,
     schema: &SchemaName,
+    working_dir: &Path,
     output: Output,
 ) -> Command {
     let mut command = Command::new(&binary.path);
+    // Never the operator's directory: see the module docs. Every path pgpushy
+    // passes is absolute, so this changes nothing else.
+    command.current_dir(working_dir);
     command.arg(subcommand);
     command.args(["--schema", schema.as_str()]);
     command.args(connection.pgschema_flags());
@@ -100,4 +113,29 @@ fn run(
         .status()
         .with_context(|| format!("running {} {subcommand}", binary.path.display()))?;
     Ok(status.success())
+}
+
+/// What pgschema must leave alone, written into the directory it runs in.
+///
+/// pgpushy 0.x does not manage privileges, and a desired state that mentions
+/// none is not a statement that there should be none — pgschema would read it
+/// that way and plan `REVOKE` for every grant on the target. Verified: without
+/// this, a target granting `SELECT, INSERT` to a role has both revoked.
+///
+/// This is the same hazard as an unmentioned schema in §4.4, and gets the same
+/// answer: what the source tree does not describe, pgpushy does not touch.
+pub fn write_ignore_file(directory: &Path) -> Result<()> {
+    std::fs::write(
+        directory.join(".pgschemaignore"),
+        "# Written by pgpushy. pgschema loads this from its working directory.\n\
+         #\n\
+         # pgpushy does not manage privileges, so it must not let their absence\n\
+         # from the desired state read as a request to revoke them.\n\
+         [privileges]\n\
+         patterns = [\"*\"]\n\
+         \n\
+         [default_privileges]\n\
+         patterns = [\"*\"]\n",
+    )
+    .with_context(|| format!("writing .pgschemaignore in {}", directory.display()))
 }

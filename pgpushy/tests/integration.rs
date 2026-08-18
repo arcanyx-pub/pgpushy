@@ -1245,3 +1245,106 @@ fn walk_for_file(root: &Path, name: &str) -> Option<PathBuf> {
     }
     None
 }
+
+// ---------------------------------------------------------------------------
+// Privileges pgpushy does not manage
+// ---------------------------------------------------------------------------
+
+/// pgpushy 0.x does not manage privileges, and a desired state that mentions
+/// none is not a statement that there should be none. Without the
+/// `.pgschemaignore` pgpushy writes, pgschema reads it that way and plans a
+/// `REVOKE` for every grant on the target — silently stripping permissions
+/// nobody asked it to touch.
+#[test]
+fn does_not_revoke_grants_it_does_not_manage() {
+    let target = require_target!();
+    let schema = unique_schema("grants");
+    let _schemas = Schemas::create(&target, std::slice::from_ref(&schema));
+
+    let role = format!("pgpushy_role_{}", std::process::id());
+    let mut client = target.client();
+    let _ = client.batch_execute(&format!("DROP ROLE IF EXISTS {role}"));
+    client
+        .batch_execute(&format!("CREATE ROLE {role}"))
+        .expect("create role");
+
+    let project = target.project(
+        &format!("default_schema = \"{schema}\""),
+        &[("t.sql", "CREATE TABLE t (id int PRIMARY KEY);".to_owned())],
+    );
+    project
+        .command("apply")
+        .arg("--auto-approve")
+        .assert()
+        .success();
+
+    // Grant outside pgpushy, the way a permissions tool or a DBA would.
+    let mut client = target.client();
+    client
+        .batch_execute(&format!(
+            "GRANT SELECT, INSERT ON {schema}.t TO {role};
+             ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} GRANT SELECT ON TABLES TO {role}"
+        ))
+        .expect("grant");
+
+    project
+        .command("plan")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("REVOKE").not())
+        .stdout(predicates::str::contains("No changes detected"));
+
+    let remaining: i64 = target
+        .client()
+        .query_one(
+            "SELECT count(*) FROM information_schema.role_table_grants
+             WHERE table_schema = $1 AND grantee = $2",
+            &[&schema, &role],
+        )
+        .expect("count grants")
+        .get(0);
+    assert_eq!(
+        remaining, 2,
+        "pgpushy must leave privileges it does not manage alone"
+    );
+
+    let mut client = target.client();
+    let _ = client.batch_execute(&format!("DROP OWNED BY {role}; DROP ROLE {role}"));
+}
+
+/// pgschema auto-loads `.pgschemaignore` from wherever it runs, which is
+/// ambient state of exactly the kind §6.3 refuses for connections. pgpushy runs
+/// it in a directory pgpushy owns, so a file in the operator's shell directory
+/// cannot silently change what gets reconciled.
+#[test]
+fn a_stray_pgschemaignore_cannot_change_what_is_reconciled() {
+    let target = require_target!();
+    let schema = unique_schema("stray");
+    let _schemas = Schemas::create(&target, std::slice::from_ref(&schema));
+
+    let project = target.project(
+        &format!("default_schema = \"{schema}\""),
+        &[("t.sql", "CREATE TABLE t (id int PRIMARY KEY);".to_owned())],
+    );
+    project
+        .command("apply")
+        .arg("--auto-approve")
+        .assert()
+        .success();
+
+    // Make the source differ, so ignoring tables would be visible as a
+    // *missing* change rather than an ambiguous "no changes".
+    project.write("t.sql", "CREATE TABLE t (id int PRIMARY KEY, added text);");
+    std::fs::write(
+        project.dir.path().join(".pgschemaignore"),
+        "[tables]\npatterns = [\"*\"]\n",
+    )
+    .expect("write stray ignore file");
+
+    project
+        .command("plan")
+        .current_dir(project.dir.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("to modify"));
+}

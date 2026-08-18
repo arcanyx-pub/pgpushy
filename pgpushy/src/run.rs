@@ -256,6 +256,10 @@ impl Session {
             .prefix("pgpushy-plans-")
             .tempdir()
             .context("creating a temporary directory for pgschema's plans")?;
+        // pgschema runs here, so this is also where its `.pgschemaignore`
+        // comes from — pgpushy's, not whatever is in the operator's shell
+        // directory.
+        pgschema::write_ignore_file(plan_dir.path())?;
 
         Ok(Opened::Session(Box::new(Self {
             analysis,
@@ -294,6 +298,7 @@ impl Session {
                 schema,
                 self.document.path(),
                 &json,
+                self.plan_dir.path(),
                 self.output,
             )?;
             if !ok {
@@ -342,6 +347,7 @@ impl Session {
                 schema,
                 &self.plan_path(index),
                 lock_timeout,
+                self.plan_dir.path(),
                 self.output,
             )?;
 
