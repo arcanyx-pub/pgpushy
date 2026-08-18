@@ -1277,10 +1277,21 @@ not cover using a shared sequence as a column default, for which `serial` or
 ## 13. Dependencies and Compatibility
 
 - **pgschema** — required at runtime, resolved through the provider (§8.5):
-  downloaded by the managed backend or supplied by the operator (BYO). The
-  minimum supported version is **the version pgpushy is tested against** —
-  currently **v1.12.0** — expressed as a `>=` floor that tracks pgpushy's CI
-  matrix and rises as newer releases are tested; newer-than-floor is accepted.
+  downloaded by the managed backend or supplied by the operator (BYO).
+
+  Two versions matter, and they are **not** the same number. The **floor** is
+  the oldest version pgpushy is tested against — currently **v1.12.0** —
+  expressed as a `>=` requirement; newer is accepted. The **pin** is the
+  newest version pgpushy is tested against — currently **v1.12.3** — and is
+  what the managed backend downloads. Both ends MUST appear in pgpushy's CI
+  matrix, or one of them is a claim nothing tests.
+
+  Keeping them apart answers two different questions. An operator who brings
+  their own binary should not be made to upgrade because pgpushy prefers a
+  newer release; an operator who lets pgpushy fetch one should get the most
+  fixed release that has actually been tested. Collapsing them forces one of
+  those two to lose.
+
   The floor is not overridable: a below-floor binary is a hard error, and the
   remedy is to upgrade pgschema or use the managed backend. The relied-upon
   behavior (foreign-key deferral, deterministic cycle-breaking, PR #156) is
@@ -1431,8 +1442,12 @@ made after draft 2 of v0.1.
   read-only inspection. It resolves every connection parameter itself and
   passes them explicitly to pgschema, making divergent resolution impossible
   by construction rather than detecting it afterwards. (§6.3, §6.4, §13)
-- **pgschema version & resolution** — floor is the tested version
-  (`>= v1.12.0` today), tracking pgpushy's CI matrix, **not overridable**.
+- **pgschema version & resolution** — **[0.4]** the floor and the pin are
+  separate numbers: the floor is the *oldest* tested version (`>= v1.12.0`
+  today) and the pin is the *newest* (`v1.12.3`), with both ends in the CI
+  matrix. A BYO operator is not made to upgrade for a release pgpushy merely
+  prefers, and a managed one gets the most fixed release that was tested. The
+  floor tracks pgpushy's CI matrix and is **not overridable**.
   pgpushy resolves the binary through a provider: managed download (intended
   default, pinned + SHA-256-verified) with a permanent BYO override that
   parses `pgschema --help` and enforces the floor. The plan was for the first

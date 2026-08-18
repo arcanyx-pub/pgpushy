@@ -26,12 +26,16 @@ use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-/// The pgschema version pgpushy pins by default.
+/// The pgschema version pgpushy downloads by default.
 ///
-/// The same version §13 makes the floor, and for the same reason: it is what
-/// CI tests against. Bumping this, `MIN_PGSCHEMA`, and the CI matrix is one
-/// action, not three.
-pub const PINNED_PGSCHEMA: &str = MIN_PGSCHEMA;
+/// The **newest** version CI tests, where `MIN_PGSCHEMA` is the **oldest**.
+/// They are separate numbers because they answer different questions: an
+/// operator who brings their own binary should not be forced to upgrade for
+/// a release pgpushy merely prefers, while an operator who lets pgpushy fetch
+/// one should get the most fixed version that has been tested. Both ends of
+/// the CI matrix move with these constants, or the floor is a lie in one
+/// direction and the pin is untested in the other.
+pub const PINNED_PGSCHEMA: &str = "1.12.3";
 
 /// SHA-256 of each release asset pgpushy pins, as `(version, platform, hash)`.
 ///
@@ -42,6 +46,26 @@ pub const PINNED_PGSCHEMA: &str = MIN_PGSCHEMA;
 /// Adding a version means adding four rows — one per platform — verified by
 /// downloading each asset and hashing it, not by copying from anywhere.
 const HASHES: &[(&str, &str, &str)] = &[
+    (
+        "1.12.3",
+        "linux-amd64",
+        "d7729340f0f689254e4d3a4e9aa86f11beaaf5ffcdb93366600ae7ba6c4a630d",
+    ),
+    (
+        "1.12.3",
+        "linux-arm64",
+        "b99f5abdda39e6c15f7bbfd83136d8422e835818070e0ca192a88a91da026df1",
+    ),
+    (
+        "1.12.3",
+        "darwin-amd64",
+        "23ceff6287d1d18061defb61b667466d6cbcbe8cb1abd9fa4740cab7e4a43c6b",
+    ),
+    (
+        "1.12.3",
+        "darwin-arm64",
+        "1328eff0ac6695c27f96065001344ead10cdbe01c807a8bbcf7689ed97a3cf6c",
+    ),
     (
         "1.12.0",
         "linux-amd64",

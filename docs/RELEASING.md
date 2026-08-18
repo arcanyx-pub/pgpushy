@@ -41,12 +41,13 @@ would ship declaring `license = "Apache-2.0"` with nothing in them saying what
 that grants. A published version is immutable, so this is a fix before the
 first publish rather than after it.
 
-Beyond those, the version floor is **the pgschema version pgpushy is tested
-against** (spec §13), which is a promise about CI rather than about the code.
-So a release means the CI matrix in [`ci.yml`](../.github/workflows/ci.yml) and
-`MIN_PGSCHEMA` in [`provider/mod.rs`](../pgpushy/src/provider/mod.rs) must
-agree. Raising one without the other makes the floor a lie in whichever
-direction is worse.
+Beyond those, the pgschema versions pgpushy names are promises about CI rather
+than about the code (spec §13). A release means the matrix in
+[`ci.yml`](../.github/workflows/ci.yml), `MIN_PGSCHEMA` in
+[`provider/mod.rs`](../pgpushy/src/provider/mod.rs) and `PINNED_PGSCHEMA` in
+[`provider/managed.rs`](../pgpushy/src/provider/managed.rs) must agree: the
+matrix runs both, the floor is its low end, the pin is its high end. Moving one
+without the others makes it a claim nothing tests.
 
 ## Bumping the pinned pgschema
 
@@ -64,12 +65,29 @@ $ sha256sum pgschema-$ver-*
 ```
 
 Put all four rows in `HASHES` in
-[`provider/managed.rs`](../pgpushy/src/provider/managed.rs), update
-`MIN_PGSCHEMA` and the CI matrix together, and commit them in one change so the
-hashes are reviewed alongside the version they belong to. A unit test fails if
-the pinned version lacks a hash for any published platform — but nothing can
-check that a hash is the *right* one except computing it from the real asset,
-so do that rather than copying from anywhere.
+[`provider/managed.rs`](../pgpushy/src/provider/managed.rs) and commit them in
+one change with the version bump, so the hashes are reviewed alongside the
+version they belong to. A unit test fails if the pinned version lacks a hash
+for any published platform — but nothing can check that a hash is the *right*
+one except computing it from the real asset, so do that rather than copying
+from anywhere.
+
+Then move whichever of the two version constants this is (spec §13):
+
+- **`PINNED_PGSCHEMA`** is what the managed backend downloads: the *newest*
+  tested version. Raising it means the new version must be in the CI matrix.
+- **`MIN_PGSCHEMA`** is the floor a bring-your-own binary must clear: the
+  *oldest* tested version. Raising it makes existing BYO setups fail, so raise
+  it only deliberately — when the old version is dropped from the matrix
+  because pgpushy has come to rely on something newer.
+
+The CI matrix in [`ci.yml`](../.github/workflows/ci.yml) must run both ends. A
+constant that names a version the matrix does not test is a promise nothing
+checks.
+
+Re-verify before pinning, and verify by **applying**, not by seeding a target
+with `psql` — pgschema reads a hand-built target correctly even where it would
+never build one like it (impl-plan §1).
 
 ## Release flow
 

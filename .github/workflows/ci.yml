@@ -28,10 +28,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The lowest pgschema here is the supported floor (spec §13): the
-        # floor is the version pgpushy is tested against, so raising this
-        # matrix and raising MIN_PGSCHEMA are the same action.
-        pgschema: ["1.12.0"]
+        # Both ends of this list are load-bearing (spec §13). The lowest is
+        # the supported floor, so `MIN_PGSCHEMA` must equal it; the highest is
+        # what the managed backend downloads, so `PINNED_PGSCHEMA` must equal
+        # that. Changing either constant without changing this matrix makes
+        # one of them a claim nothing tests.
+        pgschema: ["1.12.0", "1.12.3"]
         postgres: ["18"]
     services:
       postgres:
