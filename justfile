@@ -121,4 +121,4 @@ publish:
     fi
     git tag -a "$tag" -m "pgpushy workspace $tag"
     git push origin "$tag"
-    echo "Pushed $tag. The publish workflow will build and publish the crates."
+    echo "Pushed $tag. publish.yml will now build and publish both crates."

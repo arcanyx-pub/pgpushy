@@ -1,0 +1,83 @@
+name: Publish
+
+# Tagging is the release. `just publish` pushes `vX.Y.Z` from an up-to-date
+# main, and this is what that tag starts. Nothing publishes on a merge, so a
+# release is always a deliberate second action.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    # No `environment:` here on purpose. A GitHub environment is the right
+    # place to add a required reviewer or a wait timer later, but naming one
+    # that does not exist fails the job at tag time — after the tag is pushed,
+    # which is the worst moment for this workflow to be wrong about itself.
+    permissions:
+      # Trusted Publishing: this job proves its identity to crates.io with a
+      # short-lived OIDC token and is handed a crates.io token valid for about
+      # half an hour, which the action revokes when the job ends. There is no
+      # long-lived secret in this repository to leak or rotate.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # The tag is the only thing saying which version this is, and cargo is
+      # the only thing that knows which version the code claims. Publishing a
+      # crate is irreversible, so they are compared before anything is sent.
+      - name: Check the tag matches the workspace version
+        run: |
+          set -euo pipefail
+          tagged="${GITHUB_REF_NAME#v}"
+          declared=$(cargo pkgid -p pgpushy | sed 's/.*[#@]//')
+          if [ "$tagged" != "$declared" ]; then
+            echo "tag $GITHUB_REF_NAME does not match the workspace version $declared" >&2
+            echo "run 'just bump' and merge that before tagging" >&2
+            exit 1
+          fi
+          echo "publishing $declared"
+
+      - name: Authenticate with crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      # Order matters and is not negotiable: `pgpushy` depends on
+      # `pgpushy-core`, so the registry has to have the core version this
+      # release names before the binary crate can resolve it. `--locked` keeps
+      # the published build to the dependency versions CI actually tested.
+      - name: Publish pgpushy-core
+        run: cargo publish --locked -p pgpushy-core
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+      # crates.io serves the index asynchronously, so a publish that has been
+      # accepted is not yet a publish that can be resolved. Waiting for the
+      # index rather than sleeping means a slow index delays the release
+      # instead of failing it.
+      - name: Wait for pgpushy-core to appear in the index
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          for attempt in $(seq 1 60); do
+            if curl -fsSL "https://index.crates.io/pg/pu/pgpushy-core" \
+                 | grep -qF "\"vers\":\"$version\""; then
+              echo "pgpushy-core $version is in the index"
+              exit 0
+            fi
+            echo "attempt $attempt: not indexed yet, waiting"
+            sleep 10
+          done
+          echo "pgpushy-core $version never appeared in the index" >&2
+          exit 1
+
+      - name: Publish pgpushy
+        run: cargo publish --locked -p pgpushy
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

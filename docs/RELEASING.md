@@ -1,10 +1,7 @@
 # Releasing
 
-> **Nothing has been released yet, and the flow below cannot be run yet.** It
-> documents the intended process, which mirrors `snowdrop-id-rs`, but two
-> pieces of it are missing — see *Before the first release*. The important one
-> is that there is no publish workflow, so `just publish` pushes a tag nothing
-> is listening for.
+> **Nothing has been released yet**, so the *first* release is not the flow
+> below — see *The first release is different*. Every release after it is.
 
 The two crates (`pgpushy-core`, `pgpushy`) are versioned in lockstep and
 published to crates.io from CI using **Trusted Publishing (OIDC)** — GitHub
@@ -19,29 +16,32 @@ piece (parse a tree of DDL, lift foreign keys, emit a deterministic
 desired-state document), and if anyone depends on it directly, dragging it
 through a bump it did not earn stops being free.
 
-## Before the first release
+## The first release is different
 
-Two pieces of the flow below do not exist yet.
+Trusted Publishing cannot bootstrap itself. crates.io links a repository to a
+crate through the crate's own settings page, and that page does not exist until
+the crate does — so **the first publish of each crate is manual, with a token,
+and only then can the workflow take over.** Once:
 
-**Missing: the publish workflow.** `.github/workflows/` holds only `ci.yml`.
-`just publish` tags `vX.Y.Z`, pushes it, and reports that the publish workflow
-will build and publish the crates — nothing is listening for that tag. The
-failure is silent at the moment it happens and awkward afterwards: the tag now
-exists, so `just publish` refuses the retry (`tag vX.Y.Z already exists`), and
-the tag has to be deleted locally and on the remote before a second attempt.
-The workflow needs to fire on `v*` tags, claim crates.io Trusted Publishing for
-both crates, and publish `pgpushy-core` before `pgpushy`, which depends on it.
+```console
+$ cargo login                     # a scoped token from crates.io/settings/tokens
+$ cargo publish --locked -p pgpushy-core
+$ cargo publish --locked -p pgpushy      # after core appears in the index
+```
 
-**Missing: the licence in the published crates.** `LICENSE` exists only at the
-repo root, and neither `pgpushy/Cargo.toml` nor `pgpushy-core/Cargo.toml` sets
-`include` or `license-file`, so cargo packages neither copy of it — verified
-against the `.crate` tarballs under `target/package/`, which carry `README.md`
-(through `readme = "../README.md"`) and no licence text at all. Both crates
-would ship declaring `license = "Apache-2.0"` with nothing in them saying what
-that grants. A published version is immutable, so this is a fix before the
-first publish rather than after it.
+Then, on crates.io, open each crate's *Settings → Trusted Publishing* and add
+this repository with the workflow filename `publish.yml`. Do it for **both**
+crates; the workflow publishes both and will fail on whichever was missed.
+Revoke the manual token afterwards — it has done its one job, and the point of
+Trusted Publishing is that no long-lived credential remains.
 
-Beyond those, the pgschema versions pgpushy names are promises about CI rather
+[`publish.yml`](../.github/workflows/publish.yml) deliberately names no GitHub
+`environment`. Adding one is the right way to require a reviewer or a wait
+before a release, but naming an environment that does not exist fails the job
+*after* the tag is pushed — which is the worst moment for this workflow to be
+wrong about itself. Create the environment first, then add the line.
+
+Beyond that, the pgschema versions pgpushy names are promises about CI rather
 than about the code (spec §13). A release means the matrix in
 [`ci.yml`](../.github/workflows/ci.yml), `MIN_PGSCHEMA` in
 [`provider/mod.rs`](../pgpushy/src/provider/mod.rs) and `PINNED_PGSCHEMA` in
@@ -106,16 +106,18 @@ never build one like it (impl-plan §1).
    $ git switch main && git pull
    $ just publish
    ```
-   `just publish` pushes the `vX.Y.Z` tag. Once the publish workflow exists
-   that tag is what starts it; until then the push is inert and leaves a tag
-   behind that must be deleted, locally and on the remote, before a second
-   attempt — `just publish` refuses to run while it is there.
+   `just publish` pushes the `vX.Y.Z` tag, and that tag is what starts
+   [`publish.yml`](../.github/workflows/publish.yml). The workflow re-checks
+   that the tag matches the workspace version before it sends anything, since
+   a publish cannot be taken back; then it publishes `pgpushy-core`, waits for
+   it to appear in the index, and publishes `pgpushy`. If it fails, the tag
+   already exists and `just publish` will refuse the retry — delete the tag
+   locally and on the remote first.
 
 ## Checklist for a release that is not just code
 
 - Both crates carry the Apache-2.0 text —
-  `tar tzf target/package/pgpushy-*.crate | grep LICENSE`. They do not today;
-  see *Before the first release*.
+  `tar tzf target/package/pgpushy-*.crate | grep LICENSE`.
 - `CHANGELOG.md` has a real `## [Unreleased]` section. `just bump` stamps it
   with the version and date; it does not write it.
 - `docs/spec.md` version and date reflect any decisions the release changed.
