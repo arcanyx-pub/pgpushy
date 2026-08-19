@@ -255,6 +255,25 @@ commands are in [Appendix A](#appendix-a-reproduction-harness).
   rewrite has to be a typed walk, which is why `literal.rs` checks afterwards
   that nothing it should have reached survived.
 
+**pgschema's embedded plan database is a network dependency (2026-08-19)**
+- It downloads a Postgres tarball at runtime and caches it in
+  `~/.embedded-postgres-go/`, e.g.
+  `embedded-postgres-binaries-linux-amd64-18.0.0.txz`, chosen to match the
+  target's version. A developer machine only pays for this once, which is why
+  it is invisible locally.
+- **CI pays on every run, and it can fail.** Observed: an integration leg
+  failing 16 tests in three seconds with `failed to start embedded PostgreSQL:
+  no version found matching 18.0.0`, while the other matrix leg — same commit,
+  same runner image, same target — passed. Nothing in pgpushy was involved; the
+  commit was documentation only.
+- A failure looks alarming rather than obvious: it surfaces as a wall of failed
+  pgpushy tests, not as a step that could not reach the network.
+- The remedy pgpushy already has is `[env.*.plan_db]` (spec §10.4): pointing the
+  plan database at CI's own Postgres service means pgschema never fetches the
+  embedded one. Not free, though — an external plan database accumulates state
+  across runs (above), so tests sharing one need it cleaned or namespaced, and
+  today only `plans_through_an_external_plan_database` exercises that path.
+
 **Release/distribution facts (for the provider, §7)**
 - Assets are **standalone per-platform binaries**: `pgschema-<ver>-{darwin,
   linux}-{amd64,arm64}` (~18 MB static Go), plus `.deb`/`.rpm`. **No Windows
