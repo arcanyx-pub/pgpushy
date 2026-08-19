@@ -14,10 +14,12 @@ jobs:
   publish:
     name: Publish to crates.io
     runs-on: ubuntu-latest
-    # No `environment:` here on purpose. A GitHub environment is the right
-    # place to add a required reviewer or a wait timer later, but naming one
-    # that does not exist fails the job at tag time — after the tag is pushed,
-    # which is the worst moment for this workflow to be wrong about itself.
+    # Load-bearing, not decoration: crates.io's Trusted Publishing config for
+    # both crates names this environment, and it checks the claim in the OIDC
+    # token. A job outside it — or in one spelled differently — is refused at
+    # the token exchange. The environment must exist in this repository's
+    # settings under exactly this name.
+    environment: crates-io
     permissions:
       # Trusted Publishing: this job proves its identity to crates.io with a
       # short-lived OIDC token and is handed a crates.io token valid for about
@@ -52,8 +54,21 @@ jobs:
       # `pgpushy-core`, so the registry has to have the core version this
       # release names before the binary crate can resolve it. `--locked` keeps
       # the published build to the dependency versions CI actually tested.
+      #
+      # Each publish is skipped if that version is already in the index, which
+      # makes the whole workflow re-runnable. That matters twice: a release
+      # where the first crate succeeded and the second failed can be retried
+      # without choking on the first, and a tag added after a manual publish
+      # does not fail against a version that is already there.
       - name: Publish pgpushy-core
-        run: cargo publish --locked -p pgpushy-core
+        run: |
+          set -euo pipefail
+          if curl -fsSL "https://index.crates.io/pg/pu/pgpushy-core" \
+               | grep -qF "\"vers\":\"${GITHUB_REF_NAME#v}\""; then
+            echo "pgpushy-core ${GITHUB_REF_NAME#v} is already published; skipping"
+          else
+            cargo publish --locked -p pgpushy-core
+          fi
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
@@ -78,6 +93,13 @@ jobs:
           exit 1
 
       - name: Publish pgpushy
-        run: cargo publish --locked -p pgpushy
+        run: |
+          set -euo pipefail
+          if curl -fsSL "https://index.crates.io/pg/pu/pgpushy" \
+               | grep -qF "\"vers\":\"${GITHUB_REF_NAME#v}\""; then
+            echo "pgpushy ${GITHUB_REF_NAME#v} is already published; skipping"
+          else
+            cargo publish --locked -p pgpushy
+          fi
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

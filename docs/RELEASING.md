@@ -1,12 +1,22 @@
 # Releasing
 
-> **Nothing has been released yet**, so the *first* release is not the flow
-> below — see *The first release is different*. Every release after it is.
+> **0.1.0 was published by hand and carries no `v0.1.0` tag** — Trusted
+> Publishing could not be configured before the crates existed. That bootstrap
+> is done; every release from 0.1.1 on goes through the flow below.
 
 The two crates (`pgpushy-core`, `pgpushy`) are versioned in lockstep and
 published to crates.io from CI using **Trusted Publishing (OIDC)** — GitHub
 Actions mints a short-lived crates.io token per run, so there is no long-lived
 `CARGO_REGISTRY_TOKEN` secret to leak or rotate.
+
+Each crate's *Settings → Trusted Publishing* entry on crates.io names this
+repository, the workflow filename `publish.yml` and the environment
+`crates-io`. The environment name is checked against the OIDC token, so it must
+match [`publish.yml`](../.github/workflows/publish.yml)'s `environment:` line
+and must exist in this repository's settings; a job outside that environment,
+or in one spelled differently, is refused at the token exchange. Both crates
+carry the same entry — the workflow publishes both, and fails on whichever was
+missed.
 
 **Why lockstep:** one version, one CHANGELOG, one tag. `pgpushy` depends on
 `pgpushy-core` at an exact version anyway, and while the two move together
@@ -16,33 +26,8 @@ piece (parse a tree of DDL, lift foreign keys, emit a deterministic
 desired-state document), and if anyone depends on it directly, dragging it
 through a bump it did not earn stops being free.
 
-## The first release is different
-
-Trusted Publishing cannot bootstrap itself. crates.io links a repository to a
-crate through the crate's own settings page, and that page does not exist until
-the crate does — so **the first publish of each crate is manual, with a token,
-and only then can the workflow take over.** Once:
-
-```console
-$ cargo login                     # a scoped token from crates.io/settings/tokens
-$ cargo publish --locked -p pgpushy-core
-$ cargo publish --locked -p pgpushy      # after core appears in the index
-```
-
-Then, on crates.io, open each crate's *Settings → Trusted Publishing* and add
-this repository with the workflow filename `publish.yml`. Do it for **both**
-crates; the workflow publishes both and will fail on whichever was missed.
-Revoke the manual token afterwards — it has done its one job, and the point of
-Trusted Publishing is that no long-lived credential remains.
-
-[`publish.yml`](../.github/workflows/publish.yml) deliberately names no GitHub
-`environment`. Adding one is the right way to require a reviewer or a wait
-before a release, but naming an environment that does not exist fails the job
-*after* the tag is pushed — which is the worst moment for this workflow to be
-wrong about itself. Create the environment first, then add the line.
-
-Beyond that, the pgschema versions pgpushy names are promises about CI rather
-than about the code (spec §13). A release means the matrix in
+The pgschema versions pgpushy names are promises about CI rather than about the
+code (spec §13). A release means the matrix in
 [`ci.yml`](../.github/workflows/ci.yml), `MIN_PGSCHEMA` in
 [`provider/mod.rs`](../pgpushy/src/provider/mod.rs) and `PINNED_PGSCHEMA` in
 [`provider/managed.rs`](../pgpushy/src/provider/managed.rs) must agree: the
@@ -112,7 +97,8 @@ never build one like it (impl-plan §1).
    a publish cannot be taken back; then it publishes `pgpushy-core`, waits for
    it to appear in the index, and publishes `pgpushy`. If it fails, the tag
    already exists and `just publish` will refuse the retry — delete the tag
-   locally and on the remote first.
+   locally and on the remote first. Each publish step skips a version already
+   in the index, so re-running after a half-finished release is safe.
 
 ## Checklist for a release that is not just code
 
