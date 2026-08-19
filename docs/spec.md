@@ -1400,8 +1400,27 @@ unaffected and is managed normally (verified).
   that can classify this cheaply; pgpushy could only do it by forming opinions
   about generated SQL, where a false negative reads as approval.
 
-  Doing this properly may therefore be a question about the engine rather than
-  about pgpushy. Worth evaluating when it is picked up: whether pgschema grows
+  **The near-term shape is decided**, and is the shallow fix done honestly:
+  `plan` emits a machine-readable summary — per-schema change and drop counts,
+  and per-step kinds derived from what pgschema already reports (`drop.table`,
+  `drop.table.column`) with their paths. Following Atlas, a plan containing
+  drops **fails by default**, with the opt-out in `pgpushy.toml` rather than as
+  a flag: Atlas puts the same switch in `atlas.hcl`, and §10.1 reaches the same
+  place independently, since a flag that disables a safety check is the hazard
+  that section exists to prevent. The exit code MUST NOT be `1`, which already
+  means pgpushy refused the run (§7, §6.2) — a caller has to be able to tell a
+  broken source tree from a plan that drops a column, because they route to
+  different people.
+
+  Atlas is worth reading before building this. Its analyzers are *coded* —
+  `DS102` table dropped, `DS103` column dropped, `MF104` nullable to
+  non-nullable — which lets a pipeline allowlist a specific finding rather than
+  accept or reject a boolean; per-step kinds give pgpushy the same granularity
+  for free. Note also that Atlas does **not** appear to flag a narrowing column
+  type either, so that gap is not peculiar to pgschema.
+
+  Doing the *comprehensive* version may therefore be a question about the engine
+  rather than about pgpushy. Worth evaluating when it is picked up: whether pgschema grows
   the classification, whether another tool already has it —
   [pgmold](https://github.com/fmguerreiro/pgmold) is one to look at — or
   whether the diffing belongs in pgpushy after all. That last option reverses
