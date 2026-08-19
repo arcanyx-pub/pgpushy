@@ -1383,6 +1383,60 @@ unaffected and is managed normally (verified).
   cross-schema *type* reference correctly under a per-schema run — the
   identifier must survive un-stripped while the referring table's own
   qualifier is stripped to the scratch schema.
+- **A persistable plan, and applying exactly that plan.** `plan` computes a
+  plan per managed schema and discards them: they are written into a temporary
+  directory that dies with the process, and `apply` accepts no plan input, so
+  it re-plans. `--out` writes the synthesized *documents* (§8.7), which is a
+  different artifact for a different purpose.
+
+  That rules out a common deployment shape — plan under a low-privilege
+  **preview** role, persist the plan as a reviewable artifact, approve *that
+  artifact*, then apply exactly it under a separate **deploy** role.
+
+  Worth being precise about what is missing, because it is less than it looks:
+  `apply` has **no internal race**. It runs a full plan pass, presents it,
+  prompts once, and applies the plans it just showed, which pgschema refuses if
+  the target has moved since (§8.6 step 6). pgpushy already does
+  plan-artifact-then-apply-exactly-that; it simply never exposes the boundary
+  across a process. This is a missing surface, not a missing mechanism.
+
+  Four decisions, settled 2026-08-19 and recorded here so they are not
+  re-derived:
+
+  1. **The apply order lives in the artifact**, as a manifest naming the
+     managed schemas in order — not re-derived from the source tree. Applying
+     is applying the *plans*; source drift afterwards is not the apply step's
+     business, and re-deriving would force the deploy environment to carry a
+     checkout it has no other use for. A manifest has no equivalent of
+     pgschema's per-plan fingerprint, so pgpushy SHOULD cross-check each plan
+     against its manifest entry rather than trusting the manifest alone.
+  2. **The §6.2 removal check runs at both plan and apply time**, the second
+     against a fresh inspection. The fingerprint cannot substitute: it is
+     scoped to one schema, while the hazard is a relationship between two. A
+     cross-schema foreign key added to the target after approval leaves the
+     *referenced* schema's fingerprint untouched, so that schema applies and
+     drops the column, and only the referencing schema then refuses — after the
+     damage.
+  3. **The artifact records the target it was planned against** —
+     `system_identifier` and database name, both already read for §6.3 — and
+     apply refuses a different one. The fingerprint covers target *drift*, not
+     target *identity*, and it is silent exactly when two databases are kept
+     identical, which is what a promote-through-environments pipeline does on
+     purpose. Not host and port: those are what a pooler, a proxy or DNS will
+     lie about, while the system identifier survives a rename and a failover
+     and changes on a logical restore, which is correct in both directions.
+  4. **One `<schema>.json` per managed schema**, percent-encoded by §8.7's
+     rule, in a directory pgpushy owns. The manifest is what marks the
+     directory as pgpushy's, since JSON cannot carry §4.1's generated-file
+     marker. Naming them by index — as the temporary files do today — would
+     leave file order and manifest order able to disagree, and would make the
+     artifact unreadable to whoever is approving it.
+
+  One consequence to state in the interface: **an approved artifact is not a
+  promise that it will apply.** The target can move underneath it, and pgpushy
+  will refuse. A pipeline needs a story for approved-then-refused, which is
+  re-plan and re-approve.
+
 - **Comprehensive destructive-change detection.** pgpushy has no signal a
   pipeline can route on: exit codes are success-or-failure, and how many
   changes are destructive is said only in the approval text (§8.6). The
