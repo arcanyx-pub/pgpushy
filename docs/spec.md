@@ -1479,6 +1479,19 @@ unaffected and is managed normally (verified).
   [pgmold](https://github.com/fmguerreiro/pgmold) is one to look at — or
   whether the diffing belongs in pgpushy after all. That last option reverses
   G3, which is why it is a decision rather than a task.
+- **Release binaries, and a GitHub Action.** pgpushy publishes to crates.io
+  only, so installing it in CI means libclang, `bindgen` and compiling
+  libpg_query's C sources on every run. Per-platform release binaries would fix
+  that, and pgpushy has already designed the shape once — its managed provider
+  downloads, verifies and caches exactly such binaries for pgschema (§8.5).
+
+  They are the prerequisite for an action, which is where the plan artifact
+  above stops being a CLI feature and starts being useful: GitHub's
+  `environment:` with required reviewers is the approval gate that design
+  needs, two environments give the preview and deploy roles their separate
+  credentials, and an uploaded artifact is what makes the approval apply to a
+  reviewed object rather than a recomputed one. See
+  [`github-action-sketch.md`](./github-action-sketch.md).
 - **Plan-database hygiene** — an external plan database accumulates state
   across runs (§10.4), and stale objects can make a broken desired state
   appear to work. With grants making an external plan database mandatory for
