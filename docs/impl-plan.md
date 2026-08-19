@@ -1,6 +1,6 @@
 # pgpushy Implementation Plan
 
-**Status:** Draft — build guidance (non-normative)
+**Status:** Build guidance (non-normative)
 **Date:** 2026-08-18
 **Companion to:** [`docs/spec.md`](./spec.md) v0.4 (normative)
 
@@ -309,6 +309,7 @@ pgpushy/
   Cargo.toml                # [workspace] resolver=3, members, workspace.package
   justfile  README.md  CHANGELOG.md  LICENSE
   docs/spec.md  docs/impl-plan.md  docs/RELEASING.md
+  docs/migrating-from-pgschema.md   assets/pgpushy.jpg  docs/RELEASING.md
   pgpushy-core/             # pure, deterministic, no IO — the heart
     src/lib.rs              # analyze(): the whole offline pipeline
     src/model.rs            # SchemaName, QualifiedName, Table, ForeignKey, Objects
@@ -318,13 +319,15 @@ pgpushy/
     src/synth.rs            # closure + FK-lift + qualify + 6-category emission,
                             #   one document per managed schema (spec §5)
     src/graph.rs            # cross-schema FK graph, topo order, cycle detection (spec §7)
+    src/literal.rs          # object names inside string literals (spec §4.3, §5.4)
     src/error.rs            # diagnostics carrying file + line
   pgpushy/                  # the `pgpushy` binary — IO shell
     src/main.rs             # clap dispatch
     src/cli.rs              # arg/flag definitions
     src/config.rs           # pgpushy.toml load, named environments (spec §10)
     src/discovery.rs        # walk source tree, apply excludes, deterministic order (spec §4.1)
-    src/conn.rs             # connection resolution → conninfo + pgschema flags (spec §6.3-6.4)
+    src/conn.rs             # connection resolution → driver config + pgschema flags (spec §6.3-6.4)
+    src/tls.rs              # what each sslmode means on the wire (spec §6.4)
     src/inspect.rs          # read-only target inspection: schemas, cross-schema FKs, identity (spec §6)
     src/provider/mod.rs     # trait PgschemaProvider
     src/provider/byo.rs     # PATH/explicit path + version check
@@ -334,7 +337,8 @@ pgpushy/
     src/hazard.rs           # cross-schema FK removal check, over those plans (spec §6.2)
     src/approve.rs          # plan presentation + single database-level prompt (spec §8.6)
     src/init.rs             # `pgpushy init`
-    src/output.rs           # verbosity and colour, resolved once
+    src/outdir.rs           # --out, a directory pgpushy owns (spec §8.7)
+    src/output.rs           # verbosity and color, resolved once
     src/report.rs           # user-facing output, routed through one place
     src/run.rs              # orchestrates validate/plan/apply
     tests/                  # integration (real pgschema + Postgres)
@@ -803,8 +807,8 @@ comparing anything.
 
 ## 11. Milestones (phased; each shippable)
 
-- **M0 — Skeleton & spike.** Workspace, justfile, CI. **Do the pg_query
-  round-trip spike (R1) first** — it de-risks everything. R1 now also covers
+- **M0 — Skeleton & spike. ✅ Done.** Workspace, justfile, CI. The pg_query
+  round-trip spike (R1) came first — it de-risked everything. R1 also covers
   the unnamed-FK naming question (§14).
 - **M1 — `pgpushy validate`. ✅ Done.** discover → parse → allow-list → resolve
   → duplicate/referent/collision checks → graph → synth, plus the CLI. **No
@@ -837,56 +841,46 @@ comparing anything.
   and hashing it. A unit test asserts the pinned version has a hash for every
   platform, so forgetting one drops that platform to TLS-only trust loudly
   rather than silently.
-
-### Remaining for 0.1
-
-Spec v0.4 settled eight things the code does not do yet. They are ordered by
-dependency: the first blocks the second, and everything else is independent.
-
-- **M7 — Per-schema documents and the closure** (spec §5.4, §5.5, §8.7).
-  `synthesize` takes a target schema; `Analysis` carries a document per schema;
-  `run.rs` writes one tempfile per schema and hands each pgschema run the
-  matching one. `--out` becomes a **directory pgpushy owns**: it creates it,
+- **M7 — Per-schema documents and the closure (spec §5.4, §5.5, §8.7).
+  ✅ Done.** `synthesize` takes a target schema; `Analysis` carries a document
+  per schema; `run.rs` writes one tempfile per schema and hands each pgschema
+  run the matching one. `--out` is a **directory pgpushy owns**: it creates it,
   refuses it by name if it holds a file without the generated marker, prunes
   its own stale documents, and percent-encodes bytes outside `[A-Za-z0-9_-]` in
   the schema name so a legal-but-hostile name cannot escape the directory.
-- **M8 — Types, domains and standalone sequences** (spec §4.3, §5.1). New model
-  variants and `parse.rs` arms for `CREATE TYPE` (enum, composite, range),
-  `CREATE DOMAIN` and `CREATE SEQUENCE`; the topological sort within category
-  2; rejection of `CREATE SEQUENCE … OWNED BY`. Their names qualify exactly as
-  tables do. Needs M7 first: a sequence in a column default is the reference
-  that must be spelled differently in each schema's document.
-- **M9 — `ALTER` rejection, and `CREATE TABLE … (LIKE t)`** (spec §4.3,
-  §5.1). `classify_alter_table` keeps only the foreign-key form; the standalone
-  non-FK constraint leaves the model and synthesis, which is what makes
+- **M8 — Types, domains and standalone sequences (spec §4.3, §5.1). ✅ Done.**
+  New model variants and `parse.rs` arms for `CREATE TYPE` (enum, composite,
+  range), `CREATE DOMAIN` and `CREATE SEQUENCE`; the topological sort within
+  category 2; rejection of `CREATE SEQUENCE … OWNED BY`. Their names qualify
+  exactly as tables do. It needed M7 first: a sequence in a column default is
+  the reference that must be spelled differently in each schema's document.
+- **M9 — `ALTER` rejection, and `CREATE TABLE … (LIKE t)` (spec §4.3, §5.1).
+  ✅ Done.** `classify_alter_table` keeps only the foreign-key form, so the
+  model holds no standalone non-foreign-key constraint — which is what makes
   category 4 `CREATE INDEX` alone and therefore internally order-free. The
-  diagnostic must show the inline form to write instead — an inline constraint
-  can carry an explicit name (§1), so nothing is lost but the spelling.
+  diagnostic shows the inline form to write instead — an inline constraint can
+  carry an explicit name (§1), so nothing is lost but the spelling.
 
-  `classify_create_table` gains a fourth guard beside `inh_relations`,
-  `partspec` and `of_typename`: a `TableLikeClause` arrives inside `table_elts`
-  rather than in a clause of its own, which is why it slipped past the other
-  three. Today a `LIKE` passes validation and is emitted unqualified, in name
-  order, ahead of the table it copies.
-- **M10 — Names inside string literals** (spec §4.3, §5.4). Reject a bare name
-  in a literal, naming the file, line and the qualified form to write; record
-  where the qualified ones are so §5's de-qualification pass does not have to
-  find them again.
-- **M11 — Cross-schema references other than foreign keys** (spec §4.5,
-  §12.6). Reject in `validate.rs`, naming the referring object, the referenced
-  object and both schemas. This is what keeps the closure shallow, so it
-  belongs with M7 in review even though it is a separate change.
-- **M12 — `sslmode` in full and TLS** (spec §6.4). `inspect.rs` connects with
-  `NoTls` today, so pgpushy cannot reach any hosted Postgres at all. Parse all
-  five modes in `conn.rs` and build the connector each calls for (§8). The
-  driver's own `ssl_mode` carries the fallback semantics — `disable`, `prefer`,
-  `require` for `require`/`verify-ca`/`verify-full` — while the connector
-  carries the verification, so `prefer` must not collapse into `require`.
-- **M13 — Discovery follows symlinked files** (spec §4.1). `file_type()` does
-  not traverse symlinks, so a symlinked `.sql` is neither a file nor a
-  directory to the walk today and is silently skipped — which is to say
-  scheduled for deletion. Follow links to files; keep skipping links to
-  directories, which is what stops the walk escaping the source tree.
+  `classify_create_table` guards a `TableLikeClause` beside `inh_relations`,
+  `partspec` and `of_typename`; it arrives inside `table_elts` rather than in a
+  clause of its own.
+- **M10 — Names inside string literals (spec §4.3, §5.4). ✅ Done.** A bare
+  name in a literal is rejected, naming the file, the line and the qualified
+  form to write. `literal.rs` also carries the walk that §5.4's de-qualification
+  pass runs over each statement.
+- **M11 — Cross-schema references other than foreign keys (spec §4.5, §12.6).
+  ✅ Done.** Rejected in `validate.rs`, naming the referring object, the
+  referenced object and both schemas. This is what keeps the closure shallow,
+  so it belonged with M7 in review even though it is a separate change.
+- **M12 — `sslmode` in full and TLS (spec §6.4). ✅ Done.** All five modes are
+  parsed in `conn.rs` and `inspect.rs` connects through the connector each one
+  calls for (§8). The driver's own `ssl_mode` carries the fallback semantics —
+  `disable`, `prefer`, `require` for `require`/`verify-ca`/`verify-full` —
+  while the connector carries the verification, so `prefer` does not collapse
+  into `require`.
+- **M13 — Discovery follows symlinked files (spec §4.1). ✅ Done.** A symlink
+  to a `.sql` file is followed; a symlink to a directory is not, which is what
+  stops the walk escaping the source tree.
 
 ### Future work
 

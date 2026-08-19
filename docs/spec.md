@@ -2,7 +2,7 @@
 
 **Version:** 0.4
 **Date:** 2026-08-18
-**Status:** Draft — all 0.1 design decisions resolved (§15)
+**Status:** All 0.1 design decisions resolved (§15)
 
 This document specifies **pgpushy**, a declarative Postgres schema-management
 tool that manages an entire database — all of its schemas — from a directory
