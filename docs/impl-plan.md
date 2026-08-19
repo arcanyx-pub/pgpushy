@@ -227,6 +227,53 @@ commands are in [Appendix A](#appendix-a-reproduction-harness).
   defines, after every file is parsed — which is also the only point at which
   the answer is knowable.
 
+**Verified while answering adopter questions (2026-08-19)**
+- **pgschema has no `hostaddr`, and ignores `PGHOSTADDR`.** Its only host input
+  is `--host` (env `PGHOST`). Verified: `--host bogus.invalid` with
+  `PGHOSTADDR=127.0.0.1` fails identically to the control —
+  `hostname resolving error: lookup bogus.invalid`. So separating the name used
+  for TLS verification from the address actually dialled — the normal reason to
+  want `hostaddr`, and the usual need when reaching RDS through a tunnel or a
+  pinned IP — is not expressible end to end, and cannot be fixed in pgpushy
+  alone. `tokio-postgres` *does* support `hostaddr`, so pgpushy's own
+  inspection could honour it, but pgschema would still resolve the name, and
+  §6.3 forbids letting the two disagree. `/etc/hosts` is the only lever today.
+- **pgschema classifies plan steps only as `create`, `drop` or `alter`.** A
+  plan's JSON carries exactly `operation`, `path` and `type` per step, with no
+  destructiveness flag, no risk level and no summary; the human output uses the
+  same three words. A narrowing `ALTER COLUMN … TYPE varchar(10)` is therefore
+  indistinguishable from the widening change that is safe. Spec §14 records
+  what follows from that.
+- **`pg_query`'s own node walk is incomplete.** `NodeEnum::nodes()` is
+  hand-written, not generated, and does not descend into every field — for a
+  `CreateStmt` it yields the statement and its `RangeVar` and stops, never
+  entering `table_elts`, which is exactly where a column default lives. Any
+  search over an AST must either walk the typed tree by hand or, as
+  `literal.rs` does, run over the AST serialized to JSON, which covers every
+  field by construction. `pg_query`'s protobuf types derive `Serialize` but
+  **not** `Deserialize`, so a JSON round-trip cannot be used to *mutate* — the
+  rewrite has to be a typed walk, which is why `literal.rs` checks afterwards
+  that nothing it should have reached survived.
+
+**pgschema's embedded plan database is a network dependency (2026-08-19)**
+- It downloads a Postgres tarball at runtime and caches it in
+  `~/.embedded-postgres-go/`, e.g.
+  `embedded-postgres-binaries-linux-amd64-18.0.0.txz`, chosen to match the
+  target's version. A developer machine only pays for this once, which is why
+  it is invisible locally.
+- **CI pays on every run, and it can fail.** Observed: an integration leg
+  failing 16 tests in three seconds with `failed to start embedded PostgreSQL:
+  no version found matching 18.0.0`, while the other matrix leg — same commit,
+  same runner image, same target — passed. Nothing in pgpushy was involved; the
+  commit was documentation only.
+- A failure looks alarming rather than obvious: it surfaces as a wall of failed
+  pgpushy tests, not as a step that could not reach the network.
+- The remedy pgpushy already has is `[env.*.plan_db]` (spec §10.4): pointing the
+  plan database at CI's own Postgres service means pgschema never fetches the
+  embedded one. Not free, though — an external plan database accumulates state
+  across runs (above), so tests sharing one need it cleaned or namespaced, and
+  today only `plans_through_an_external_plan_database` exercises that path.
+
 **Release/distribution facts (for the provider, §7)**
 - Assets are **standalone per-platform binaries**: `pgschema-<ver>-{darwin,
   linux}-{amd64,arm64}` (~18 MB static Go), plus `.deb`/`.rpm`. **No Windows

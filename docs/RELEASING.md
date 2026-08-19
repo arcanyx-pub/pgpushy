@@ -100,6 +100,25 @@ never build one like it (impl-plan §1).
    locally and on the remote first. Each publish step skips a version already
    in the index, so re-running after a half-finished release is safe.
 
+## What the first workflow run showed
+
+0.1.1 was the first release to go through [`publish.yml`](../.github/workflows/publish.yml),
+and it worked end to end: the tag-versus-workspace check, the OIDC exchange
+against the `crates-io` environment, both publishes, and the automatic token
+revocation.
+
+Two things worth knowing before trusting it further:
+
+- **The index wait is insurance, not a budget.** It polls for up to ten
+  minutes; `pgpushy-core` appeared on the first attempt, about a second after
+  the upload returned. The sparse index is effectively synchronous, so a run
+  that actually waits is a signal something is wrong rather than a normal slow
+  day.
+- **The skip-if-already-published branches have never run.** They exist so a
+  release that published the first crate and failed on the second can be
+  retried, and so a tag added after a manual publish does not fail. Nothing has
+  taken that path yet, so treat the first retry as the test of it.
+
 ## Checklist for a release that is not just code
 
 - Both crates carry the Apache-2.0 text —
