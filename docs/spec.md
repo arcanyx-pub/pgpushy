@@ -1383,6 +1383,29 @@ unaffected and is managed normally (verified).
   cross-schema *type* reference correctly under a per-schema run — the
   identifier must survive un-stripped while the referring table's own
   qualifier is stripped to the scratch schema.
+- **Comprehensive destructive-change detection.** pgpushy has no signal a
+  pipeline can route on: exit codes are success-or-failure, and how many
+  changes are destructive is said only in the approval text (§8.6). The
+  shallow fix is to report what pgschema already labels — `operation: drop`,
+  which covers dropped tables, columns and constraints. That is a usable
+  proxy and a narrow one.
+
+  It is narrow because pgschema classifies only `create`, `drop` and `alter`,
+  and nothing else: verified against pgschema 1.12.3, a plan's JSON carries
+  exactly `operation`, `path` and `type` per step, with no destructiveness
+  flag, no risk level and no summary, and its human output uses the same three
+  words. So `ALTER COLUMN wide TYPE varchar(10)` — which truncates or fails —
+  is reported identically to the widening change that is safe. pgschema is the
+  only party that knows both the old and the new state, so it is the only one
+  that can classify this cheaply; pgpushy could only do it by forming opinions
+  about generated SQL, where a false negative reads as approval.
+
+  Doing this properly may therefore be a question about the engine rather than
+  about pgpushy. Worth evaluating when it is picked up: whether pgschema grows
+  the classification, whether another tool already has it —
+  [pgmold](https://github.com/fmguerreiro/pgmold) is one to look at — or
+  whether the diffing belongs in pgpushy after all. That last option reverses
+  G3, which is why it is a decision rather than a task.
 - **Plan-database hygiene** — an external plan database accumulates state
   across runs (§10.4), and stale objects can make a broken desired state
   appear to work. With grants making an external plan database mandatory for
