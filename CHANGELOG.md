@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.1.0] - 2026-08-18
+
 The first release. pgpushy reconciles a whole Postgres database — every schema
 it is told to manage — from a directory tree of SQL files, delegating the
 diffing and applying to [pgschema](https://github.com/pgplex/pgschema).

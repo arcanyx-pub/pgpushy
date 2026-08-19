@@ -1,10 +1,19 @@
 # pgpushy
 
+[![CI](https://github.com/arcanyx-pub/pgpushy/actions/workflows/ci.yml/badge.svg)](https://github.com/arcanyx-pub/pgpushy/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/pgpushy.svg)](https://crates.io/crates/pgpushy)
+[![docs.rs](https://img.shields.io/docsrs/pgpushy-core)](https://docs.rs/pgpushy-core)
+
 Declarative Postgres schema management at the database level, powered by
 [pgschema](https://github.com/pgplex/pgschema).
 
-> **Status: v0.1.0 is being prepared.** The crates are not on crates.io yet.
-> The design is settled and recorded in [`docs/spec.md`](docs/spec.md).
+<p align="center">
+  <!-- Absolute URL: crates.io resolves relative paths against the crate's
+       workspace subdirectory (path_in_vcs), not the repo root, and 404s. Both
+       crates set readme = "../README.md", so this file is rendered from two
+       subdirectories and a relative path would be wrong from both. -->
+  <img src="https://raw.githubusercontent.com/arcanyx-pub/pgpushy/main/assets/pgpushy.jpg" alt="pgpushy, a baby elephant mascot, cheerfully pushing a boulder marked pg up a grassy hill">
+</p>
 
 pgschema is a Terraform-style declarative schema tool for Postgres: describe
 the schema you want, it diffs that against a live database and applies the
@@ -436,15 +445,13 @@ should get the newest release that has actually been tested.
 
 ## Installing
 
-Not yet published, so for now:
-
 ```console
-$ just install-cli          # cargo install --path pgpushy
+$ cargo install pgpushy
 ```
 
-Once 0.1.0 is on crates.io this becomes `cargo install pgpushy`. There is no
-separate step for pgschema — pgpushy downloads and verifies its own copy the
-first time it needs one.
+There is no separate step for pgschema — pgpushy downloads and verifies its own
+copy the first time it needs one. To build from a checkout instead, `just
+install-cli`.
 
 ## Building
 
