@@ -1,6 +1,9 @@
 [workspace]
 resolver = "3"
 members = ["pgpushy-core", "pgpushy"]
+# The example is a workspace of its own on purpose: it stands in for a
+# consuming project, with its own lockfile pinning snowdrop-id-postgres.
+exclude = ["example"]
 
 [workspace.package]
 version = "0.1.1"

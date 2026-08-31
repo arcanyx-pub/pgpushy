@@ -1,0 +1,6 @@
+# A workspace of its own, deliberately separate from pgpushy's: the example
+# stands in for a consuming project, whose Cargo.lock — not pgpushy's — is
+# what pins the snowdrop-id-postgres version the generated SQL comes from.
+[workspace]
+resolver = "3"
+members = ["xtask"]
