@@ -6,7 +6,9 @@
 //! own, so schema changes all flow through pgschema, and `plan` cannot mutate
 //! the target even incidentally.
 //!
-//! One connection answers everything the commands need before delegating.
+//! One connection answers everything the commands need from the target
+//! before delegating; §10.4's look at an external plan database opens its
+//! own, separate one.
 
 use crate::conn::Resolved;
 use crate::tls;
@@ -132,7 +134,7 @@ fn policies(client: &mut Client, managed: &[SchemaName]) -> Result<Vec<PolicyOrR
              SELECT n.nspname, c.relname, NULL
              FROM pg_class c
              JOIN pg_namespace n ON n.oid = c.relnamespace
-             WHERE c.relrowsecurity AND c.relkind = 'r' AND n.nspname = ANY($1)
+             WHERE c.relrowsecurity AND c.relkind IN ('r', 'p') AND n.nspname = ANY($1)
              ORDER BY 1, 2, 3",
             &[&names],
         )

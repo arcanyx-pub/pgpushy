@@ -152,12 +152,14 @@ fn render_list(schemas: &[SchemaName]) -> String {
 pub fn type_references(objects: &mut Objects, default_schema: &SchemaName) {
     let defined: BTreeSet<QualifiedName> =
         objects.types.iter().map(|kind| kind.name.clone()).collect();
-    // A literal can name a table too — `'public.customers'::regclass` — so
-    // the is-it-defined question for literals ranges over both namespaces.
-    let tables: BTreeSet<QualifiedName> = objects
+    // A literal can name a table or an index too — `'s.t'::regclass` — so
+    // the is-it-defined question for literals ranges over every namespace
+    // the tree populates.
+    let relations: BTreeSet<QualifiedName> = objects
         .tables
         .iter()
         .map(|table| table.name.clone())
+        .chain(objects.indexes.iter().map(|index| index.name.clone()))
         .collect();
 
     for index in 0..objects.tables.len() {
@@ -175,7 +177,7 @@ pub fn type_references(objects: &mut Objects, default_schema: &SchemaName) {
         resolve_literals(
             &NodeEnum::CreateStmt(objects.tables[index].ast.clone()),
             &defined,
-            &tables,
+            &relations,
             &mut found,
             &mut unresolved,
         );
@@ -213,7 +215,7 @@ pub fn type_references(objects: &mut Objects, default_schema: &SchemaName) {
         resolve_literals(
             &objects.types[index].ast.clone(),
             &defined,
-            &tables,
+            &relations,
             &mut found,
             &mut unresolved,
         );
@@ -234,7 +236,7 @@ pub fn type_references(objects: &mut Objects, default_schema: &SchemaName) {
 fn resolve_literals(
     node: &NodeEnum,
     defined: &BTreeSet<QualifiedName>,
-    tables: &BTreeSet<QualifiedName>,
+    relations: &BTreeSet<QualifiedName>,
     found: &mut Vec<QualifiedName>,
     unresolved: &mut Vec<QualifiedName>,
 ) {
@@ -248,11 +250,11 @@ fn resolve_literals(
         let referenced = QualifiedName::new(SchemaName::new(schema), object);
         if defined.contains(&referenced) {
             found.push(referenced);
-        } else if !tables.contains(&referenced) {
+        } else if !relations.contains(&referenced) {
             // A literal is always qualified (spec §4.3), so a name that is
-            // neither a tree-defined type nor a tree-defined table is worth
-            // recording: validate reports it when the schema is managed. A
-            // table hit is simply not a category-2 dependency.
+            // neither a tree-defined type nor a tree-defined relation is
+            // worth recording: validate reports it when the schema is
+            // managed. A relation hit is simply not a category-2 dependency.
             unresolved.push(referenced);
         }
     }

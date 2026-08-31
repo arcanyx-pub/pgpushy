@@ -6,8 +6,10 @@
 //! which declining is guaranteed to leave the target untouched.
 //!
 //! The summary below is read from the plans pgschema produced. Every "N
-//! destructive" here is a step pgschema itself labelled `drop`; pgpushy does
-//! not inspect SQL or compare state to work that out (G3).
+//! destructive" here is a step pgschema itself labelled `drop`, minus the
+//! drop half of a drop+create pair on one kind and path, which pgschema
+//! renders as a modification (spec §8.6); pgpushy does not inspect SQL or
+//! compare state to work that out (G3).
 
 use crate::plan_file::Plan;
 use anyhow::{Result, bail};

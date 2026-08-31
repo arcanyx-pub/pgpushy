@@ -23,7 +23,11 @@ tables to pgpushy today and keep the rest wherever it lives, as long as the
 rest is not *described in the source tree*. The one hard blocker is
 row-level security: a policy or an RLS-enabled table in a managed schema is
 refused by name (spec §6.5), so such a schema must stay out of the managed
-set until the policies move or go.
+set until the policies move or go. One nuance: *tables* are a managed kind,
+so a table whose shape pgpushy rejects in source — partitioned, `INHERITS`,
+`OF type` — cannot be described, and is therefore reconciled **away** on the
+target like any table the tree omits, as an approved destructive change; it
+is not left alone. Keep such a table's schema out of the managed set too.
 
 | Object kind | pgschema | pgpushy 0.1 |
 |---|---|---|

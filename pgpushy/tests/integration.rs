@@ -1682,9 +1682,6 @@ fn unmanaged_kinds_in_a_managed_schema_are_left_alone() {
         .expect("count functions")
         .get(0);
     assert_eq!(functions, 2, "the functions must survive");
-    client
-        .query_one(&format!("SELECT note FROM {schema}.t LIMIT 0"), &[])
-        .err();
     // The added column landed.
     let has_note: i64 = client
         .query_one(
