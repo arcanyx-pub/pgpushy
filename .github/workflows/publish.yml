@@ -30,6 +30,13 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          # The dependency caches are the part worth keeping; the target dir
+          # is not. This job builds each crate once for verification and runs
+          # rarely — and rust-cache's post-job pruning of ./target trips over
+          # the trees `cargo publish` leaves under target/package/, logging a
+          # spray of harmless ENOENT errors after a successful release.
+          cache-targets: false
 
       # The tag is the only thing saying which version this is, and cargo is
       # the only thing that knows which version the code claims. Publishing a
