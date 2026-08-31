@@ -1414,3 +1414,163 @@ fn a_tree_with_types_domains_and_sequences_converges() {
         .get(0);
     assert_eq!(increment, 5);
 }
+
+// ---------------------------------------------------------------------------
+// Seeds (spec §8.8): execution and the convergence probe, against a real
+// database. The offline rules are covered in pgpushy-core/tests/seeds.rs.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn seeds_apply_and_converge() {
+    let target = require_target!();
+    let schema = unique_schema("seed");
+    let _schemas = Schemas::create(&target, std::slice::from_ref(&schema));
+
+    let project = target.project(
+        "seed_root = \"seeds\"\n",
+        &[
+            (
+                "t.sql",
+                format!("CREATE TABLE {schema}.t (id int PRIMARY KEY, val text);"),
+            ),
+            (
+                "seeds/rows.sql",
+                format!(
+                    "INSERT INTO {schema}.t (id, val) VALUES (1, 'a'), (2, 'b'), (3, 'c') \
+                     ON CONFLICT (id) DO NOTHING;"
+                ),
+            ),
+        ],
+    );
+
+    project
+        .command("apply")
+        .arg("--auto-approve")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("3 rows affected; probe passed"));
+
+    let mut client = target.client();
+    let rows: i64 = client
+        .query_one(&format!("SELECT count(*) FROM {schema}.t"), &[])
+        .expect("count")
+        .get(0);
+    assert_eq!(rows, 3);
+
+    // The second apply has an empty schema plan and still runs the seeds
+    // (spec §8.8); the probe passes and nothing changes.
+    project
+        .command("apply")
+        .arg("--auto-approve")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("0 rows affected; probe passed"));
+
+    let rows: i64 = client
+        .query_one(&format!("SELECT count(*) FROM {schema}.t"), &[])
+        .expect("count")
+        .get(0);
+    assert_eq!(rows, 3);
+}
+
+/// The probe's whole reason to exist: a volatile expression passes every
+/// static check and never converges. The failure must land *nothing* — the
+/// probe rolls back the first pass along with itself (spec §8.8, §11.1).
+#[test]
+fn a_volatile_seed_rolls_back_and_fails() {
+    let target = require_target!();
+    let schema = unique_schema("volatile");
+    let _schemas = Schemas::create(&target, std::slice::from_ref(&schema));
+
+    let project = target.project(
+        "seed_root = \"seeds\"\n",
+        &[
+            (
+                "t.sql",
+                format!("CREATE TABLE {schema}.t (id int PRIMARY KEY, val text);"),
+            ),
+            (
+                "seeds/volatile.sql",
+                format!(
+                    "INSERT INTO {schema}.t AS t (id, val) VALUES (1, random()::text) \
+                     ON CONFLICT (id) DO UPDATE SET val = excluded.val \
+                     WHERE t.val IS DISTINCT FROM excluded.val;"
+                ),
+            ),
+        ],
+    );
+
+    project
+        .command("apply")
+        .arg("--auto-approve")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("does not converge"))
+        .stderr(predicates::str::contains("volatile.sql"));
+
+    // Nothing from the failing file landed: the rollback covered both passes.
+    let mut client = target.client();
+    let rows: i64 = client
+        .query_one(&format!("SELECT count(*) FROM {schema}.t"), &[])
+        .expect("count")
+        .get(0);
+    assert_eq!(rows, 0);
+}
+
+/// A guarded DO UPDATE corrects drifted reference data, then converges.
+#[test]
+fn a_guarded_do_update_corrects_and_converges() {
+    let target = require_target!();
+    let schema = unique_schema("guarded");
+    let _schemas = Schemas::create(&target, std::slice::from_ref(&schema));
+
+    let seed = |val: &str| {
+        format!(
+            "INSERT INTO {schema}.t AS t (id, val) VALUES (1, '{val}') \
+             ON CONFLICT (id) DO UPDATE SET val = excluded.val \
+             WHERE t.val IS DISTINCT FROM excluded.val;"
+        )
+    };
+
+    let project = target.project(
+        "seed_root = \"seeds\"\n",
+        &[
+            (
+                "t.sql",
+                format!("CREATE TABLE {schema}.t (id int PRIMARY KEY, val text);"),
+            ),
+            ("seeds/labels.sql", seed("first")),
+        ],
+    );
+
+    project
+        .command("apply")
+        .arg("--auto-approve")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("1 row affected; probe passed"));
+
+    // The seed changes: the listed row is authoritative, so the next apply
+    // corrects it — once — and the probe still passes.
+    project.write("seeds/labels.sql", &seed("second"));
+    project
+        .command("apply")
+        .arg("--auto-approve")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("1 row affected; probe passed"));
+
+    let mut client = target.client();
+    let val: String = client
+        .query_one(&format!("SELECT val FROM {schema}.t WHERE id = 1"), &[])
+        .expect("row")
+        .get(0);
+    assert_eq!(val, "second");
+
+    project
+        .command("apply")
+        .arg("--auto-approve")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("0 rows affected; probe passed"));
+}

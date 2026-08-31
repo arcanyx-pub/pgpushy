@@ -87,6 +87,11 @@ pub enum DiagnosticKind {
     CrossSchemaReference,
     /// Managed schemas whose foreign keys form a cycle (spec §7, §12.1).
     CrossSchemaForeignKeyCycle,
+    /// A seed statement outside the seed allow-list (spec §4.6).
+    SeedDisallowedStatement,
+    /// A seed naming a table, column or conflict target the model does not
+    /// hold (spec §4.6).
+    SeedTargetMismatch,
 }
 
 impl DiagnosticKind {
@@ -103,6 +108,8 @@ impl DiagnosticKind {
             Self::SchemaNotManaged => "schema-not-managed",
             Self::CrossSchemaReference => "cross-schema-reference",
             Self::CrossSchemaForeignKeyCycle => "cross-schema-foreign-key-cycle",
+            Self::SeedDisallowedStatement => "seed-disallowed-statement",
+            Self::SeedTargetMismatch => "seed-target-mismatch",
         }
     }
 }

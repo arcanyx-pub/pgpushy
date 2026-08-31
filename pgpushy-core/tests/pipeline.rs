@@ -17,7 +17,7 @@ fn file(path: &str, contents: &str) -> SourceFile {
 }
 
 fn analyze_with(files: &[SourceFile], options: &Options) -> Result<Analysis, AnalysisError> {
-    analyze(files, options)
+    analyze(files, &[], options)
 }
 
 fn ok(files: Vec<SourceFile>) -> Analysis {

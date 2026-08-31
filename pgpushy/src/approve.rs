@@ -92,17 +92,38 @@ fn summarize(analysis: &Analysis, plans: &[(SchemaName, Plan)]) {
         }
     }
 
-    if changing.is_empty() {
+    // Seeds are inside the approved unit (spec §8.6, §8.8): the writes they
+    // make are writes, whatever the schema plans say.
+    let seeds = &analysis.seeds;
+    if !seeds.is_empty() {
+        println!(
+            "\n  {} seed file{}, applied after the schemas, each in its own transaction:",
+            seeds.files.len(),
+            plural(seeds.files.len()),
+        );
+        for file in &seeds.files {
+            println!(
+                "    {}  {} statement{}",
+                file.path,
+                file.statements.len(),
+                plural(file.statements.len()),
+            );
+        }
+    }
+
+    if changing.is_empty() && seeds.is_empty() {
         println!("\n  Nothing to apply.");
         return;
     }
 
-    println!(
-        "\n  {steps} change{} across {} schema{}, {drops} destructive.",
-        plural(steps),
-        changing.len(),
-        plural(changing.len()),
-    );
+    if !changing.is_empty() {
+        println!(
+            "\n  {steps} change{} across {} schema{}, {drops} destructive.",
+            plural(steps),
+            changing.len(),
+            plural(changing.len()),
+        );
+    }
 
     // Destructive changes are listed individually. A count alone is not a
     // review: "1 destructive" reads very differently from

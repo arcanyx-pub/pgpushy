@@ -830,3 +830,238 @@ fn an_explicit_path_wins_over_the_managed_backend() {
         .failure()
         .stderr(predicates::str::contains("no pgschema binary at"));
 }
+
+// ---------------------------------------------------------------------------
+// Seeds (spec §4.6) — the offline half; execution needs a database and lives
+// in integration.rs
+// ---------------------------------------------------------------------------
+
+/// `pgpushy generate` pointed at a project.
+fn generate(root: &Path, check: bool) -> Command {
+    let mut cmd = Command::cargo_bin("pgpushy").expect("binary builds");
+    cmd.arg("generate")
+        .arg("--config")
+        .arg(root.join("pgpushy.toml"));
+    if check {
+        cmd.arg("--check");
+    }
+    cmd
+}
+
+const SEED: &str = "INSERT INTO public.customers (id, name) VALUES (1, 'acme') \
+                    ON CONFLICT (id) DO NOTHING;";
+
+#[test]
+fn validate_accepts_a_seeded_project() {
+    let dir = project(
+        "source_root = \"schema\"\nseed_root = \"seeds\"\n",
+        &[
+            ("schema/customers.sql", CUSTOMERS),
+            ("seeds/rows.sql", SEED),
+        ],
+    );
+
+    validate(dir.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "1 seed statement across 1 seed file",
+        ))
+        .stdout(predicates::str::contains("idempotent by construction"));
+}
+
+#[test]
+fn validate_rejects_a_bad_seed_naming_file_and_line() {
+    let dir = project(
+        "source_root = \"schema\"\nseed_root = \"seeds\"\n",
+        &[
+            ("schema/customers.sql", CUSTOMERS),
+            ("seeds/bad.sql", "DELETE FROM public.customers;"),
+        ],
+    );
+
+    validate(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("must be an INSERT, not DELETE"))
+        .stderr(predicates::str::contains("bad.sql:1"));
+}
+
+#[test]
+fn the_seed_root_may_not_be_the_source_root() {
+    let dir = project("seed_root = \".\"\n", &[("customers.sql", CUSTOMERS)]);
+
+    validate(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("same directory"));
+}
+
+#[test]
+fn the_source_root_may_not_sit_inside_the_seed_root() {
+    let dir = project(
+        "source_root = \"seeds/schema\"\nseed_root = \"seeds\"\n",
+        &[("seeds/schema/customers.sql", CUSTOMERS)],
+    );
+
+    validate(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("is inside seed_root"));
+}
+
+/// A seed root nested in the source root is not desired state (spec §4.6):
+/// its INSERTs must not reach the §4.3 allow-list.
+#[test]
+fn a_nested_seed_root_is_excluded_from_desired_state() {
+    let dir = project(
+        "seed_root = \"seeds\"\n",
+        &[("customers.sql", CUSTOMERS), ("seeds/rows.sql", SEED)],
+    );
+
+    validate(dir.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "excluded 1 seed file under the seed root",
+        ))
+        .stdout(predicates::str::contains("1 seed statement"));
+}
+
+// ---------------------------------------------------------------------------
+// Generated sources (spec §4.7)
+// ---------------------------------------------------------------------------
+
+const GENERATED_TABLE: &str = "CREATE TABLE public.leases (id int PRIMARY KEY);";
+
+fn generator_config() -> String {
+    format!(
+        "source_root = \"schema\"\n\
+         \n\
+         [[generate]]\n\
+         output = \"schema/leases.sql\"\n\
+         command = [\"echo\", \"{GENERATED_TABLE}\"]\n"
+    )
+}
+
+#[test]
+fn generate_writes_the_marker_and_discovery_reads_the_file() {
+    let dir = project(&generator_config(), &[("schema/customers.sql", CUSTOMERS)]);
+
+    generate(dir.path(), false).assert().success();
+
+    let written =
+        std::fs::read_to_string(dir.path().join("schema/leases.sql")).expect("file written");
+    assert!(written.starts_with("-- Generated source."), "{written}");
+    assert!(written.contains("-- Command: echo"), "{written}");
+    assert!(written.contains(GENERATED_TABLE), "{written}");
+
+    // A generated *source* is discovered — opposite polarity to a generated
+    // document (spec §4.1) — so validate now sees two tables.
+    validate(dir.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("2 tables"));
+}
+
+#[test]
+fn generate_refuses_to_overwrite_an_unmarked_file() {
+    let dir = project(
+        &generator_config(),
+        &[
+            ("schema/customers.sql", CUSTOMERS),
+            (
+                "schema/leases.sql",
+                "CREATE TABLE public.leases (id int PRIMARY KEY);",
+            ),
+        ],
+    );
+
+    generate(dir.path(), false)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("generated-source marker"));
+}
+
+#[test]
+fn generate_check_fails_on_a_stale_output_and_passes_after_regeneration() {
+    let dir = project(&generator_config(), &[("schema/customers.sql", CUSTOMERS)]);
+
+    // Before the first generation, the output is missing — that is stale too.
+    generate(dir.path(), true)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("does not exist"));
+
+    generate(dir.path(), false).assert().success();
+    generate(dir.path(), true).assert().success();
+
+    let path = dir.path().join("schema/leases.sql");
+    let mut drifted = std::fs::read_to_string(&path).expect("read");
+    drifted.push_str("-- drifted\n");
+    std::fs::write(&path, drifted).expect("write");
+
+    generate(dir.path(), true)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("out of date"))
+        .stderr(predicates::str::contains("leases.sql"));
+
+    generate(dir.path(), false).assert().success();
+    generate(dir.path(), true).assert().success();
+}
+
+#[test]
+fn a_generate_output_must_land_under_a_root() {
+    let dir = project(
+        "source_root = \"schema\"\n\
+         \n\
+         [[generate]]\n\
+         output = \"elsewhere/leases.sql\"\n\
+         command = [\"echo\", \"x\"]\n",
+        &[("schema/customers.sql", CUSTOMERS)],
+    );
+
+    generate(dir.path(), false)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "neither the source root nor the seed root",
+        ));
+}
+
+#[test]
+fn a_generate_output_may_not_climb_out_of_the_project() {
+    let dir = project(
+        "[[generate]]\noutput = \"../leases.sql\"\ncommand = [\"echo\", \"x\"]\n",
+        &[("customers.sql", CUSTOMERS)],
+    );
+
+    generate(dir.path(), false)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("leaves the directory"));
+}
+
+#[test]
+fn an_empty_generator_emission_is_refused() {
+    let dir = project(
+        "[[generate]]\noutput = \"leases.sql\"\ncommand = [\"echo\"]\n",
+        &[("customers.sql", CUSTOMERS)],
+    );
+
+    generate(dir.path(), false)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("produced no output"));
+}
+
+#[test]
+fn generate_with_no_entries_is_a_no_op() {
+    let dir = project("", &[("customers.sql", CUSTOMERS)]);
+
+    generate(dir.path(), false)
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("no [[generate]] entries"));
+}

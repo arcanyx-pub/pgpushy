@@ -102,7 +102,7 @@ fn parse_file(
 /// newline ending the previous line, blank lines, and any comment written
 /// above the statement. Counting lines from there points the diagnostic at the
 /// separator rather than the statement, so skip past it first.
-fn line_of(contents: &str, offset: i32) -> u32 {
+pub(crate) fn line_of(contents: &str, offset: i32) -> u32 {
     let offset = usize::try_from(offset).unwrap_or(0).min(contents.len());
     let start = offset + skip_trivia(&contents[offset..]);
     u32::try_from(contents[..start].bytes().filter(|b| *b == b'\n').count() + 1).unwrap_or(u32::MAX)

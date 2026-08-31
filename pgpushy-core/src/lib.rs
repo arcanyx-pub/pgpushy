@@ -32,6 +32,7 @@ pub mod literal;
 pub mod model;
 pub mod parse;
 pub mod resolve;
+pub mod seed;
 pub mod synth;
 pub mod validate;
 
@@ -39,6 +40,7 @@ pub use error::{CoreError, Diagnostic, DiagnosticKind};
 pub use graph::{Cycle, CycleEdge};
 pub use model::{Origin, QualifiedName, SchemaName};
 pub use parse::SourceFile;
+pub use seed::Seeds;
 pub use synth::{Documents, GENERATED_MARKER};
 
 /// How to interpret a source tree.
@@ -87,6 +89,8 @@ pub struct Analysis {
     /// way to express a managed-and-empty schema (spec §4.4) — and it is
     /// destructive, so callers must say so before applying.
     pub empty_schemas: Vec<SchemaName>,
+    /// The seed files, checked and ready to execute (spec §4.6, §8.8).
+    pub seeds: Seeds,
     /// What the tree contained, for reporting.
     pub counts: Counts,
 }
@@ -108,6 +112,8 @@ pub struct Counts {
     pub indexes: usize,
     pub foreign_keys: usize,
     pub comments: usize,
+    pub seed_files: usize,
+    pub seed_statements: usize,
 }
 
 /// Why analysis stopped.
@@ -155,10 +161,16 @@ impl From<CoreError> for AnalysisError {
     }
 }
 
-/// Run the offline pipeline over a source tree.
+/// Run the offline pipeline over a source tree, and check the seed files.
 ///
-/// Cross-schema cycles do **not** fail this call; see [`Analysis::cycles`].
-pub fn analyze(files: &[SourceFile], options: &Options) -> Result<Analysis, AnalysisError> {
+/// `seeds` holds the files discovered under the seed root (spec §4.6); pass
+/// an empty slice when none is configured. Cross-schema cycles do **not**
+/// fail this call; see [`Analysis::cycles`].
+pub fn analyze(
+    files: &[SourceFile],
+    seed_files: &[SourceFile],
+    options: &Options,
+) -> Result<Analysis, AnalysisError> {
     let (mut objects, diagnostics) = parse::parse_files(files, &options.default_schema);
     if !diagnostics.is_empty() {
         return Err(AnalysisError::Source(diagnostics));
@@ -171,7 +183,11 @@ pub fn analyze(files: &[SourceFile], options: &Options) -> Result<Analysis, Anal
     let managed = resolve::managed_schemas(&objects, options.managed_schemas.as_deref())
         .map_err(AnalysisError::Source)?;
 
-    let diagnostics = validate::check(&objects, &managed);
+    // Validity and seed checks are collected together, so a tree with a bad
+    // reference and a bad seed reports both in one run (impl-plan §12).
+    let mut diagnostics = validate::check(&objects, &managed);
+    let (seeds, seed_diagnostics) = seed::check(seed_files, &objects);
+    diagnostics.extend(seed_diagnostics);
     if !diagnostics.is_empty() {
         return Err(AnalysisError::Source(diagnostics));
     }
@@ -185,19 +201,23 @@ pub fn analyze(files: &[SourceFile], options: &Options) -> Result<Analysis, Anal
         .cloned()
         .collect();
 
+    let counts = Counts {
+        files: files.len(),
+        types: objects.types.len(),
+        tables: objects.tables.len(),
+        indexes: objects.indexes.len(),
+        foreign_keys: objects.foreign_keys.len(),
+        comments: objects.comments.len(),
+        seed_files: seeds.files.len(),
+        seed_statements: seeds.statement_count(),
+    };
     Ok(Analysis {
         managed_schemas: managed,
         order: order.order,
         cycles: order.cycles,
         documents,
         empty_schemas,
-        counts: Counts {
-            files: files.len(),
-            types: objects.types.len(),
-            tables: objects.tables.len(),
-            indexes: objects.indexes.len(),
-            foreign_keys: objects.foreign_keys.len(),
-            comments: objects.comments.len(),
-        },
+        seeds,
+        counts,
     })
 }

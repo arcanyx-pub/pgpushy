@@ -14,7 +14,7 @@ use crate::output::Output;
 use crate::plan_file::Plan;
 use crate::provider::{self, PgschemaBin};
 use crate::report;
-use crate::{discovery, hazard, outdir, pgschema};
+use crate::{discovery, hazard, outdir, pgschema, seeds};
 use anyhow::{Context, Result, bail};
 use pgpushy_core::{Analysis, AnalysisError, Options, SchemaName, analyze};
 use std::path::{Path, PathBuf};
@@ -107,6 +107,10 @@ pub fn plan(
         report::hazards(&hazards, false);
     }
 
+    if !session.analysis.seeds.is_empty() {
+        report::seeds_planned(&session.analysis.seeds);
+    }
+
     Ok(if cycles.is_empty() && hazards.is_empty() {
         Outcome::Ok
     } else {
@@ -164,7 +168,21 @@ pub fn apply(
     let lock_timeout = lock_timeout
         .map(ToOwned::to_owned)
         .or_else(|| session.connection.lock_timeout.clone());
-    session.apply_pass(&plans, lock_timeout.as_deref())
+    let outcome = session.apply_pass(&plans, lock_timeout.as_deref())?;
+
+    // Seeds run only once every schema has applied (spec §8.8): their tables
+    // are guaranteed to exist, with the modeled shape, only then.
+    let seeds = &session.analysis.seeds;
+    if seeds.is_empty() {
+        return Ok(outcome);
+    }
+    match outcome {
+        Outcome::Failed => {
+            report::seeds_not_attempted(seeds);
+            Ok(Outcome::Failed)
+        }
+        Outcome::Ok => seeds::execute(&session.connection, seeds, lock_timeout.as_deref()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -390,7 +408,19 @@ fn analyze_source(
     output: Output,
 ) -> Result<Option<Analysis>> {
     let root = canonical_root(&settings.source_root)?;
-    let discovered = discovery::discover(&root, &settings.exclude)?;
+    let seed_root = match &settings.seed_root {
+        Some(configured) => Some(canonical_seed_root(configured, &root)?),
+        None => None,
+    };
+    let discovered = discovery::discover(
+        &root,
+        &settings.exclude,
+        seed_root.as_deref().filter(|seed| seed.starts_with(&root)),
+    )?;
+    let seed_files = match &seed_root {
+        Some(seed) => discovery::discover(seed, &[], None)?.files,
+        None => Vec::new(),
+    };
 
     let options = Options {
         default_schema: SchemaName::new(&settings.default_schema),
@@ -402,13 +432,16 @@ fn analyze_source(
 
     report::configuration(loaded);
     report::discovery(&root, &discovered);
+    if let Some(seed) = &seed_root {
+        report::seed_discovery(seed, seed_files.len());
+    }
     if output.verbose {
         // The first thing to check when an exclusion is doing more or less
         // than expected.
         report::discovered_files(&discovered);
     }
 
-    match analyze(&discovered.files, &options) {
+    match analyze(&discovered.files, &seed_files, &options) {
         Ok(analysis) => Ok(Some(analysis)),
         Err(AnalysisError::Source(diagnostics)) => {
             report::diagnostics(&diagnostics);
@@ -433,6 +466,42 @@ fn canonical_root(root: &Path) -> Result<PathBuf> {
              \n\
              source_root names the directory pgpushy walks for *.sql files, not a \
              single file. Point it at the directory containing your schema.",
+            canonical.display(),
+        );
+    }
+    Ok(canonical)
+}
+
+/// Resolve and sanity-check the seed root against the source root (spec §4.6).
+fn canonical_seed_root(configured: &Path, source_root: &Path) -> Result<PathBuf> {
+    let canonical = configured
+        .canonicalize()
+        .with_context(|| format!("seed root {} does not exist", configured.display()))?;
+    if !canonical.is_dir() {
+        bail!(
+            "seed root {} is not a directory\n\
+             \n\
+             seed_root names the directory pgpushy walks for seed files, not a \
+             single file.",
+            canonical.display(),
+        );
+    }
+    if canonical == source_root {
+        bail!(
+            "seed_root and source_root are the same directory\n\
+             \n\
+             A seed file is not desired state (spec §4.6); give the seeds a \
+             directory of their own, beside or inside the source root.",
+        );
+    }
+    if source_root.starts_with(&canonical) {
+        bail!(
+            "source_root {} is inside seed_root {}\n\
+             \n\
+             Every schema file would then also be read as a seed and rejected by \
+             the seed allow-list (spec §4.6). Keep the seed root beside or inside \
+             the source root, never around it.",
+            source_root.display(),
             canonical.display(),
         );
     }

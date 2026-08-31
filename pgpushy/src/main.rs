@@ -10,6 +10,7 @@ mod cli;
 mod config;
 mod conn;
 mod discovery;
+mod generate;
 mod hazard;
 mod init;
 mod inspect;
@@ -20,6 +21,7 @@ mod plan_file;
 mod provider;
 mod report;
 mod run;
+mod seeds;
 mod tls;
 
 use clap::Parser;
@@ -81,6 +83,7 @@ error: {err:#}"
             *auto_approve,
             lock_timeout.as_deref(),
         ),
+        Command::Generate { check } => generate::run(&loaded, output, *check),
     };
 
     match result {
