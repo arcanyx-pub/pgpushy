@@ -1,9 +1,8 @@
 # pgpushy Specification
 
-**Version:** 0.5
+**Version:** 0.6
 **Date:** 2026-08-31
-**Status:** All 0.1 design decisions resolved (§15). §4.6, §4.7 and §8.8
-(seed files, generated sources) are specified but not yet implemented.
+**Status:** All design decisions resolved (§15).
 
 This document specifies **pgpushy**, a declarative Postgres schema-management
 tool that manages an entire database — all of its schemas — from a directory
@@ -207,7 +206,7 @@ following statements:
 | `CREATE TABLE` (with inline constraints) | 3, FKs lifted to 5 |
 | `CREATE [UNIQUE] INDEX` | 4 |
 | `ALTER TABLE … ADD CONSTRAINT` — foreign key | 5 |
-| `COMMENT ON` a schema, table, column, index, table constraint or sequence | 6 |
+| `COMMENT ON` a table, column, index or sequence | 6 |
 
 Any other statement MUST be a hard error naming the file, the line, and the
 statement kind, and directing the reader to §14 for the object kinds under
@@ -274,7 +273,8 @@ same reason the allow-list exists at all:
   sequence does not survive a dump-and-reapply (verified against pgschema
   1.12.0 — the standalone sequence is dropped and an owned one created in its
   place). An owned sequence is spelled `serial` or `GENERATED … AS IDENTITY`.
-- **`COMMENT ON` a type or a domain** MUST be rejected, though a comment on a
+- **`COMMENT ON` a type, a domain, a schema or a table constraint** MUST be
+  rejected, though a comment on a
   sequence is accepted. pgschema generates no DDL for either: verified against
   pgschema 1.12.3 by applying and re-planning, it emits the sequence's comment,
   omits the other two, applies everything else, and then reports no changes —
@@ -942,6 +942,23 @@ Inspection and seed execution (§8.8) are the only places pgpushy accesses the
 target directly — §8.8 reuses this section's resolution — and every statement
 outside §8.8 MUST be read-only.
 
+### 6.5 Policies and row-level security
+
+Inspection MUST also read, for every managed schema, the policies it holds
+and the tables with row-level security enabled (`pg_policy`,
+`pg_class.relrowsecurity`). Neither can be suppressed: pgschema's ignore file
+has no section for them, and §4.3 admits no way to describe them — so a
+managed schema holding either would have its policies dropped and its RLS
+disabled by reconciliation, which §8.4's rule forbids.
+
+The response follows §7's cycle semantics: fatal for `apply`, before anything
+is touched; reported by `plan`, which still shows the plans — the operator
+needs them to decide what to move — and exits non-zero. Every policy and
+every RLS-enabled table MUST be named, with the choices stated: drop the
+policy, or leave the schema out of the managed set. (Their plan steps,
+`table.policy` and `table.rls`, are also caught by §8.4's enforcement — the
+fail-closed net behind this check's friendlier message.)
+
 ## 7. Cross-Schema Ordering
 
 When a foreign key in one managed schema references a table in another
@@ -1012,7 +1029,9 @@ binary can be resolved, pgpushy MUST fail with an actionable message.
   `pgschema apply --schema S` for every managed schema in dependency order
   (§7), then execute the seed files (§8.8). Approval is governed by §8.6.
   `apply` MUST abort before touching the target if synthesis, any §4 or §7
-  check, the target inspection, or any plan in the preceding plan pass fails.
+  check, the target
+  inspection — including §6.5 — or any plan in the preceding plan pass
+  fails, or if any plan carries a step outside pgpushy's model (§8.4).
 
 - **`pgpushy generate`** — run each configured generator and (re)write its
   output file; with `--check`, write nothing and fail if any output is stale
@@ -1056,8 +1075,8 @@ pgschema invocation:
 
 ### 8.4 What pgpushy does not manage, pgschema must not touch
 
-Two axes of the target lie outside the managed set, and both need pgpushy to
-say so explicitly rather than let silence be read as intent.
+Three axes of the target lie outside the managed set, and each needs pgpushy
+to say so explicitly rather than let silence be read as intent.
 
 **Unmanaged schemas.** pgpushy reconciles exactly the managed-schema set
 (§4.4). Schemas present in the target database but absent from that set are
@@ -1075,8 +1094,32 @@ pgpushy MUST NOT let pgschema read intent into it. pgpushy therefore writes a
 `.pgschemaignore` into the working directory of §8.3 suppressing `[privileges]`
 and `[default_privileges]` for every run.
 
-One rule covers both axes: **what the source tree does not describe, pgpushy
-does not touch.** The consequence of getting either wrong is the same, and it
+**Unmanaged kinds.** A managed schema may hold objects of kinds pgpushy
+cannot describe — views, materialized views, functions, procedures,
+aggregates, triggers — installed by a migration pgpushy did not make, or
+owned by something else. §4.3 rejects them in *source*; their absence from
+the desired state therefore carries no intent, exactly as with privileges,
+and pgpushy MUST NOT let pgschema read one. Two layers deliver that, because
+one cannot:
+
+- The `.pgschemaignore` pgpushy writes suppresses the kinds — `[views]`,
+  `[materialized_views]`, `[functions]`, `[procedures]`, `[aggregates]`,
+  `[triggers]` (verified at 1.12.3: `[views]` alone also covers materialized
+  views; the extra section is insurance against an upstream split).
+- pgschema silently accepts ignore sections it does not know (verified), so
+  the file is ergonomics, not enforcement. pgpushy therefore also checks the
+  plans: any step whose type names a kind outside pgpushy's model MUST be
+  refused — reported by `plan`, which exits non-zero, and fatal for `apply`
+  before anything is touched (§8.6). An upstream rename of an ignore section
+  then fails loudly instead of re-arming the drops.
+
+This axis is what makes **partial adoption a supported path**: a database
+whose tables pgpushy manages keeps its views and functions wherever they came
+from. The two exceptions are policies and row-level security, which have no
+ignore section at all and are refused by name instead (§6.5).
+
+One rule covers all three axes: **what the source tree does not describe,
+pgpushy does not touch.** The consequence of getting either wrong is the same, and it
 is the reason the rule is stated rather than assumed — reconciliation drops
 things.
 
@@ -1141,8 +1184,9 @@ pgpushy MUST:
    schema being reconciled to an empty desired state (§4.4); when seed files
    exist the summary MUST list them with their statement counts, because the
    approval covers the seed writes too (§8.8);
-3. perform the §6.2 check against those plans, and refuse if it finds a
-   cross-schema removal the apply order cannot satisfy;
+3. perform the §6.2 check and §8.4's kind check against those plans, and
+   refuse on a cross-schema removal the apply order cannot satisfy or a step
+   outside pgpushy's model;
 4. state that apply is not atomic across schemas;
 5. prompt once, and abort without touching the target if the answer is no;
 6. on approval, apply **the plans it just showed** — `pgschema apply --plan
@@ -1158,7 +1202,11 @@ nobody approved.
 A summary of "how many schemas change" and which changes are destructive is
 read from those plans — each step carries its own operation — and not derived
 by pgpushy comparing anything, which would be reimplementing the diffing G3
-reserves for pgschema.
+reserves for pgschema. One refinement is required: a `drop` step paired with
+a `create` of the same kind and path is a **modification**, not a destructive
+change — pgschema's own rendering of a widened UNIQUE constraint is "1 to
+modify" over exactly such a pair (verified at 1.12.3) — so the summary and
+the §6.2 check MUST treat the pair as one alter.
 
 `pgpushy apply --auto-approve` skips step 5 for non-interactive use. When
 standard input is not a terminal and `--auto-approve` was not given, pgpushy
@@ -1372,13 +1420,28 @@ there, except that the environment variable supplying it is
 `PGPUSHY_PLAN_PASSWORD` — a separate variable, because the plan database is a
 separate server with separate credentials.
 
-> **Non-normative — this database is scratch, and is written to.** Verified
-> against pgschema 1.12.0: planning a schema `pd` leaves a schema `pd` behind
-> in the plan database afterwards. It is working space, not a read-only
-> reference, so it MUST NOT be a database that matters. The embedded default
-> needs none of this; an external plan database exists for environments where
-> spawning a Postgres is not possible, and for seeding objects pgpushy does not
-> manage (§14).
+An external plan database is working space, and it **accumulates**. Each run
+executes every document into it, and a closure member (§5.4) lands in its
+real, named schema, which pgschema never cleans — so a project with
+cross-schema references cannot plan twice against the same plan database: the
+second run fails on the first run's leftovers, midway through the loop
+(verified at 1.12.3). Following pgschema's own lead, pgpushy does not clean it
+either — it issues no DDL to the plan database, as to the target (§6) — the
+database is **single-use for such projects**, dropped and recreated between
+runs by the operator.
+
+What pgpushy MUST do is refuse early and by name rather than let the failure
+surface as pgschema's mid-loop error: before delegating, it checks the plan
+database, and if any managed schema there is non-empty, it refuses, naming
+the schemas and the remedy. An **empty** leftover schema MUST NOT be refused:
+a project with no cross-schema references executes its objects into
+pgschema's scratch schema and re-plans against the same plan database
+indefinitely (verified), and refusing it would break what works.
+
+> **Non-normative.** The plan database MUST NOT be one that matters. The
+> embedded default needs none of this; an external plan database exists for
+> environments where spawning a Postgres is not possible, and for seeding
+> objects pgpushy does not manage (§14).
 
 ### 10.5 Lock timeout
 
@@ -1554,13 +1617,20 @@ from by application code, which is the common reason to declare one; it does
 not cover using a shared sequence as a column default, for which `serial` or
 `GENERATED … AS IDENTITY` is the supported spelling.
 
-### 12.9 A type or a domain cannot be commented
+### 12.9 A type, a domain, a schema or a constraint cannot be commented
 
 pgschema drops `COMMENT ON TYPE` and `COMMENT ON DOMAIN` without applying them
 and without reporting it — the surrounding statements apply, the plan
 afterwards is empty, and the comment simply is not there. §4.3 rejects both
-rather than letting a comment quietly not exist. `COMMENT ON SEQUENCE` is
-unaffected and is managed normally (verified).
+rather than letting a comment quietly not exist.
+
+`COMMENT ON SCHEMA` and `COMMENT ON CONSTRAINT` fail the same way, found the
+same way — by applying and re-planning against 1.12.3: neither produces a
+plan step, neither lands in the catalog, and the plan afterwards is empty.
+Both were accepted through 0.1, which made its comment support for those two
+targets hollow; §4.3 now rejects them too, the honest narrowing. `COMMENT ON
+SEQUENCE` is unaffected and is managed normally (verified — its step folds
+under the sequence's own type rather than a `.comment` suffix).
 
 ### 12.10 Seeds ensure rows exist; they never delete
 
@@ -2079,3 +2149,43 @@ made after draft 2 of v0.1.
   DML only, from seed files only, after apply only, one transaction per file,
   under the environment's lock timeout. §6's guarantee — no DDL of pgpushy's
   own to the target — is intact, and `plan` remains read-only in effect. (§8.8)
+- **[0.6] Unmanaged kinds are suppressed and enforced, and partial adoption
+  is a supported path** — a managed schema's views, materialized views,
+  functions, procedures, aggregates and triggers are left alone: suppressed
+  through the `.pgschemaignore` pgpushy writes, and enforced by refusing any
+  plan step whose type falls outside pgpushy's model. Two layers because one
+  cannot serve: pgschema silently accepts ignore sections it does not know
+  (verified — `[not_a_real_section]` draws no error), so the file alone is a
+  hope pinned to an upstream TOML key, and an upstream rename would silently
+  re-arm the drops 0.1 shipped with. The step taxonomy backing the check was
+  measured, not assumed (impl-plan §1). Partial adoption — manage the tables,
+  keep the views wherever they came from — is a deliberate commitment, not a
+  transition state. (§8.4, §12.5)
+- **[0.6] Policies and row-level security are refused by name** — no ignore
+  section exists for either (verified), so they cannot be left alone, only
+  detected. Refusal beats what 0.1 did, which was silently plan `DROP POLICY`
+  and `DISABLE ROW LEVEL SECURITY`. The shape follows §7's cycle precedent:
+  fatal for `apply` before anything is touched, reported by `plan` alongside
+  the plans the operator needs, read during inspection so the message names
+  objects rather than plan steps. (§6.5, §8.4)
+- **[0.6] The external plan database is single-use, and pgpushy checks
+  rather than cleans** — closure members execute into real schemas pgschema
+  never cleans, so a cross-schema project cannot re-plan against the same
+  plan database. pgpushy follows pgschema's lead and issues no DDL there; it
+  refuses early — a non-empty managed schema in the plan database, named,
+  with the drop-and-recreate remedy — instead of surfacing pgschema's
+  mid-loop error. The check is precisely calibrated to what was measured: an
+  empty leftover schema is harmless (a single-schema project re-plans
+  indefinitely), and refusing it would break what works. (§10.4)
+- **[0.6] A schema or a constraint cannot be commented** — the same silent
+  drop as types and domains, found the same way: apply and re-plan shows no
+  step, no catalog row, and an empty plan. Accepted through 0.1, rejected
+  now; a narrowing of shipped behavior, taken deliberately, because a comment
+  that quietly does not exist is worse than one that is refused. (§4.3,
+  §12.9)
+- **[0.6] A drop paired with a create on the same kind and path is a
+  modification** — pgschema renders a widened UNIQUE constraint as "1 to
+  modify" over exactly such a pair (verified), so counting the drop half as
+  destructive misreports routine migrations, and the §6.2 check reading it as
+  a removal would refuse a change pgschema itself calls an alter. The §8.6
+  summary and §6.2 both pair before they count. (§6.2, §8.6)

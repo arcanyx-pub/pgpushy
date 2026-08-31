@@ -66,7 +66,7 @@ pub struct File {
 pub struct Pgschema {
     /// An explicit pgschema binary (the BYO backend).
     pub path: Option<PathBuf>,
-    /// Which backend to use. Only `byo` exists so far.
+    /// Which backend to use: `managed` (the default) or `byo`.
     pub backend: Option<String>,
     /// The pinned version, for the managed backend.
     pub version: Option<String>,

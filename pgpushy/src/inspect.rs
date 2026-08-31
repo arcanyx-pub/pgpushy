@@ -20,6 +20,8 @@ pub struct Inspection {
     pub missing_schemas: Vec<SchemaName>,
     /// Foreign keys crossing between two managed schemas (spec §6.2).
     pub cross_schema_foreign_keys: Vec<CrossSchemaForeignKey>,
+    /// Policies and RLS-enabled tables in managed schemas (spec §6.5).
+    pub policies: Vec<PolicyOrRls>,
     /// Which database pgpushy actually reached (spec §6.3).
     pub identity: Identity,
 }
@@ -42,6 +44,19 @@ pub struct CrossSchemaForeignKey {
     pub to_columns: Vec<String>,
     /// The unique or primary key constraint the foreign key depends on.
     pub to_constraint: Option<String>,
+}
+
+/// A policy, or an RLS-enabled table, in a managed schema (spec §6.5).
+///
+/// pgschema's ignore file has no section for either, and §4.3 admits no way
+/// to describe them, so reconciliation would drop the policy and disable the
+/// security — which §8.4 forbids. They are refused by name instead.
+#[derive(Debug, Clone)]
+pub struct PolicyOrRls {
+    pub schema: SchemaName,
+    pub table: String,
+    /// The policy's name, or `None` for the row-level-security flag itself.
+    pub policy: Option<String>,
 }
 
 /// Enough to identify the target unambiguously in output.
@@ -90,12 +105,89 @@ pub fn inspect(connection: &Resolved, managed: &[SchemaName]) -> Result<Inspecti
     let identity = read_identity(&mut client)?;
     let missing_schemas = missing_schemas(&mut client, managed)?;
     let cross_schema_foreign_keys = cross_schema_foreign_keys(&mut client, managed)?;
+    let policies = policies(&mut client, managed)?;
 
     Ok(Inspection {
         missing_schemas,
         cross_schema_foreign_keys,
+        policies,
         identity,
     })
+}
+
+/// Policies and RLS-enabled tables in the managed schemas (spec §6.5).
+fn policies(client: &mut Client, managed: &[SchemaName]) -> Result<Vec<PolicyOrRls>> {
+    if managed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let names: Vec<&str> = managed.iter().map(SchemaName::as_str).collect();
+    let rows = client
+        .query(
+            "SELECT n.nspname, c.relname, p.polname::text
+             FROM pg_policy p
+             JOIN pg_class c     ON c.oid = p.polrelid
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = ANY($1)
+             UNION ALL
+             SELECT n.nspname, c.relname, NULL
+             FROM pg_class c
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE c.relrowsecurity AND c.relkind = 'r' AND n.nspname = ANY($1)
+             ORDER BY 1, 2, 3",
+            &[&names],
+        )
+        .context("reading policies and row-level security from pg_policy")?;
+
+    Ok(rows
+        .iter()
+        .map(|row| PolicyOrRls {
+            schema: SchemaName::new(row.get::<_, String>(0)),
+            table: row.get(1),
+            policy: row.get(2),
+        })
+        .collect())
+}
+
+/// Managed schemas that are non-empty in the plan database (spec §10.4).
+///
+/// A previous run's closure members accumulate there and collide with this
+/// run's, midway through the loop, as pgschema's error. Read-only: pgpushy
+/// issues no DDL to the plan database either, following pgschema's own lead —
+/// the remedy is the operator's drop-and-recreate. An empty leftover schema
+/// is deliberately not reported: a project with no cross-schema references
+/// re-plans against the same plan database indefinitely (verified), and
+/// refusing it would break what works.
+pub fn plan_db_leftovers(
+    plan: &crate::conn::PlanConnection,
+    managed: &[SchemaName],
+) -> Result<Vec<SchemaName>> {
+    let (config, sslmode) = plan.pg_config()?;
+    let mut client = match tls::connector(sslmode)? {
+        Some(tls) => config.connect(tls),
+        None => config.connect(NoTls),
+    }
+    .with_context(|| format!("connecting to the plan database {}", plan.describe()))?;
+
+    let names: Vec<&str> = managed.iter().map(SchemaName::as_str).collect();
+    let rows = client
+        .query(
+            "SELECT DISTINCT nspname FROM (
+                 SELECT n.nspname
+                 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname = ANY($1)
+                 UNION ALL
+                 SELECT n.nspname
+                 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
+                 WHERE n.nspname = ANY($1) AND t.typtype IN ('d', 'e')
+             ) s ORDER BY nspname",
+            &[&names],
+        )
+        .context("reading leftover state from the plan database")?;
+
+    Ok(rows
+        .iter()
+        .map(|row| SchemaName::new(row.get::<_, String>(0)))
+        .collect())
 }
 
 /// Foreign keys on the target that cross between two managed schemas.

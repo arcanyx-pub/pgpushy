@@ -17,7 +17,7 @@ pub fn check(objects: &Objects, managed: &[SchemaName]) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     duplicate_objects(objects, &mut diagnostics);
     unresolved_references(objects, managed, &mut diagnostics);
-    type_references(objects, &mut diagnostics);
+    type_references(objects, managed, &mut diagnostics);
     colliding_unnamed_foreign_keys(objects, &mut diagnostics);
     diagnostics
 }
@@ -204,7 +204,7 @@ fn colliding_unnamed_foreign_keys(objects: &Objects, diagnostics: &mut Vec<Diagn
 /// foreign key is the only reference 0.1 lets cross, because FK-lift is what
 /// makes a foreign key not a creation-time dependency; anything else would
 /// drag a transitive closure of another schema's objects behind it (§12.6).
-fn type_references(objects: &Objects, diagnostics: &mut Vec<Diagnostic>) {
+fn type_references(objects: &Objects, managed: &[SchemaName], diagnostics: &mut Vec<Diagnostic>) {
     let defined: BTreeMap<&QualifiedName, &crate::model::TypeLike> = objects
         .types
         .iter()
@@ -214,15 +214,53 @@ fn type_references(objects: &Objects, diagnostics: &mut Vec<Diagnostic>) {
     let referrers = objects
         .tables
         .iter()
-        .map(|table| (&table.name, "table", &table.depends_on, &table.origin))
-        .chain(
-            objects
-                .types
-                .iter()
-                .map(|kind| (&kind.name, "type", &kind.depends_on, &kind.origin)),
-        );
+        .map(|table| {
+            (
+                &table.name,
+                "table",
+                &table.depends_on,
+                &table.unresolved,
+                &table.origin,
+            )
+        })
+        .chain(objects.types.iter().map(|kind| {
+            (
+                &kind.name,
+                "type",
+                &kind.depends_on,
+                &kind.unresolved,
+                &kind.origin,
+            )
+        }));
 
-    for (owner, what, references, origin) in referrers {
+    for (owner, what, references, unresolved, origin) in referrers {
+        // A qualified reference into a managed schema that the tree does not
+        // define cannot exist in the plan database, whose managed schemas
+        // hold only what the tree describes — so it would fail mid-plan-loop
+        // as pgschema's error rather than pgpushy's (G5). An unresolved name
+        // in an unmanaged schema is left alone: it may be an extension's,
+        // which is §14 territory either way.
+        for referenced in unresolved {
+            if !managed.contains(&referenced.schema) {
+                continue;
+            }
+            diagnostics.push(
+                Diagnostic::new(
+                    DiagnosticKind::UnresolvedReference,
+                    format!(
+                        "{what} {owner} uses {referenced}, which the source tree does not define"
+                    ),
+                    vec![origin.clone()],
+                )
+                .with_help(format!(
+                    "{} is a managed schema, and in the plan database it holds only what \
+                     the source tree defines — this reference cannot resolve there. Define \
+                     {referenced} in the tree; a type provided by an extension is not \
+                     supported in this version (spec §14).",
+                    referenced.schema
+                )),
+            );
+        }
         for referenced in references {
             let Some(target) = defined.get(referenced) else {
                 diagnostics.push(

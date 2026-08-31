@@ -152,6 +152,3 @@ pub enum CoreError {
     )]
     TypeCycle { names: Vec<String> },
 }
-
-/// Analysis either succeeds or yields every problem it found.
-pub type Analysis<T> = Result<T, Vec<Diagnostic>>;

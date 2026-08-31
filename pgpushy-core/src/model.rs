@@ -106,6 +106,13 @@ pub struct Table {
     /// Carried so that a table pulled into another schema's document as a
     /// closure member brings the types it is written in (spec §5.4).
     pub depends_on: Vec<QualifiedName>,
+    /// Qualified type or literal references the tree does not define.
+    ///
+    /// Recorded rather than dropped during resolution: when the schema turns
+    /// out to be managed, the reference cannot exist in the plan database,
+    /// and [`crate::validate`] reports it instead of pgschema failing
+    /// mid-loop (spec §4.5).
+    pub unresolved: Vec<QualifiedName>,
     pub ast: CreateStmt,
 }
 
@@ -171,6 +178,8 @@ pub struct TypeLike {
     /// satisfy, and [`crate::validate`] reports it rather than ordering around
     /// it.
     pub depends_on: Vec<QualifiedName>,
+    /// As on [`Table`]: qualified references the tree does not define.
+    pub unresolved: Vec<QualifiedName>,
     pub ast: pg_query::NodeEnum,
 }
 

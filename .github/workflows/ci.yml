@@ -34,7 +34,9 @@ jobs:
         # that. Changing either constant without changing this matrix makes
         # one of them a claim nothing tests.
         pgschema: ["1.12.0", "1.12.3"]
-        postgres: ["18"]
+        # pgschema states PG 14-17; 18 is what the dev container runs. Both
+        # ends of the claimed range plus the local reality.
+        postgres: ["14", "17", "18"]
     services:
       postgres:
         image: postgres:${{ matrix.postgres }}-alpine

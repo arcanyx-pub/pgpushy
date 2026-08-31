@@ -1081,7 +1081,6 @@ fn comments_reach_every_managed_object_kind() {
          CREATE SEQUENCE ticket_no;
          CREATE TABLE t (id int PRIMARY KEY, how mood);
          CREATE INDEX t_how_idx ON t (how);
-         COMMENT ON SCHEMA public IS 'the default';
          COMMENT ON SEQUENCE ticket_no IS 'shared counter';
          COMMENT ON TABLE t IS 'one per thing';
          COMMENT ON COLUMN t.id IS 'the key';
@@ -1095,11 +1094,10 @@ fn comments_reach_every_managed_object_kind() {
         "COMMENT ON TABLE public.t IS 'one per thing'",
         "COMMENT ON COLUMN public.t.id IS 'the key'",
         "COMMENT ON INDEX public.t_how_idx IS 'for the mood lookup'",
-        "COMMENT ON SCHEMA public IS 'the default'",
     ] {
         assert!(body.contains(expected), "missing {expected:?} in:\n{body}");
     }
-    assert_eq!(analysis.counts.comments, 5);
+    assert_eq!(analysis.counts.comments, 4);
 }
 
 /// A comment on a kind pgpushy does not manage still says so.

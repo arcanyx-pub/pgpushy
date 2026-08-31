@@ -88,6 +88,24 @@ impl PlanConnection {
     pub fn describe(&self) -> String {
         format!("{}@{}:{}/{}", self.user, self.host, self.port, self.db)
     }
+
+    /// The driver configuration for pgpushy's own read-only look at the plan
+    /// database (spec §10.4), built the way the target's is and interpreting
+    /// `sslmode` the same way (§6.4).
+    pub fn pg_config(&self) -> Result<(postgres::Config, SslMode)> {
+        let sslmode = SslMode::parse(&self.sslmode, "plan_db")?;
+        let mut config = postgres::Config::new();
+        config
+            .host(&self.host)
+            .port(self.port)
+            .dbname(&self.db)
+            .user(&self.user)
+            .ssl_mode(Security::for_mode(sslmode).fallback);
+        if let Some(password) = &self.password {
+            config.password(password);
+        }
+        Ok((config, sslmode))
+    }
 }
 
 /// Where the password actually in use came from.
@@ -471,6 +489,28 @@ mod tests {
         for mode in ["disable", "prefer", "require", "verify-ca", "verify-full"] {
             assert!(error.contains(mode), "{mode} is not named: {error}");
         }
+    }
+
+    /// The plan database's flags never carry its password (spec §10.4): it
+    /// travels as PGSCHEMA_PLAN_PASSWORD, out of the process list.
+    #[test]
+    fn plan_database_flags_never_carry_the_password() {
+        let mut target = target();
+        target.plan_db = Some(ResolvedPlanDatabase {
+            host: "plan.example".into(),
+            port: 5432,
+            db: "plan".into(),
+            user: "planner".into(),
+            sslmode: "disable".into(),
+            password: Some("zzz-plan-secret-zzz".into()),
+        });
+        let flags = Resolved::build(&target, None, None)
+            .unwrap()
+            .pgschema_flags()
+            .join(" ");
+        assert!(flags.contains("--plan-db plan"), "{flags}");
+        assert!(!flags.contains("--plan-password"), "{flags}");
+        assert!(!flags.contains("zzz-plan-secret-zzz"), "{flags}");
     }
 
     #[test]

@@ -56,6 +56,25 @@ impl Step {
     }
 }
 
+/// Every step type pgpushy's model can produce, measured against pgschema
+/// 1.12.3 (impl-plan §1). A step outside this list is a change to something
+/// the source tree cannot describe, which §8.4 forbids pgpushy to touch —
+/// the enforcement behind the `.pgschemaignore` suppression, and the net
+/// that catches an upstream ignore-section rename loudly instead of letting
+/// it re-arm the drops.
+const MODEL_KINDS: &[&str] = &[
+    "table",
+    "table.column",
+    "table.constraint",
+    "table.index",
+    "table.comment",
+    "table.column.comment",
+    "table.index.comment",
+    "sequence",
+    "type",
+    "domain",
+];
+
 impl Plan {
     /// Read a plan pgschema wrote.
     pub fn read(path: &Path) -> Result<Self> {
@@ -88,8 +107,45 @@ impl Plan {
         self.steps().filter(|step| step.is_drop())
     }
 
-    pub fn drop_count(&self) -> usize {
-        self.drops().count()
+    /// Steps naming a kind outside pgpushy's model (spec §8.4).
+    pub fn unmanaged_steps(&self) -> Vec<&Step> {
+        self.steps()
+            .filter(|step| !MODEL_KINDS.contains(&step.kind.as_str()))
+            .collect()
+    }
+
+    /// `(kind, path)` pairs that both drop and create — a modification worn
+    /// as two steps. pgschema renders a widened UNIQUE constraint exactly
+    /// this way and calls it "1 to modify" (spec §8.6), so counting the drop
+    /// half as destructive misreports routine migrations.
+    fn recreated(&self) -> std::collections::BTreeSet<(&str, &str)> {
+        let mut dropped = std::collections::BTreeSet::new();
+        let mut created = std::collections::BTreeSet::new();
+        for step in self.steps() {
+            let key = (step.kind.as_str(), step.path.as_str());
+            match step.operation.as_str() {
+                "drop" => {
+                    dropped.insert(key);
+                }
+                "create" => {
+                    created.insert(key);
+                }
+                _ => {}
+            }
+        }
+        dropped.intersection(&created).copied().collect()
+    }
+
+    /// Drops that actually remove something: the unpaired ones (spec §8.6).
+    pub fn destructive_drops(&self) -> Vec<&Step> {
+        let recreated = self.recreated();
+        self.drops()
+            .filter(|step| !recreated.contains(&(step.kind.as_str(), step.path.as_str())))
+            .collect()
+    }
+
+    pub fn destructive_count(&self) -> usize {
+        self.destructive_drops().len()
     }
 }
 
@@ -122,7 +178,7 @@ mod tests {
     fn reads_steps_and_counts_drops() {
         let plan: Plan = serde_json::from_str(WITH_CHANGES).unwrap();
         assert_eq!(plan.step_count(), 2);
-        assert_eq!(plan.drop_count(), 1);
+        assert_eq!(plan.destructive_count(), 1);
         assert!(!plan.is_empty());
 
         let drop = plan.drops().next().unwrap();
@@ -135,7 +191,7 @@ mod tests {
         let plan: Plan = serde_json::from_str(EMPTY).unwrap();
         assert!(plan.is_empty());
         assert_eq!(plan.step_count(), 0);
-        assert_eq!(plan.drop_count(), 0);
+        assert_eq!(plan.destructive_count(), 0);
     }
 
     /// Fields pgpushy does not name must not break it, so that a pgschema
@@ -148,5 +204,43 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan.step_count(), 1);
+    }
+
+    /// A drop paired with a create on the same kind and path is a
+    /// modification (spec §8.6): pgschema renders a widened UNIQUE as
+    /// exactly this pair and calls it "1 to modify".
+    #[test]
+    fn a_recreated_object_is_not_destructive() {
+        let plan: Plan = serde_json::from_str(
+            r#"{"groups":[{"steps":[
+                {"type":"table.constraint","operation":"drop","path":"public.p.p_alt"},
+                {"type":"table.constraint","operation":"create","path":"public.p.p_alt"},
+                {"type":"table.column","operation":"drop","path":"public.p.old"}
+            ]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(plan.drops().count(), 2);
+        assert_eq!(plan.destructive_count(), 1);
+        assert_eq!(plan.destructive_drops()[0].path, "public.p.old");
+    }
+
+    /// Steps outside pgpushy's model are the §8.4 tripwire's business; steps
+    /// inside it are not.
+    #[test]
+    fn steps_outside_the_model_are_reported() {
+        let plan: Plan = serde_json::from_str(
+            r#"{"groups":[{"steps":[
+                {"type":"table","operation":"create","path":"a.t"},
+                {"type":"view","operation":"drop","path":"a.v"},
+                {"type":"table.rls","operation":"drop","path":"a.t"}
+            ]}]}"#,
+        )
+        .unwrap();
+        let outside: Vec<&str> = plan
+            .unmanaged_steps()
+            .iter()
+            .map(|step| step.kind.as_str())
+            .collect();
+        assert_eq!(outside, ["view", "table.rls"]);
     }
 }

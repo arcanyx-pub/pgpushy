@@ -13,9 +13,17 @@ that decides whether you can move at all.
 
 ## Can you move yet? Check this first
 
-pgpushy 0.1 manages a strict **subset** of what pgschema manages. If your
-desired state contains a view or a function, you cannot migrate today — pgpushy
-rejects the file rather than passing the statement through.
+pgpushy manages a strict **subset** of what pgschema manages, and a source
+file containing anything outside it is rejected rather than passed through.
+That no longer decides adoption on its own, though: **partial adoption is a
+supported path**. Objects of kinds pgpushy cannot describe — views,
+materialized views, functions, procedures, aggregates, triggers — are left
+exactly as they are in a managed schema (spec §8.4), so you can move your
+tables to pgpushy today and keep the rest wherever it lives, as long as the
+rest is not *described in the source tree*. The one hard blocker is
+row-level security: a policy or an RLS-enabled table in a managed schema is
+refused by name (spec §6.5), so such a schema must stay out of the managed
+set until the policies move or go.
 
 | Object kind | pgschema | pgpushy 0.1 |
 |---|---|---|
@@ -24,8 +32,8 @@ rejects the file rather than passing the statement through.
 | foreign keys, including cross-schema | yes | yes |
 | `CREATE TYPE`, `CREATE DOMAIN` | yes | yes |
 | `CREATE SEQUENCE` (standalone) | yes | yes |
-| `COMMENT ON` a table, column, index, constraint, schema or sequence | yes | yes |
-| `COMMENT ON` a type or a domain | yes | **rejected** |
+| `COMMENT ON` a table, column, index or sequence | yes | yes |
+| `COMMENT ON` a type, domain, schema or constraint | yes | **rejected** |
 | `CREATE VIEW`, `CREATE MATERIALIZED VIEW` | yes | **rejected** |
 | `CREATE FUNCTION`, `CREATE PROCEDURE`, `CREATE AGGREGATE` | yes | **rejected** |
 | `CREATE TRIGGER` | yes | **rejected** |
@@ -533,6 +541,20 @@ error: 1 managed schema is missing from the target
 
 pgpushy never drops a schema either, and schemas outside the managed set are
 neither planned nor modified.
+
+**Kinds pgpushy cannot describe are left exactly as found.** A managed
+schema's views, materialized views, functions, procedures, aggregates and
+triggers are suppressed in that same `.pgschemaignore`, and enforced the same
+way privileges are not: any plan step that names a kind outside pgpushy's
+model is refused outright (spec §8.4). This is what makes partial adoption
+work — pgpushy reconciles the tables it is given and does not treat the
+absence of your views from the source tree as a request to drop them.
+
+**Policies and row-level security are the exception**, because pgschema's
+ignore file has no section for them: they can be neither described nor left
+alone. A managed schema holding either is refused, with every policy and
+RLS-enabled table named (spec §6.5); `plan` still shows the plans and exits
+non-zero, and `apply` refuses before touching anything.
 
 ## Running it the first time
 

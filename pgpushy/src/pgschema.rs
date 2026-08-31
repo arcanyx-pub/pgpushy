@@ -137,6 +137,30 @@ pub fn write_ignore_file(directory: &Path) -> Result<()> {
          patterns = [\"*\"]\n\
          \n\
          [default_privileges]\n\
+         patterns = [\"*\"]\n\
+         \n\
+         # Nor does it manage these kinds (spec §8.4): a managed schema keeps\n\
+         # its views, functions and triggers wherever they came from. This\n\
+         # file is the suppression; the plan-step check in plan_file.rs is\n\
+         # the enforcement, since pgschema silently accepts sections it does\n\
+         # not know. [views] also covers materialized views at 1.12.3; the\n\
+         # extra section is insurance against an upstream split.\n\
+         [views]\n\
+         patterns = [\"*\"]\n\
+         \n\
+         [materialized_views]\n\
+         patterns = [\"*\"]\n\
+         \n\
+         [functions]\n\
+         patterns = [\"*\"]\n\
+         \n\
+         [procedures]\n\
+         patterns = [\"*\"]\n\
+         \n\
+         [aggregates]\n\
+         patterns = [\"*\"]\n\
+         \n\
+         [triggers]\n\
          patterns = [\"*\"]\n",
     )
     .with_context(|| format!("writing .pgschemaignore in {}", directory.display()))

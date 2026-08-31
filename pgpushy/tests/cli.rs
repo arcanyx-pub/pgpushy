@@ -1121,3 +1121,59 @@ fn generate_refuses_to_overwrite_a_non_utf8_file() {
     let bytes = std::fs::read(dir.path().join("gen.sql")).expect("read");
     assert_eq!(bytes, [0xff, 0xfe, 0x00, 0xc0, 0xc1]);
 }
+
+// ---------------------------------------------------------------------------
+// Comment narrowing (spec §12.9) and unresolved references (spec §4.5)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_comment_on_a_schema_or_constraint_is_rejected() {
+    let dir = tree(&[(
+        "t.sql",
+        "CREATE TABLE customers (id int PRIMARY KEY, CONSTRAINT c_pk_extra UNIQUE (id));\n\
+         COMMENT ON SCHEMA public IS 'nope';\n\
+         COMMENT ON CONSTRAINT c_pk_extra ON customers IS 'nope';",
+    )]);
+
+    validate(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "COMMENT ON a schema or a table constraint",
+        ))
+        .stderr(predicates::str::contains("t.sql:2"))
+        .stderr(predicates::str::contains("t.sql:3"))
+        .stderr(predicates::str::contains("spec §12.9"));
+}
+
+/// A qualified reference into a managed schema that the tree does not define
+/// used to detonate mid-plan-loop as pgschema's error; validate now catches
+/// it offline (spec §4.5).
+#[test]
+fn a_qualified_type_the_tree_does_not_define_is_rejected() {
+    let dir = tree(&[(
+        "t.sql",
+        "CREATE TABLE customers (id int PRIMARY KEY, tag public.label);",
+    )]);
+
+    validate(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "uses public.label, which the source tree does not define",
+        ))
+        .stderr(predicates::str::contains("managed schema"));
+}
+
+/// An unqualified unknown name stays permitted: `text` and an extension's
+/// type are indistinguishable offline, and rejecting them would reject the
+/// built-ins (see resolve.rs).
+#[test]
+fn an_unqualified_unknown_type_still_passes_validate() {
+    let dir = tree(&[(
+        "t.sql",
+        "CREATE TABLE customers (id int PRIMARY KEY, name text);",
+    )]);
+
+    validate(dir.path()).assert().success();
+}
