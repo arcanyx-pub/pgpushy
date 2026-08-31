@@ -417,9 +417,12 @@ fn analyze_source(
         &settings.exclude,
         seed_root.as_deref().filter(|seed| seed.starts_with(&root)),
     )?;
-    let seed_files = match &seed_root {
-        Some(seed) => discovery::discover(seed, &[], None)?.files,
-        None => Vec::new(),
+    let (seed_files, seed_generated) = match &seed_root {
+        Some(seed) => {
+            let found = discovery::discover(seed, &[], None)?;
+            (found.files, found.generated)
+        }
+        None => (Vec::new(), 0),
     };
 
     let options = Options {
@@ -433,7 +436,7 @@ fn analyze_source(
     report::configuration(loaded);
     report::discovery(&root, &discovered);
     if let Some(seed) = &seed_root {
-        report::seed_discovery(seed, seed_files.len());
+        report::seed_discovery(seed, seed_files.len(), seed_generated);
     }
     if output.verbose {
         // The first thing to check when an exclusion is doing more or less

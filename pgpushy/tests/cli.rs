@@ -1065,3 +1065,59 @@ fn generate_with_no_entries_is_a_no_op() {
         .success()
         .stdout(predicates::str::contains("no [[generate]] entries"));
 }
+
+/// Argv means argv: metacharacters reach the command as data, never a shell.
+#[test]
+fn generate_arguments_are_not_shell_interpreted() {
+    let dir = project(
+        "[[generate]]\n\
+         output = \"gen.sql\"\n\
+         command = [\"echo\", \"CREATE TABLE public.g (id int PRIMARY KEY); -- $HOME ; touch pwned\"]\n",
+        &[("customers.sql", CUSTOMERS)],
+    );
+
+    generate(dir.path(), false).assert().success();
+
+    let written = std::fs::read_to_string(dir.path().join("gen.sql")).expect("file written");
+    assert!(written.contains("$HOME"), "{written}");
+    assert!(written.contains("; touch pwned"), "{written}");
+    assert!(!dir.path().join("pwned").exists());
+}
+
+/// An excluded output is a generated file nothing will discover (spec §4.7).
+#[test]
+fn a_generate_output_may_not_be_excluded() {
+    let dir = project(
+        "exclude = [\"gen.sql\"]\n\
+         \n\
+         [[generate]]\n\
+         output = \"gen.sql\"\n\
+         command = [\"echo\", \"x\"]\n",
+        &[("customers.sql", CUSTOMERS)],
+    );
+
+    generate(dir.path(), false)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("exclude pattern"));
+}
+
+/// A file generate cannot even read as text is a file it did not write.
+#[test]
+fn generate_refuses_to_overwrite_a_non_utf8_file() {
+    let dir = project(
+        "[[generate]]\noutput = \"gen.sql\"\ncommand = [\"echo\", \"x\"]\n",
+        &[("customers.sql", CUSTOMERS)],
+    );
+    std::fs::write(dir.path().join("gen.sql"), [0xff, 0xfe, 0x00, 0xc0, 0xc1])
+        .expect("write binary");
+
+    generate(dir.path(), false)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("generated-source marker"));
+
+    // The refusal left the bytes alone.
+    let bytes = std::fs::read(dir.path().join("gen.sql")).expect("read");
+    assert_eq!(bytes, [0xff, 0xfe, 0x00, 0xc0, 0xc1]);
+}

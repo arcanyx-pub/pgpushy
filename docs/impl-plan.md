@@ -389,7 +389,7 @@ pgpushy/
     src/output.rs           # verbosity and color, resolved once
     src/report.rs           # user-facing output, routed through one place
     src/run.rs              # orchestrates validate/plan/apply
-    src/seed_run.rs         # seed execution: per-file transaction + probe (spec §8.8)
+    src/seeds.rs            # seed execution: per-file transaction + probe (spec §8.8)
     src/generate.rs         # `pgpushy generate` and --check (spec §4.7)
     tests/                  # integration (real pgschema + Postgres)
 ```
@@ -942,7 +942,7 @@ comparing anything.
   explicit column list with no GENERATED ALWAYS column; qualified table), and
   the model checks (table, columns, conflict target), all string-literal
   testable. Binary: discovery under
-  `seed_root`, `seed_run.rs` (per-file transaction, empty `search_path`,
+  `seed_root`, `seeds.rs` (per-file transaction, empty `search_path`,
   `lock_timeout`, execute-record-probe-commit), the §8.6 summary line, §9
   reporting. Ships the snowdrop story with a hand-vendored seed file; M15 is
   not a prerequisite.

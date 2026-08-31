@@ -1574,3 +1574,34 @@ fn a_guarded_do_update_corrects_and_converges() {
         .success()
         .stdout(predicates::str::contains("0 rows affected; probe passed"));
 }
+
+/// Seeds are writes, so an apply that has only seeds to do still needs the
+/// approval gate (spec §8.6, §8.8): without a terminal and without
+/// --auto-approve it refuses, and nothing lands.
+#[test]
+fn seeds_require_approval_without_auto_approve() {
+    let target = require_target!();
+    let schema = unique_schema("approval");
+    let _schemas = Schemas::create(&target, std::slice::from_ref(&schema));
+
+    let project = target.project(
+        "seed_root = \"seeds\"\n",
+        &[
+            (
+                "t.sql",
+                format!("CREATE TABLE {schema}.t (id int PRIMARY KEY);"),
+            ),
+            (
+                "seeds/rows.sql",
+                format!("INSERT INTO {schema}.t (id) VALUES (1) ON CONFLICT (id) DO NOTHING;"),
+            ),
+        ],
+    );
+
+    project
+        .command("apply")
+        .assert()
+        .failure()
+        .stdout(predicates::str::contains("seed file"))
+        .stderr(predicates::str::contains("--auto-approve"));
+}

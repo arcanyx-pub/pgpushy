@@ -45,11 +45,15 @@ pub fn execute(
         }
 
         let mut rows: u64 = 0;
+        let mut per_statement: Vec<(u32, u64)> = Vec::new();
         let mut failed = false;
 
         for stmt in &file.statements {
             match tx.execute(stmt.sql.as_str(), &[]) {
-                Ok(count) => rows += count,
+                Ok(count) => {
+                    rows += count;
+                    per_statement.push((stmt.origin.line, count));
+                }
                 Err(err) => {
                     report::seed_statement_error(&file.path, &stmt.origin, &err);
                     failed = true;
@@ -92,7 +96,7 @@ pub fn execute(
 
         tx.commit()
             .with_context(|| format!("committing seed {}", file.path))?;
-        report::seed_applied(&file.path, rows);
+        report::seed_applied(&file.path, rows, &per_statement);
         applied.push(file.path.clone());
     }
 
