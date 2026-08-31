@@ -42,8 +42,8 @@ The scope is narrow, and a source tree containing anything outside it is
 
 **Supported.** Tables, indexes, inline table constraints (`CHECK`, `UNIQUE`,
 `PRIMARY KEY`, `EXCLUDE`), foreign keys, user-defined types, domains,
-standalone sequences, and `COMMENT ON` a schema, table, column, index, table
-constraint or sequence. A comment on a *type* or a *domain* is rejected, not
+standalone sequences, and `COMMENT ON` a table, column, index or sequence. A
+comment on a *type*, a *domain*, a *schema* or a *constraint* is rejected, not
 because pgpushy cannot express it but because pgschema drops it without
 applying it and without saying so.
 
@@ -51,6 +51,14 @@ applying it and without saying so.
 policies, `GRANT`/`REVOKE`, `CREATE EXTENSION`, every `DROP`, and all DML.
 Widening this towards parity with the statement set pgschema itself supports is
 the main direction of travel; see [`docs/spec.md`](docs/spec.md) §14.
+
+**Partial adoption is a supported path.** A managed schema's existing views,
+materialized views, functions, procedures, aggregates and triggers are left
+exactly as they are — suppressed in the ignore file pgpushy hands pgschema,
+and enforced by refusing any plan that would touch a kind outside pgpushy's
+model. Manage your tables with pgpushy today; keep the rest wherever it came
+from. The one exception is row-level security: a policy or an RLS-enabled
+table in a managed schema cannot be suppressed and is refused by name.
 
 Rejection rather than pass-through is deliberate. pgpushy schema-qualifies
 every identifier it emits, because an unqualified one is misattributed to

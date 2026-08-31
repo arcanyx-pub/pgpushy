@@ -32,10 +32,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a dependency bump that changes the emitted SQL must land as a reviewed
   diff. `generate` never overwrites a file it cannot prove it wrote.
 
+### Fixed
+
+- **A managed schema's unmanageable objects are no longer dropped.** 0.1
+  planned `DROP VIEW`, `DROP FUNCTION`, `DROP TRIGGER` and the rest for any
+  object it could not describe, violating the spec's own rule that what the
+  source tree does not describe, pgpushy does not touch. Those kinds are now
+  suppressed in the `.pgschemaignore` pgpushy writes — and enforced: any plan
+  step naming a kind outside pgpushy's model is refused, so an upstream
+  ignore-section rename fails loudly instead of re-arming the drops. Partial
+  adoption is a supported path. Policies and row-level security have no
+  suppression lever and are refused by name instead of silently removed
+  (spec §6.5, §8.4).
+- **A stale external plan database is refused by name.** A cross-schema
+  project's closure members accumulate in an external plan database, and the
+  second run used to fail midway through the loop with pgschema's
+  `relation … already exists`. pgpushy now checks before delegating and
+  refuses when a managed schema there is non-empty, naming the schemas and
+  the drop-and-recreate remedy. A single-schema project keeps re-planning
+  against the same plan database, as it always could (spec §10.4).
+- **A qualified type or literal reference into a managed schema that the
+  tree does not define is rejected at `validate`**, instead of failing
+  mid-plan-loop as pgschema's error (spec §4.5).
+- **A recreated object no longer reads as destructive.** pgschema renders a
+  widened UNIQUE constraint as a drop plus a create on one path and calls it
+  a modify; the approval summary and the cross-schema removal check now pair
+  the steps before counting (spec §8.6).
+
 ### Changed
 
 - `apply` gains a write path to the target, scoped to seed DML: pgpushy
   still issues no DDL of its own, and `plan` still executes nothing.
+- **`COMMENT ON SCHEMA` and `COMMENT ON CONSTRAINT` are rejected.** Both were
+  accepted through 0.1 and silently dropped by pgschema — no plan step,
+  nothing in the catalog — the same class as type and domain comments, found
+  the same way. A comment that quietly does not exist is worse than one that
+  is refused (spec §12.9).
 
 ## [0.1.1] - 2026-08-18
 

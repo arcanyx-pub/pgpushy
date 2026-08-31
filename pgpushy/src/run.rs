@@ -11,7 +11,7 @@ use crate::config::{self, Loaded, Settings};
 use crate::conn::Resolved;
 use crate::inspect::{self, Inspection};
 use crate::output::Output;
-use crate::plan_file::Plan;
+use crate::plan_file::{Plan, Step};
 use crate::provider::{self, PgschemaBin};
 use crate::report;
 use crate::{discovery, hazard, outdir, pgschema, seeds};
@@ -96,6 +96,13 @@ pub fn plan(
         report::plans_are_diagnostic_only();
     }
 
+    // Spec §6.5: reported like a cycle — the plans are still computed and
+    // shown, because the operator needs them, and the run fails at the end.
+    let refused = &session.inspection.policies;
+    if !refused.is_empty() {
+        report::policies_refused(refused, false);
+    }
+
     let Some(plans) = session.plan_pass()? else {
         return Ok(Outcome::Failed);
     };
@@ -107,15 +114,24 @@ pub fn plan(
         report::hazards(&hazards, false);
     }
 
+    // Spec §8.4: a step outside pgpushy's model means pgschema would touch
+    // what the source tree cannot describe.
+    let violations = unmanaged_violations(&plans);
+    if !violations.is_empty() {
+        report::unmanaged_steps(&violations, false);
+    }
+
     if !session.analysis.seeds.is_empty() {
         report::seeds_planned(&session.analysis.seeds);
     }
 
-    Ok(if cycles.is_empty() && hazards.is_empty() {
-        Outcome::Ok
-    } else {
-        Outcome::Failed
-    })
+    Ok(
+        if cycles.is_empty() && hazards.is_empty() && refused.is_empty() && violations.is_empty() {
+            Outcome::Ok
+        } else {
+            Outcome::Failed
+        },
+    )
 }
 
 /// `pgpushy apply` — plan, review, approve, then apply the reviewed plans.
@@ -142,11 +158,26 @@ pub fn apply(
         return Ok(Outcome::Failed);
     }
 
+    // Spec §6.5: fatal here, before anything is touched.
+    let refused = &session.inspection.policies;
+    if !refused.is_empty() {
+        report::policies_refused(refused, true);
+        return Ok(Outcome::Failed);
+    }
+
     // Spec §8.6 step 1: the full plan pass runs before anything is touched, so
     // failing to even compute a plan aborts with the target untouched.
     let Some(plans) = session.plan_pass()? else {
         return Ok(Outcome::Failed);
     };
+
+    // Spec §8.4: fatal before approval — a step outside the model is a
+    // change to something the source tree cannot describe.
+    let violations = unmanaged_violations(&plans);
+    if !violations.is_empty() {
+        report::unmanaged_steps(&violations, true);
+        return Ok(Outcome::Failed);
+    }
 
     let hazards = session.hazards(&plans);
     if !hazards.is_empty() {
@@ -260,6 +291,17 @@ impl Session {
         if !inspection.missing_schemas.is_empty() {
             report::missing_schemas(&inspection.missing_schemas);
             return Ok(Opened::Stop(Outcome::Failed));
+        }
+
+        // Spec §10.4: an external plan database accumulates each run's
+        // closure members, and the next run fails on them midway through the
+        // loop. Refuse early and by name, before delegating anything.
+        if let Some(plan_db) = &connection.plan_db {
+            let leftovers = inspect::plan_db_leftovers(plan_db, &analysis.managed_schemas)?;
+            if !leftovers.is_empty() {
+                report::plan_db_leftovers(&leftovers, &plan_db.db);
+                return Ok(Opened::Stop(Outcome::Failed));
+            }
         }
 
         let document_dir = tempfile::Builder::new()
@@ -509,6 +551,18 @@ fn canonical_seed_root(configured: &Path, source_root: &Path) -> Result<PathBuf>
         );
     }
     Ok(canonical)
+}
+
+/// Plan steps naming kinds outside pgpushy's model (spec §8.4).
+fn unmanaged_violations(plans: &[(SchemaName, Plan)]) -> Vec<(SchemaName, Step)> {
+    plans
+        .iter()
+        .flat_map(|(schema, plan)| {
+            plan.unmanaged_steps()
+                .into_iter()
+                .map(|step| (schema.clone(), step.clone()))
+        })
+        .collect()
 }
 
 /// Write each schema's document where its pgschema run will read it.

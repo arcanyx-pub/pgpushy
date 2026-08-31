@@ -1051,39 +1051,47 @@ fn captured_output_carries_no_escape_sequences() {
 /// `--plan-password`: a secret in the argv is visible in the process list, and
 /// in anything `--verbose` prints into a bug report.
 ///
-/// Needs a real target because pgpushy inspects it before ever invoking
-/// pgschema — but the *plan* database can be anywhere, since pgpushy never
-/// connects there itself. So it gets a deliberately distinctive password,
-/// which a real target's could not be: CI's happens to equal the username,
-/// and asserting on a value that appears legitimately all over the output
-/// cannot work.
+/// The plan database is real and empty, because pgpushy now looks at it
+/// before delegating (spec §10.4) — an unreachable one would fail before the
+/// command line this test asserts on is ever printed. The no-password
+/// guarantee on the flags themselves is unit-tested in conn.rs, where a
+/// distinctive value can be used.
 #[test]
 fn the_plan_database_password_never_reaches_the_command_line() {
     let target = require_target!();
-    const DISTINCTIVE: &str = "zzz-plan-secret-zzz";
 
     let schema = unique_schema("planpw");
     let _schemas = Schemas::create(&target, std::slice::from_ref(&schema));
 
+    let plan_db = format!("{schema}_plan");
+    let mut admin = target.client();
+    admin
+        .batch_execute(&format!("DROP DATABASE IF EXISTS {plan_db}"))
+        .expect("drop stale plan db");
+    admin
+        .batch_execute(&format!("CREATE DATABASE {plan_db}"))
+        .expect("create plan db");
+
+    let parts = parse(&target.url);
     let project = target.project(
         &format!("default_schema = \"{schema}\""),
         &[("t.sql", "CREATE TABLE t (id int PRIMARY KEY);".to_owned())],
     );
     let config = project.dir.path().join("pgpushy.toml");
     let mut text = std::fs::read_to_string(&config).expect("read config");
-    text.push_str(
-        "\n[env.test.plan_db]\nhost = \"127.0.0.1\"\nport = 1\n\
-         db = \"plan\"\nuser = \"planner\"\nsslmode = \"disable\"\n",
-    );
+    text.push_str(&format!(
+        "\n[env.test.plan_db]\nhost = \"{}\"\nport = {}\n\
+         db = \"{plan_db}\"\nuser = \"{}\"\nsslmode = \"disable\"\n",
+        parts.host, parts.port, parts.user,
+    ));
     std::fs::write(&config, text).expect("write config");
 
-    // pgschema cannot reach that plan database, and does not need to: the
-    // command line is printed before it runs, which is all this asserts on.
-    let assert = project
-        .command("plan")
-        .arg("--verbose")
-        .env("PGPUSHY_PLAN_PASSWORD", DISTINCTIVE)
-        .assert();
+    let mut command = project.command("plan");
+    command.arg("--verbose");
+    if let Some(password) = &parts.password {
+        command.env("PGPUSHY_PLAN_PASSWORD", password);
+    }
+    let assert = command.assert().success();
 
     let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
     assert!(
@@ -1094,10 +1102,10 @@ fn the_plan_database_password_never_reaches_the_command_line() {
         !stdout.contains("--plan-password"),
         "the password must not be a flag:\n{stdout}"
     );
-    assert!(
-        !stdout.contains(DISTINCTIVE),
-        "the password leaked into output:\n{stdout}"
-    );
+
+    admin
+        .batch_execute(&format!("DROP DATABASE IF EXISTS {plan_db}"))
+        .ok();
 }
 
 // ---------------------------------------------------------------------------
@@ -1604,4 +1612,262 @@ fn seeds_require_approval_without_auto_approve() {
         .failure()
         .stdout(predicates::str::contains("seed file"))
         .stderr(predicates::str::contains("--auto-approve"));
+}
+
+// ---------------------------------------------------------------------------
+// Untouched kinds (spec §6.5, §8.4) and the plan database (spec §10.4)
+// ---------------------------------------------------------------------------
+
+/// Partial adoption, live: a managed schema holding a view, a function and a
+/// trigger — none of which pgpushy can describe — reconciles its tables while
+/// leaving the rest alone. This is the 0.1 defect fixed: those objects used
+/// to be planned as drops.
+#[test]
+fn unmanaged_kinds_in_a_managed_schema_are_left_alone() {
+    let target = require_target!();
+    let schema = unique_schema("keep");
+    let _schemas = Schemas::create(&target, std::slice::from_ref(&schema));
+
+    let mut client = target.client();
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE {schema}.t (id int PRIMARY KEY);
+             CREATE VIEW {schema}.v AS SELECT id FROM {schema}.t;
+             CREATE MATERIALIZED VIEW {schema}.mv AS SELECT id FROM {schema}.t;
+             CREATE FUNCTION {schema}.f() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;
+             CREATE FUNCTION {schema}.trgf() RETURNS trigger LANGUAGE plpgsql
+                 AS $$ BEGIN RETURN NEW; END $$;
+             CREATE TRIGGER trg BEFORE INSERT ON {schema}.t
+                 FOR EACH ROW EXECUTE FUNCTION {schema}.trgf();"
+        ))
+        .expect("seed unmanaged kinds");
+
+    // The desired state adds a column and says nothing about the rest.
+    let project = target.project(
+        &format!("default_schema = \"{schema}\""),
+        &[(
+            "t.sql",
+            "CREATE TABLE t (id int PRIMARY KEY, note text);".to_owned(),
+        )],
+    );
+
+    project
+        .command("apply")
+        .arg("--auto-approve")
+        .assert()
+        .success();
+
+    // The table changed; everything pgpushy cannot describe survived.
+    let survivors: i64 = client
+        .query_one(
+            &format!(
+                "SELECT count(*) FROM pg_class c
+                 JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname = '{schema}' AND c.relname IN ('v', 'mv')"
+            ),
+            &[],
+        )
+        .expect("count views")
+        .get(0);
+    assert_eq!(survivors, 2, "the view and matview must survive");
+    let functions: i64 = client
+        .query_one(
+            &format!(
+                "SELECT count(*) FROM pg_proc p
+                 JOIN pg_namespace n ON n.oid = p.pronamespace
+                 WHERE n.nspname = '{schema}'"
+            ),
+            &[],
+        )
+        .expect("count functions")
+        .get(0);
+    assert_eq!(functions, 2, "the functions must survive");
+    client
+        .query_one(&format!("SELECT note FROM {schema}.t LIMIT 0"), &[])
+        .err();
+    // The added column landed.
+    let has_note: i64 = client
+        .query_one(
+            &format!(
+                "SELECT count(*) FROM information_schema.columns
+                 WHERE table_schema = '{schema}' AND table_name = 't'
+                   AND column_name = 'note'"
+            ),
+            &[],
+        )
+        .expect("column check")
+        .get(0);
+    assert_eq!(has_note, 1, "the table diff must still reconcile");
+}
+
+/// Policies and RLS cannot be suppressed, so they are refused by name
+/// (spec §6.5): plan reports and exits non-zero, apply refuses before
+/// touching anything.
+#[test]
+fn a_policy_is_refused_by_name() {
+    let target = require_target!();
+    let schema = unique_schema("rls");
+    let _schemas = Schemas::create(&target, std::slice::from_ref(&schema));
+
+    let mut client = target.client();
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE {schema}.t (id int PRIMARY KEY);
+             ALTER TABLE {schema}.t ENABLE ROW LEVEL SECURITY;
+             CREATE POLICY p ON {schema}.t USING (true);"
+        ))
+        .expect("seed policy");
+
+    let project = target.project(
+        &format!("default_schema = \"{schema}\""),
+        &[("t.sql", "CREATE TABLE t (id int PRIMARY KEY);".to_owned())],
+    );
+
+    project
+        .command("plan")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("policy p on"))
+        .stderr(predicates::str::contains("row-level security on"));
+
+    project
+        .command("apply")
+        .arg("--auto-approve")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("refuses before touching"));
+
+    // Nothing was touched: the policy is still there.
+    let policies: i64 = client
+        .query_one(
+            &format!(
+                "SELECT count(*) FROM pg_policy p
+                 JOIN pg_class c ON c.oid = p.polrelid
+                 JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname = '{schema}'"
+            ),
+            &[],
+        )
+        .expect("count policies")
+        .get(0);
+    assert_eq!(policies, 1);
+}
+
+/// The §10.4 check in both directions: a single-schema project re-plans
+/// against the same external plan database indefinitely, and a cross-schema
+/// project is refused by name on the second run instead of surfacing
+/// pgschema's mid-loop error.
+#[test]
+fn plan_database_leftovers_are_refused_only_when_they_collide() {
+    let target = require_target!();
+    let solo = unique_schema("pdsolo");
+    let sa = unique_schema("pda");
+    let sb = unique_schema("pdb");
+    let _schemas = Schemas::create(&target, &[solo.clone(), sa.clone(), sb.clone()]);
+
+    let parts = parse(&target.url);
+    let mut admin = target.client();
+    let plan_db = format!("{solo}_plan");
+    admin
+        .batch_execute(&format!("DROP DATABASE IF EXISTS {plan_db}"))
+        .expect("drop stale plan db");
+    admin
+        .batch_execute(&format!("CREATE DATABASE {plan_db}"))
+        .expect("create plan db");
+
+    let plan_block = |db: &str| {
+        format!(
+            "\n[env.test.plan_db]\nhost = \"{}\"\nport = {}\n\
+             db = \"{db}\"\nuser = \"{}\"\nsslmode = \"disable\"\n",
+            parts.host, parts.port, parts.user,
+        )
+    };
+    let with_plan_db = |project: &Project| {
+        let config = project.dir.path().join("pgpushy.toml");
+        let mut text = std::fs::read_to_string(&config).expect("read config");
+        text.push_str(&plan_block(&plan_db));
+        std::fs::write(&config, text).expect("write config");
+    };
+    let run = |project: &Project| {
+        let mut command = project.command("plan");
+        if let Some(password) = &parts.password {
+            command.env("PGPUSHY_PLAN_PASSWORD", password);
+        }
+        command.assert()
+    };
+
+    // Single schema: two runs against the same plan database both succeed.
+    let project = target.project(
+        &format!("default_schema = \"{solo}\""),
+        &[("t.sql", "CREATE TABLE t (id int PRIMARY KEY);".to_owned())],
+    );
+    with_plan_db(&project);
+    run(&project).success();
+    run(&project).success();
+
+    // Cross schema: the first run leaves closure members behind, and the
+    // second is refused by name, before delegating.
+    let project = target.project(
+        &format!("default_schema = \"{sa}\"\nmanaged_schemas = [\"{sa}\", \"{sb}\"]"),
+        &[(
+            "t.sql",
+            format!(
+                "CREATE TABLE {sa}.parent (id int PRIMARY KEY);
+                 CREATE TABLE {sb}.child (id int PRIMARY KEY,
+                     pid int REFERENCES {sa}.parent(id));"
+            ),
+        )],
+    );
+    with_plan_db(&project);
+    run(&project).success();
+    run(&project)
+        .failure()
+        .stderr(predicates::str::contains("is not empty"))
+        .stderr(predicates::str::contains("DROP DATABASE"));
+
+    admin
+        .batch_execute(&format!("DROP DATABASE IF EXISTS {plan_db}"))
+        .ok();
+}
+
+/// A widened UNIQUE constraint is drop+create on one path; pgschema calls it
+/// a modify, and so must the approval summary (spec §8.6).
+#[test]
+fn a_recreated_constraint_is_not_counted_destructive() {
+    let target = require_target!();
+    let schema = unique_schema("recr");
+    let _schemas = Schemas::create(&target, std::slice::from_ref(&schema));
+
+    let mut client = target.client();
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE {schema}.p (id int PRIMARY KEY, alt text, extra text,
+                 CONSTRAINT p_alt UNIQUE (alt));"
+        ))
+        .expect("seed table");
+
+    let project = target.project(
+        &format!("default_schema = \"{schema}\""),
+        &[(
+            "p.sql",
+            "CREATE TABLE p (id int PRIMARY KEY, alt text, extra text,
+                 CONSTRAINT p_alt UNIQUE (alt, extra));"
+                .to_owned(),
+        )],
+    );
+
+    let assert = project
+        .command("apply")
+        .arg("--auto-approve")
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("0 destructive"),
+        "a recreate must count as zero destructive changes:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("(1 destructive)") && !stdout.contains("Destructive changes:"),
+        "a recreate must not be listed as destructive:\n{stdout}"
+    );
 }

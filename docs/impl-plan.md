@@ -2,7 +2,7 @@
 
 **Status:** Build guidance (non-normative)
 **Date:** 2026-08-31
-**Companion to:** [`docs/spec.md`](./spec.md) v0.5 (normative)
+**Companion to:** [`docs/spec.md`](./spec.md) v0.6 (normative)
 
 This plan says *how* to build what `spec.md` defines. Where they disagree, the
 spec wins. It is written to be read cold: §1 distills everything we learned
@@ -291,6 +291,33 @@ commands are in [Appendix A](#appendix-a-reproduction-harness).
   pgpushy. Harmless for correctness (it is a HOT-update optimization), but
   where it matters it must be set with a hand-run `ALTER TABLE … SET
   (fillfactor = …)`.
+
+**Verified while designing the untouched-kinds and plan-database work
+(2026-08-31, pgschema 1.12.3 + PG 18)**
+- **Ignore sections that exist and work:** `[views]`, `[functions]`,
+  `[procedures]`, `[aggregates]`, `[triggers]` (plus the known
+  `[privileges]`/`[default_privileges]`). `[views]` alone also suppresses
+  materialized views; `[materialized_views]` is accepted (like every unknown
+  section — silently) and is written as insurance. **No section suppresses
+  policies or RLS.**
+- **The plan-step type taxonomy** (from a plan dropping/creating every kind):
+  managed kinds render as `table`, `table.column`, `table.constraint`,
+  `table.index`, `table.comment`, `table.column.comment`,
+  `table.index.comment`, `sequence`, `type`, `domain`. Unmanaged kinds:
+  `view`, `materialized_view` (underscore), `function`, `procedure`,
+  `aggregate`, `table.trigger`, `table.policy`, `table.rls`. A sequence's
+  comment folds under `sequence` as a second step on the same path, not a
+  `.comment` suffix.
+- **`COMMENT ON SCHEMA` and `COMMENT ON CONSTRAINT` are silently dropped**:
+  no plan step, nothing in the catalog after apply, empty re-plan. Same class
+  as spec §12.9's type/domain comments; both now rejected in source.
+- **The external plan database accumulates closure members, and only them.**
+  Cross-schema project: run 1 plans, run 2 fails (`relation … already
+  exists`) on the closure member the first run left in a real schema.
+  Single-schema project: re-plans indefinitely — its own objects execute into
+  `pgschema_tmp_*`, and the leftover named schema stays empty, which
+  `CREATE SCHEMA IF NOT EXISTS` tolerates. The §10.4 check keys on non-empty
+  managed schemas for exactly this reason.
 
 ## 2. Tech stack & conventions
 
@@ -932,8 +959,9 @@ comparing anything.
   its own stale documents, and percent-encodes bytes outside `[A-Za-z0-9_-]` in
   the schema name so a legal-but-hostile name cannot escape the directory.
 - **M8 — Types, domains and standalone sequences (spec §4.3, §5.1). ✅ Done.**
-  New model variants and `parse.rs` arms for `CREATE TYPE` (enum, composite,
-  range), `CREATE DOMAIN` and `CREATE SEQUENCE`; the topological sort within
+  New model variants and `parse.rs` arms for `CREATE TYPE` (enum and
+  composite; the range form is rejected), `CREATE DOMAIN` and
+  `CREATE SEQUENCE`; the topological sort within
   category 2; rejection of `CREATE SEQUENCE … OWNED BY`. Their names qualify
   exactly as tables do. It needed M7 first: a sequence in a column default is
   the reference that must be spelled differently in each schema's document.
@@ -957,6 +985,22 @@ comparing anything.
   `lock_timeout`, execute-record-probe-commit), the §8.6 summary line, §9
   reporting. Ships the snowdrop story with a hand-vendored seed file; M15 is
   not a prerequisite.
+- **M16 — Untouched kinds, and policies refused (spec §6.5, §8.4).**
+  `pgschema::write_ignore_file` gains the six kind sections; `plan_file.rs`
+  gains the model-kind allow-list and the drop/create pairing (spec §8.6);
+  `inspect.rs` reads `pg_policy` and `relrowsecurity` for managed schemas;
+  `run.rs` wires the §6.5 refusal (cycle semantics) and the plan-step
+  tripwire; `hazard.rs` and `approve.rs` count pairs as modifications. The
+  behavioural test is the point: a managed schema holding a view, a function
+  and a trigger plans **no drops** while its table diffs still reconcile —
+  partial adoption working — and a policy/RLS schema is refused by name.
+- **M17 — Plan-database check, reachable unresolved references, comment
+  narrowing (spec §4.3, §10.4, §12.9).** A read-only pre-delegation check of
+  a configured plan database (non-empty managed schema → named refusal);
+  `resolve.rs` records qualified type and literal references the tree does
+  not define so `validate.rs` can finally reach its `UnresolvedReference`
+  arm for managed schemas; `parse.rs` rejects `COMMENT ON SCHEMA` and
+  `COMMENT ON CONSTRAINT` alongside types and domains.
 - **M15 — `pgpushy generate` (spec §4.7).** `[[generate]]` config, argv
   execution with captured stdout, the generated-source marker (distinct from
   §4.1's document marker — opposite discovery polarity), the refusal to

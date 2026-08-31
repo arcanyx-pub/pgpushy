@@ -62,7 +62,7 @@ pub fn confirm(
 fn summarize(analysis: &Analysis, plans: &[(SchemaName, Plan)]) {
     let changing: Vec<_> = plans.iter().filter(|(_, plan)| !plan.is_empty()).collect();
     let steps: usize = plans.iter().map(|(_, plan)| plan.step_count()).sum();
-    let drops: usize = plans.iter().map(|(_, plan)| plan.drop_count()).sum();
+    let drops: usize = plans.iter().map(|(_, plan)| plan.destructive_count()).sum();
 
     let width = plans
         .iter()
@@ -80,7 +80,7 @@ fn summarize(analysis: &Analysis, plans: &[(SchemaName, Plan)]) {
         if plan.is_empty() {
             println!("    {schema:<width$}  no changes");
         } else {
-            let destructive = match plan.drop_count() {
+            let destructive = match plan.destructive_count() {
                 0 => String::new(),
                 n => format!("  ({n} destructive)"),
             };
@@ -131,7 +131,7 @@ fn summarize(analysis: &Analysis, plans: &[(SchemaName, Plan)]) {
     if drops > 0 {
         println!("\n  Destructive changes:");
         for (_, plan) in plans {
-            for step in plan.drops() {
+            for step in plan.destructive_drops() {
                 println!("    drop {:<18} {}", step.kind, step.path);
             }
         }

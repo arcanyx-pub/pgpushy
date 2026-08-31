@@ -75,7 +75,7 @@ pub fn check(
             continue;
         };
 
-        for step in plan.drops() {
+        for step in plan.destructive_drops() {
             let Some(object) = step
                 .path
                 .strip_prefix(&format!("{}.{}.", fk.to_schema, fk.to_table))

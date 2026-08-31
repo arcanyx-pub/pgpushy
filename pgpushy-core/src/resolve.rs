@@ -152,28 +152,41 @@ fn render_list(schemas: &[SchemaName]) -> String {
 pub fn type_references(objects: &mut Objects, default_schema: &SchemaName) {
     let defined: BTreeSet<QualifiedName> =
         objects.types.iter().map(|kind| kind.name.clone()).collect();
+    // A literal can name a table too — `'public.customers'::regclass` — so
+    // the is-it-defined question for literals ranges over both namespaces.
+    let tables: BTreeSet<QualifiedName> = objects
+        .tables
+        .iter()
+        .map(|table| table.name.clone())
+        .collect();
 
     for index in 0..objects.tables.len() {
         let schema = objects.tables[index].name.schema.clone();
         let mut found = Vec::new();
+        let mut unresolved = Vec::new();
         resolve_columns(
             &mut objects.tables[index].ast.table_elts,
             &schema,
             default_schema,
             &defined,
             &mut found,
+            &mut unresolved,
         );
         resolve_literals(
             &NodeEnum::CreateStmt(objects.tables[index].ast.clone()),
             &defined,
+            &tables,
             &mut found,
+            &mut unresolved,
         );
         objects.tables[index].depends_on = found;
+        objects.tables[index].unresolved = unresolved;
     }
 
     for index in 0..objects.types.len() {
         let schema = objects.types[index].name.schema.clone();
         let mut found = Vec::new();
+        let mut unresolved = Vec::new();
         match &mut objects.types[index].ast {
             NodeEnum::CompositeTypeStmt(composite) => resolve_columns(
                 &mut composite.coldeflist,
@@ -181,16 +194,31 @@ pub fn type_references(objects: &mut Objects, default_schema: &SchemaName) {
                 default_schema,
                 &defined,
                 &mut found,
+                &mut unresolved,
             ),
             NodeEnum::CreateDomainStmt(domain) => {
                 if let Some(type_name) = domain.type_name.as_mut() {
-                    resolve_type_name(type_name, &schema, default_schema, &defined, &mut found);
+                    resolve_type_name(
+                        type_name,
+                        &schema,
+                        default_schema,
+                        &defined,
+                        &mut found,
+                        &mut unresolved,
+                    );
                 }
             }
             _ => {}
         }
-        resolve_literals(&objects.types[index].ast.clone(), &defined, &mut found);
+        resolve_literals(
+            &objects.types[index].ast.clone(),
+            &defined,
+            &tables,
+            &mut found,
+            &mut unresolved,
+        );
         objects.types[index].depends_on = found;
+        objects.types[index].unresolved = unresolved;
     }
 }
 
@@ -206,7 +234,9 @@ pub fn type_references(objects: &mut Objects, default_schema: &SchemaName) {
 fn resolve_literals(
     node: &NodeEnum,
     defined: &BTreeSet<QualifiedName>,
+    tables: &BTreeSet<QualifiedName>,
     found: &mut Vec<QualifiedName>,
+    unresolved: &mut Vec<QualifiedName>,
 ) {
     for name in crate::literal::find(node) {
         let Some(parts) = crate::literal::name_parts(&name.raw) else {
@@ -218,6 +248,12 @@ fn resolve_literals(
         let referenced = QualifiedName::new(SchemaName::new(schema), object);
         if defined.contains(&referenced) {
             found.push(referenced);
+        } else if !tables.contains(&referenced) {
+            // A literal is always qualified (spec §4.3), so a name that is
+            // neither a tree-defined type nor a tree-defined table is worth
+            // recording: validate reports it when the schema is managed. A
+            // table hit is simply not a category-2 dependency.
+            unresolved.push(referenced);
         }
     }
 }
@@ -228,12 +264,13 @@ fn resolve_columns(
     default_schema: &SchemaName,
     defined: &BTreeSet<QualifiedName>,
     found: &mut Vec<QualifiedName>,
+    unresolved: &mut Vec<QualifiedName>,
 ) {
     for column in columns {
         if let Some(NodeEnum::ColumnDef(column)) = column.node.as_mut()
             && let Some(type_name) = column.type_name.as_mut()
         {
-            resolve_type_name(type_name, owner, default_schema, defined, found);
+            resolve_type_name(type_name, owner, default_schema, defined, found, unresolved);
         }
     }
 }
@@ -251,6 +288,7 @@ fn resolve_type_name(
     default_schema: &SchemaName,
     defined: &BTreeSet<QualifiedName>,
     found: &mut Vec<QualifiedName>,
+    unresolved: &mut Vec<QualifiedName>,
 ) {
     let parts: Vec<String> = type_name
         .names
@@ -275,7 +313,20 @@ fn resolve_type_name(
         _ => return,
     };
 
-    let Some(resolved) = candidates.into_iter().find(|name| defined.contains(name)) else {
+    let qualified = parts.len() == 2;
+    let Some(resolved) = candidates
+        .clone()
+        .into_iter()
+        .find(|name| defined.contains(name))
+    else {
+        // A qualified miss is recorded rather than dropped: an unqualified
+        // name that matches nothing may be `text` or an extension's type
+        // (see the module note), but a qualified one names a schema — and
+        // when that schema is managed, the reference cannot exist in the
+        // plan database, which validate reports (spec §4.5).
+        if qualified && let Some(missed) = candidates.into_iter().next() {
+            unresolved.push(missed);
+        }
         return;
     };
     type_name.names = vec![

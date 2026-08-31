@@ -447,6 +447,7 @@ fn classify_create_table(
     objects.tables.push(Table {
         name,
         depends_on: Vec::new(),
+        unresolved: Vec::new(),
         origin: origin.clone(),
         ast,
     });
@@ -623,10 +624,22 @@ fn classify_comment(
         CommentTarget::Column
     } else if objtype == ObjectType::ObjectIndex as i32 {
         CommentTarget::Index
-    } else if objtype == ObjectType::ObjectTabconstraint as i32 {
-        CommentTarget::Constraint
-    } else if objtype == ObjectType::ObjectSchema as i32 {
-        CommentTarget::Schema
+    } else if objtype == ObjectType::ObjectTabconstraint as i32
+        || objtype == ObjectType::ObjectSchema as i32
+    {
+        // Verified against pgschema 1.12.3 the same way the type/domain case
+        // below was — by applying and re-planning: neither produces a plan
+        // step, neither lands in the catalog, and the plan afterwards is
+        // empty (spec §12.9).
+        return Err(Diagnostic::new(
+            DiagnosticKind::UnsupportedStatement,
+            "COMMENT ON a schema or a table constraint",
+            vec![origin.clone()],
+        )
+        .with_help(
+            "pgschema drops these without applying them and without reporting it, so \
+             the comment would never appear on the target (spec §12.9)",
+        ));
     } else if objtype == ObjectType::ObjectType as i32 || objtype == ObjectType::ObjectDomain as i32
     {
         // Verified against pgschema 1.12.3 by applying and re-planning:
@@ -667,7 +680,6 @@ fn classify_comment(
     // schema qualifier is present: TABLE takes (table) or (schema, table),
     // COLUMN takes (table, column) or (schema, table, column), and so on.
     let (schema, target) = match (kind, parts.len()) {
-        (CommentTarget::Schema, 1) => (SchemaName::new(&parts[0]), parts[0].clone()),
         (CommentTarget::Table | CommentTarget::Index | CommentTarget::Sequence, 1) => (
             default_schema.clone(),
             format!("{default_schema}.{}", parts[0]),
@@ -675,13 +687,11 @@ fn classify_comment(
         (CommentTarget::Table | CommentTarget::Index | CommentTarget::Sequence, 2) => {
             (SchemaName::new(&parts[0]), parts.join("."))
         }
-        (CommentTarget::Column | CommentTarget::Constraint, 2) => (
+        (CommentTarget::Column, 2) => (
             default_schema.clone(),
             format!("{default_schema}.{}", parts.join(".")),
         ),
-        (CommentTarget::Column | CommentTarget::Constraint, 3) => {
-            (SchemaName::new(&parts[0]), parts.join("."))
-        }
+        (CommentTarget::Column, 3) => (SchemaName::new(&parts[0]), parts.join(".")),
         _ => {
             return Err(unsupported_named(
                 "COMMENT ON with an object name pgpushy cannot read",
@@ -690,9 +700,7 @@ fn classify_comment(
         }
     };
 
-    if kind != CommentTarget::Schema {
-        qualify_comment_object(&mut ast, kind, &schema);
-    }
+    qualify_comment_object(&mut ast, kind, &schema);
 
     Ok(Comment {
         schema,
@@ -704,22 +712,18 @@ fn classify_comment(
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CommentTarget {
-    Schema,
     Table,
     Column,
     Index,
-    Constraint,
     Sequence,
 }
 
 impl CommentTarget {
     fn keyword(self) -> &'static str {
         match self {
-            Self::Schema => "SCHEMA",
             Self::Table => "TABLE",
             Self::Column => "COLUMN",
             Self::Index => "INDEX",
-            Self::Constraint => "CONSTRAINT",
             Self::Sequence => "SEQUENCE",
         }
     }
@@ -727,8 +731,8 @@ impl CommentTarget {
     /// How many trailing parts are the object itself rather than its schema.
     fn unqualified_len(self) -> usize {
         match self {
-            Self::Schema | Self::Table | Self::Index | Self::Sequence => 1,
-            Self::Column | Self::Constraint => 2,
+            Self::Table | Self::Index | Self::Sequence => 1,
+            Self::Column => 2,
         }
     }
 }
@@ -978,6 +982,7 @@ fn classify_named_type(
         kind: TypeKind::Type,
         origin: origin.clone(),
         depends_on,
+        unresolved: Vec::new(),
         ast,
     })
 }
@@ -997,6 +1002,7 @@ fn classify_domain(
         kind: TypeKind::Domain,
         origin: origin.clone(),
         depends_on: Vec::new(),
+        unresolved: Vec::new(),
         ast: NodeEnum::CreateDomainStmt(Box::new(ast)),
     })
 }
@@ -1019,6 +1025,7 @@ fn classify_composite_type(
         kind: TypeKind::Type,
         origin: origin.clone(),
         depends_on: Vec::new(),
+        unresolved: Vec::new(),
         ast: NodeEnum::CompositeTypeStmt(ast),
     })
 }
@@ -1057,6 +1064,7 @@ fn classify_sequence(
         kind: TypeKind::Sequence,
         origin: origin.clone(),
         depends_on: Vec::new(),
+        unresolved: Vec::new(),
         ast: NodeEnum::CreateSeqStmt(ast),
     })
 }

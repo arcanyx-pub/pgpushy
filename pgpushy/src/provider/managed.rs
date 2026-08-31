@@ -4,7 +4,7 @@
 //! remove. The cost is that pgpushy now fetches an executable over the
 //! network, so the integrity story has to be real rather than decorative:
 //!
-//! - **pgschema publishes no checksums**, so pgpushy ships its own, computed
+//! - **pgschema ships no checksum file** (GitHub's release API does serve per-asset digests — the same trust root, useful as a cross-check), so pgpushy ships its own, computed
 //!   from the release assets and reviewed alongside the version bump that adds
 //!   them ([`HASHES`]). TLS alone would mean trusting whatever the endpoint
 //!   served today.

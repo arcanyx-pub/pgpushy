@@ -16,7 +16,7 @@ use crate::config::{Loaded, Settings};
 use crate::conn::{PasswordSource, Resolved};
 use crate::discovery::Discovered;
 use crate::hazard::Hazard;
-use crate::inspect::Identity;
+use crate::inspect::{Identity, PolicyOrRls};
 use crate::provider::PgschemaBin;
 use pgpushy_core::{Analysis, Diagnostic, Origin, SchemaName, Seeds};
 use std::path::Path;
@@ -652,4 +652,80 @@ pub fn generate_stale(stale: &[(std::path::PathBuf, &'static str)]) {
         eprintln!("  {} {why}", path.display());
     }
     eprintln!("\n  Run `pgpushy generate` and commit the result.");
+}
+
+// ---------------------------------------------------------------------------
+// Untouched kinds (spec §6.5, §8.4) and the plan database (spec §10.4)
+// ---------------------------------------------------------------------------
+
+/// Policies and RLS-enabled tables in managed schemas (spec §6.5).
+pub fn policies_refused(findings: &[PolicyOrRls], applying: bool) {
+    eprintln!(
+        "\nerror: managed schemas hold policies or row-level security, which pgpushy \
+         can neither manage nor leave alone (spec §6.5):"
+    );
+    for finding in findings {
+        match &finding.policy {
+            Some(policy) => {
+                eprintln!("  policy {policy} on {}.{}", finding.schema, finding.table);
+            }
+            None => eprintln!(
+                "  row-level security on {}.{}",
+                finding.schema, finding.table
+            ),
+        }
+    }
+    eprintln!(
+        "\n  pgschema\'s ignore file has no section for these, so reconciling the \
+         schema would drop the policies and disable the security. Drop them first, \
+         or leave the schema out of the managed set."
+    );
+    if applying {
+        eprintln!("\n  apply refuses before touching anything.");
+    } else {
+        eprintln!("\n  The plans are still computed below; the run exits non-zero.");
+    }
+}
+
+/// Steps outside pgpushy\'s model (spec §8.4): the enforcement behind the
+/// ignore-file suppression.
+pub fn unmanaged_steps(violations: &[(SchemaName, crate::plan_file::Step)], applying: bool) {
+    let n = violations.len();
+    eprintln!(
+        "\nerror: {n} plan step{} touch{} something the source tree cannot describe:",
+        s(n),
+        if n == 1 { "es" } else { "" },
+    );
+    for (schema, step) in violations {
+        eprintln!("  {schema}: {} {} {}", step.operation, step.kind, step.path);
+    }
+    eprintln!(
+        "\n  What the source tree does not describe, pgpushy does not touch \
+         (spec §8.4). Seeing this usually means a pgschema release changed its \
+         ignore-file sections; please report it to pgpushy."
+    );
+    if applying {
+        eprintln!("\n  apply refuses before touching anything.");
+    }
+}
+
+/// Leftover state in the plan database (spec §10.4).
+pub fn plan_db_leftovers(schemas: &[SchemaName], db: &str) {
+    let list = schemas
+        .iter()
+        .map(|schema| schema.as_str().to_owned())
+        .collect::<Vec<_>>()
+        .join(", ");
+    eprintln!(
+        "\nerror: the plan database {db} is not empty: schema{} {list} hold{} objects \
+         from a previous run",
+        s(schemas.len()),
+        if schemas.len() == 1 { "s" } else { "" },
+    );
+    eprintln!(
+        "\n  An external plan database accumulates each run\'s cross-schema closure \
+         members, and the next run fails on them midway through the loop \
+         (spec §10.4). It is scratch space: drop and recreate it, then re-run.\n\
+         \n      DROP DATABASE {db}; CREATE DATABASE {db};"
+    );
 }
