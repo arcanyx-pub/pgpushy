@@ -127,6 +127,20 @@ pub enum Command {
         #[arg(long, value_name = "DURATION")]
         lock_timeout: Option<String>,
     },
+
+    /// Run each configured generator and (re)write its output file.
+    ///
+    /// Generation is upstream of discovery (spec §4.7): the `[[generate]]`
+    /// commands run here and nowhere else — validate, plan and apply read
+    /// only files — and the output is vendored into the tree under a
+    /// generated-source marker. Connects to nothing.
+    Generate {
+        /// Verify every output is current instead of writing; fail naming
+        /// each stale one. The CI half of vendoring: a dependency bump that
+        /// changes the emitted SQL must land as a reviewed diff.
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 #[derive(Args, Debug)]

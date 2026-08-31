@@ -32,15 +32,23 @@ pub struct Discovered {
     pub excluded: Vec<(String, usize)>,
     /// How many files were skipped for being pgpushy's own output.
     pub generated: usize,
+    /// How many `.sql` files sat under a nested seed root (spec §4.6).
+    pub skipped_seed_root: usize,
 }
 
 /// Walk a source tree, honoring exclusions.
-pub fn discover(root: &Path, exclude: &[String]) -> Result<Discovered> {
+///
+/// `skip` names a directory the walk must not descend into — a seed root
+/// nested inside the source root (spec §4.6), whose files are seed files
+/// rather than desired state. Its `.sql` files are counted so the skip is
+/// visible in the report rather than mysterious.
+pub fn discover(root: &Path, exclude: &[String], skip: Option<&Path>) -> Result<Discovered> {
     let matchers = compile(exclude)?;
     let mut counts = vec![0usize; matchers.len()];
     let mut candidates = Vec::new();
+    let mut skipped_seed_root = 0usize;
 
-    walk(root, root, &mut candidates)
+    walk(root, root, skip, &mut candidates, &mut skipped_seed_root)
         .with_context(|| format!("reading source tree {}", root.display()))?;
 
     // Sort before reading so that the order is fixed by path alone, and
@@ -99,6 +107,7 @@ pub fn discover(root: &Path, exclude: &[String]) -> Result<Discovered> {
         files,
         excluded: exclude.iter().cloned().zip(counts).collect(),
         generated,
+        skipped_seed_root,
     })
 }
 
@@ -133,7 +142,13 @@ enum Kind {
 }
 
 /// Recursive walk collecting the `.sql` candidates under `dir`.
-fn walk(root: &Path, dir: &Path, out: &mut Vec<Candidate>) -> Result<()> {
+fn walk(
+    root: &Path,
+    dir: &Path,
+    skip: Option<&Path>,
+    out: &mut Vec<Candidate>,
+    skipped: &mut usize,
+) -> Result<()> {
     let entries =
         std::fs::read_dir(dir).with_context(|| format!("reading directory {}", dir.display()))?;
 
@@ -153,7 +168,11 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<Candidate>) -> Result<()> {
         // the walk terminate and keeps it inside the source tree.
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            walk(root, &path, out)?;
+            if skip == Some(path.as_path()) {
+                *skipped += count_sql(&path);
+                continue;
+            }
+            walk(root, &path, skip, out, skipped)?;
             continue;
         }
         if !has_sql_extension(&path) {
@@ -226,6 +245,30 @@ fn unresolved_message(root: &Path, unresolved: &[(String, Option<PathBuf>, Strin
     message
 }
 
+/// How many `.sql` files a skipped subtree holds, for the report.
+fn count_sql(dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut count = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let hidden = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_none_or(|n| n.starts_with('.'));
+        if hidden {
+            continue;
+        }
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => count += count_sql(&path),
+            Ok(_) if has_sql_extension(&path) => count += 1,
+            _ => {}
+        }
+    }
+    count
+}
+
 fn has_sql_extension(path: &Path) -> bool {
     path.extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("sql"))
@@ -265,7 +308,7 @@ mod tests {
     /// The source-root-relative paths discovery yielded, in the order it
     /// yielded them.
     fn found(root: &Path) -> Vec<String> {
-        discover(root, &[])
+        discover(root, &[], None)
             .expect("discovery succeeds")
             .files
             .into_iter()
@@ -300,7 +343,8 @@ mod tests {
         )
         .expect("create symlink");
 
-        let discovered = discover(&dir.path().join("schema"), &[]).expect("discovery succeeds");
+        let discovered =
+            discover(&dir.path().join("schema"), &[], None).expect("discovery succeeds");
         let paths: Vec<_> = discovered
             .files
             .iter()
@@ -344,7 +388,7 @@ mod tests {
         std::os::unix::fs::symlink("../../gone/prices.sql", root.join("vendor/prices.sql"))
             .expect("create symlink");
 
-        let Err(err) = discover(&root, &[]) else {
+        let Err(err) = discover(&root, &[], None) else {
             panic!("an unresolvable link must be fatal");
         };
         let message = format!("{err:#}");
@@ -371,7 +415,7 @@ mod tests {
             .expect("create symlink");
 
         let discovered =
-            discover(&root, &["customers.sql".to_owned()]).expect("discovery succeeds");
+            discover(&root, &["customers.sql".to_owned()], None).expect("discovery succeeds");
         assert_eq!(discovered.files.len(), 1);
         assert_eq!(discovered.excluded, [("customers.sql".to_owned(), 1)]);
     }

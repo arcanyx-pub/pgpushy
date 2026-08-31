@@ -46,6 +46,13 @@ pub struct File {
     pub managed_schemas: Option<Vec<String>>,
     /// Globs of paths not to read (spec §4.1).
     pub exclude: Option<Vec<String>>,
+    /// Directory of seed files (spec §4.6). No seeds when absent. Relative to
+    /// this file's own directory, like `source_root`.
+    pub seed_root: Option<PathBuf>,
+    /// Generated sources (spec §4.7): commands whose output is vendored into
+    /// the tree by `pgpushy generate`, and by nothing else.
+    #[serde(default)]
+    pub generate: Vec<GenerateEntry>,
 
     #[serde(default)]
     pub pgschema: Pgschema,
@@ -63,6 +70,17 @@ pub struct Pgschema {
     pub backend: Option<String>,
     /// The pinned version, for the managed backend.
     pub version: Option<String>,
+}
+
+/// One `[[generate]]` entry (spec §4.7).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GenerateEntry {
+    /// Where the output lands: a relative, `..`-free `*.sql` path under the
+    /// source root or the seed root, resolved against this file's directory.
+    pub output: PathBuf,
+    /// The command to run, as an argv vector — never a shell.
+    pub command: Vec<String>,
 }
 
 /// One named target.
@@ -139,6 +157,7 @@ impl Loaded {
                 .unwrap_or_else(|| "public".to_owned()),
             managed_schemas: file.managed_schemas.clone(),
             exclude: file.exclude.clone().unwrap_or_default(),
+            seed_root: file.seed_root.as_ref().map(|root| self.base().join(root)),
         }
     }
 
@@ -290,6 +309,7 @@ pub struct Settings {
     pub default_schema: String,
     pub managed_schemas: Option<Vec<String>>,
     pub exclude: Vec<String>,
+    pub seed_root: Option<PathBuf>,
 }
 
 /// Read `pgpushy.toml`. Required (spec §10.1).

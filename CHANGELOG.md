@@ -5,6 +5,38 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Seed files** (spec §4.6, §8.8). A `seed_root` in `pgpushy.toml` names a
+  directory of idempotent baseline rows — reference data the application
+  needs, provisioned by the deploy role instead of by every webserver at
+  boot. Seeds are not desired state: they are never shown to pgschema, and
+  `apply` executes them itself after every schema has applied, one
+  transaction per file. Each statement must be `INSERT … ON CONFLICT` with a
+  database-free source, an explicit column list, a schema-qualified, modeled
+  table, and — for `DO UPDATE` — a `WHERE … IS DISTINCT FROM` guard; the
+  offline checks verify columns and conflict targets against the model.
+  Inside each transaction the file runs twice, and the second pass must
+  affect zero rows: a seed that does not converge is rolled back whole, so a
+  volatile expression lands nothing. Rows are never deleted.
+
+- **`pgpushy generate`** (spec §4.7). `[[generate]]` entries in
+  `pgpushy.toml` name an argv command — never a shell — whose output is
+  vendored into the tree under a generated-source marker, for SQL owned by a
+  dependency rather than an author (a workspace `xtask` printing
+  `snowdrop-id-postgres`'s published DDL, say). Generation is upstream of
+  discovery: `validate`, `plan` and `apply` execute no configured command
+  and read only files. `generate --check` fails when any output is stale, so
+  a dependency bump that changes the emitted SQL must land as a reviewed
+  diff. `generate` never overwrites a file it cannot prove it wrote.
+
+### Changed
+
+- `apply` gains a write path to the target, scoped to seed DML: pgpushy
+  still issues no DDL of its own, and `plan` still executes nothing.
+
 ## [0.1.1] - 2026-08-18
 
 Nothing yet.

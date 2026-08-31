@@ -93,6 +93,37 @@ object.
   on the target. pgpushy has no way to express a grant, so it tells pgschema to
   leave privileges alone.
 
+## Seeding baseline rows
+
+Some rows are as load-bearing as the shape that holds them — lookup tables,
+reference data, the 1024 machine-ID rows a
+[`snowdrop-id-postgres`](https://crates.io/crates/snowdrop-id-postgres) lease
+table needs before any worker can claim one. Provisioning them usually falls
+either to a side script or to the application at boot, which needs rights a
+production role should not hold. pgpushy owns the step instead: a `seed_root`
+in `pgpushy.toml` names a directory of seed files, and `apply` executes them
+itself after every schema has applied, one transaction per file, under the
+deploy role.
+
+Seeds are **not** desired state — they never reach pgschema — and they are
+idempotent by construction: every statement must be `INSERT … ON CONFLICT`
+(`DO UPDATE` needs a `WHERE … IS DISTINCT FROM` guard), with an explicit
+column list, a schema-qualified table the source tree defines, and a source
+that reads nothing — `VALUES`, or a `SELECT` over set-returning built-ins like
+`generate_series`. `validate` checks the columns and the conflict target
+against your tables, offline. Then `apply` proves convergence on every run:
+inside each file's transaction the statements run **twice**, and the second
+pass must affect zero rows, or the whole file rolls back and nothing from it
+lands. Rows are never deleted: what no seed file describes, pgpushy does not
+touch.
+
+When the SQL is owned by a dependency rather than written by hand,
+`pgpushy generate` vendors it: a `[[generate]]` entry names an argv command
+whose output lands in the tree under a generated-source marker, and
+`pgpushy generate --check` fails in CI the moment a dependency bump changes
+the emission — so the change ships as a reviewed diff. `validate`, `plan` and
+`apply` never execute a configured command; they read only files.
+
 ## A worked example
 
 ```console
@@ -265,7 +296,8 @@ No changes detected.
 | `pgpushy init` | Write a starter `pgpushy.toml`. |
 | `pgpushy validate` | Check the source tree. No database, no pgschema binary. |
 | `pgpushy plan` | Show what would change, per schema. Read-only. |
-| `pgpushy apply` | Reconcile the database, after one approval. |
+| `pgpushy apply` | Reconcile the database, after one approval; then apply the seeds. |
+| `pgpushy generate` | Vendor each `[[generate]]` command's output into the tree; `--check` fails on stale output. |
 
 `apply` plans every managed schema first and shows the lot, then asks once —
 so declining leaves the target untouched. It then applies the plans it just
@@ -308,6 +340,7 @@ source tree as all of it, and plan to drop everything else.
 # source_root defaults to this file's directory
 source_root    = "db/schema"
 default_schema = "app"            # schema for unqualified objects
+seed_root      = "db/seeds"       # optional: idempotent baseline rows
 exclude        = ["seeds/**", "**/*.test.sql"]
 
 # Optional, and authoritative when present: a schema the source tree uses but

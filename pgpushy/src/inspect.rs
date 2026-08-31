@@ -1,9 +1,10 @@
 //! Read-only target inspection (spec §6).
 //!
-//! This is the **only** place pgpushy touches the target directly, and every
-//! statement it issues here is a `SELECT`. Spec §6 hangs a guarantee on that:
-//! pgpushy issues no DDL of its own, so schema and content changes all flow
-//! through pgschema, and `plan` cannot mutate the target even incidentally.
+//! Inspection and seed execution (spec §8.8) are the only places pgpushy
+//! touches the target directly, and every statement issued *here* is a
+//! `SELECT`. Spec §6 hangs a guarantee on that: pgpushy issues no DDL of its
+//! own, so schema changes all flow through pgschema, and `plan` cannot mutate
+//! the target even incidentally.
 //!
 //! One connection answers everything the commands need before delegating.
 
@@ -65,18 +66,26 @@ impl std::fmt::Display for Identity {
     }
 }
 
-/// Inspect the target. Read-only.
-pub fn inspect(connection: &Resolved, managed: &[SchemaName]) -> Result<Inspection> {
+/// Open pgpushy's own connection to the target.
+///
+/// Shared with seed execution (spec §8.8), which is what makes §6.3 hold for
+/// it too: the seeds land on the same database the inspection saw.
+pub fn connect(connection: &Resolved) -> Result<Client> {
     let config = connection.pg_config();
     // The two halves of `sslmode` (spec §6.4): the config carries what happens
     // when the server declines TLS, and the connector carries how much of the
     // certificate is checked once it does not. `None` is `disable` alone — the
     // driver then never even asks for TLS.
-    let mut client = match tls::connector(connection.sslmode)? {
+    match tls::connector(connection.sslmode)? {
         Some(tls) => config.connect(tls),
         None => config.connect(NoTls),
     }
-    .with_context(|| format!("connecting to {}", connection.describe()))?;
+    .with_context(|| format!("connecting to {}", connection.describe()))
+}
+
+/// Inspect the target. Read-only.
+pub fn inspect(connection: &Resolved, managed: &[SchemaName]) -> Result<Inspection> {
+    let mut client = connect(connection)?;
 
     let identity = read_identity(&mut client)?;
     let missing_schemas = missing_schemas(&mut client, managed)?;
