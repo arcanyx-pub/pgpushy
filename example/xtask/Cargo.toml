@@ -1,0 +1,10 @@
+[package]
+name = "xtask"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+# The version authority for the vendored SQL: bumping this and running
+# `pgpushy generate` is how the schema under db/ follows the library.
+snowdrop-id-postgres = "0.3.0"

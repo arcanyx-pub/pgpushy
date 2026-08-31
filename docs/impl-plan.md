@@ -281,6 +281,17 @@ commands are in [Appendix A](#appendix-a-reproduction-harness).
 
 ---
 
+**Verified while building the example project (2026-08-31, pgschema 1.12.3 + PG 18)**
+- **Storage parameters are outside pgschema's model, silently, in both
+  directions.** A desired state carrying `WITH (fillfactor = 70)` applies
+  without it (`reloptions` stays NULL) and re-plans empty; a target given the
+  same fillfactor by hand also re-plans empty. Nothing fails and nothing
+  converges — the parameter never participates. Consequence: the fillfactor
+  in `snowdrop-id-postgres`'s published DDL is lost when it flows through
+  pgpushy. Harmless for correctness (it is a HOT-update optimization), but
+  where it matters it must be set with a hand-run `ALTER TABLE … SET
+  (fillfactor = …)`.
+
 ## 2. Tech stack & conventions
 
 Mirror `snowdrop-id-rs`:

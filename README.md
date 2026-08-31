@@ -516,6 +516,9 @@ rather than failing.
 
 ## Documentation
 
+- [`example/`](example/) — a complete worked project: three managed schemas,
+  a reference cycle, seeds, and snowdrop-id machine-ID leases vendored
+  through `pgpushy generate`.
 - [`docs/spec.md`](docs/spec.md) — the specification. Normative, and the place
   where every design decision and its reasoning is recorded.
 - [`docs/migrating-from-pgschema.md`](docs/migrating-from-pgschema.md) — moving

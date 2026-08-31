@@ -67,6 +67,25 @@ jobs:
           echo "PGPUSHY_TEST_PGSCHEMA=/usr/local/bin/pgschema" >> "$GITHUB_ENV"
       - run: cargo test --workspace --all-features
 
+  example:
+    name: Example project
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            example
+      - run: cargo build -p pgpushy
+      # Offline: no database, no pgschema binary. This is the example staying
+      # a valid pgpushy project.
+      - run: cd example && ../target/debug/pgpushy validate
+      # The vendored snowdrop SQL must match what the locked crate version
+      # emits — the freshness guarantee generated sources exist for.
+      - run: cd example && ../target/debug/pgpushy generate --check
+
   lint:
     name: Rustfmt & Clippy
     runs-on: ubuntu-latest

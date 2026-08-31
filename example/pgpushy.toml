@@ -1,0 +1,35 @@
+# The example project: three managed schemas, order-free authoring, seeds,
+# and generated sources. See README.md alongside this file.
+
+source_root    = "db/schema"
+default_schema = "app"
+
+# Authoritative: a schema the tree uses but this list omits is an error,
+# rather than a schema pgpushy quietly starts managing.
+managed_schemas = ["app", "billing", "snowdrop"]
+
+# Work-in-progress files stay out of the desired state. wishlist.draft.sql
+# holds a view — pgpushy would reject it — and the pattern keeps it parked.
+exclude = ["**/*.draft.sql"]
+
+# Idempotent baseline rows, applied by pgpushy after the schemas (one
+# transaction per file, proven convergent on every run).
+seed_root = "db/seeds"
+
+# SQL owned by a dependency, vendored rather than hand-copied. The commands
+# run only under `pgpushy generate`; validate/plan/apply read only files.
+# Cargo.lock pins the snowdrop-id-postgres version the SQL comes from, and
+# `pgpushy generate --check` fails in CI when the vendored copy goes stale.
+[[generate]]
+output  = "db/schema/snowdrop/leases.sql"
+command = ["cargo", "run", "--quiet", "-p", "xtask", "--", "snowdrop-schema"]
+
+[[generate]]
+output  = "db/seeds/snowdrop_machine_ids.sql"
+command = ["cargo", "run", "--quiet", "-p", "xtask", "--", "snowdrop-seeding"]
+
+[env.local]
+db   = "shop"
+user = "postgres"
+# host defaults to localhost, port to 5432, sslmode to prefer.
+# The password comes from PGPASSWORD, never from this file.
