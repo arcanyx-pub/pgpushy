@@ -2,7 +2,7 @@
 
 **Status:** Build guidance (non-normative)
 **Date:** 2026-08-18
-**Companion to:** [`docs/spec.md`](./spec.md) v0.4 (normative)
+**Companion to:** [`docs/spec.md`](./spec.md) v0.5 (normative)
 
 This plan says *how* to build what `spec.md` defines. Where they disagree, the
 spec wins. It is written to be read cold: §1 distills everything we learned
@@ -367,6 +367,7 @@ pgpushy/
                             #   one document per managed schema (spec §5)
     src/graph.rs            # cross-schema FK graph, topo order, cycle detection (spec §7)
     src/literal.rs          # object names inside string literals (spec §4.3, §5.4)
+    src/seed.rs             # seed parse + allow-list + model checks (spec §4.6)
     src/error.rs            # diagnostics carrying file + line
   pgpushy/                  # the `pgpushy` binary — IO shell
     src/main.rs             # clap dispatch
@@ -388,6 +389,8 @@ pgpushy/
     src/output.rs           # verbosity and color, resolved once
     src/report.rs           # user-facing output, routed through one place
     src/run.rs              # orchestrates validate/plan/apply
+    src/seed_run.rs         # seed execution: per-file transaction + probe (spec §8.8)
+    src/generate.rs         # `pgpushy generate` and --check (spec §4.7)
     tests/                  # integration (real pgschema + Postgres)
 ```
 
@@ -783,12 +786,19 @@ comparing anything.
   which file it was read from and what to do instead. Plain `eprintln!` from
   `report.rs` — there is no logging framework (§2) — and it must never echo the
   password.
-- **CLI** (`clap` derive): `pgpushy init | validate | plan | apply`. Global:
-  `--config`, `--verbose`, `--no-color`. `--out <dir>` on all three of
-  `validate`, `plan` and `apply`; `--env` and `--pgschema-path` on `plan` and
-  `apply`; `--auto-approve` and `--lock-timeout` on `apply` alone. Nothing else
-  — everything a flag could otherwise set is either project structure or the
-  target. (Future: `pgpushy dump`, spec §14.)
+- **`seed_root` and `[[generate]]`** (spec §4.6, §4.7): both are project
+  structure, so both live in the file and nowhere else. `seed_root` resolves
+  like `source_root`; a nested seed root is excluded from desired-state
+  discovery and reported like an exclusion. Each `[[generate]]` entry is an
+  `output` path (must resolve under one of the two roots) and a `command`
+  argv vector, run with no shell and the config file's directory as cwd.
+- **CLI** (`clap` derive): `pgpushy init | validate | plan | apply |
+  generate`. Global: `--config`, `--verbose`, `--no-color`. `--out <dir>` on
+  all three of `validate`, `plan` and `apply`; `--env` and `--pgschema-path`
+  on `plan` and `apply`; `--auto-approve` and `--lock-timeout` on `apply`
+  alone; `--check` on `generate` alone, which takes no `--env` and connects to
+  nothing. Nothing else — everything a flag could otherwise set is either
+  project structure or the target. (Future: `pgpushy dump`, spec §14.)
 
 ---
 
@@ -814,6 +824,18 @@ comparing anything.
   an ordinary `cargo test` never pulls ~19 MB from GitHub.
   The pgschema version in that matrix **is** the supported floor (spec §13):
   raising the matrix and raising `MIN_PGSCHEMA` are one action.
+- **Seeds** (spec §4.6, §8.8) — the static rules are string-literal core
+  tests: each allow-list rejection with its remedy, the WHERE-less `DO UPDATE`
+  rejection, unqualified table, implicit column list, unmodeled table, column
+  and conflict-target checks against the model. The probe is integration-only,
+  against live Postgres: a well-formed seed applies once and re-applies as a
+  no-op with the probe passing; a volatile seed (`random()` in a values list,
+  which passes every static check) MUST roll back leaving zero rows; a
+  `DO UPDATE` seed with the guard converges; the affected-count report matches
+  what landed; and an empty schema plan with seeds present still prompts and
+  still seeds. `generate` tests are CLI-level: marker written, overwrite of an
+  unmarked file refused, `--check` fails on a stale output and passes after
+  regeneration, argv commands get no shell.
 - **Port the spike fixtures** (Appendix B) into `tests/` as the core cases —
   each is a regression we already know the answer to:
   1. unordered inline FK → pgpushy makes it succeed (was a raw-pgschema failure).
@@ -911,6 +933,20 @@ comparing anything.
   `classify_create_table` guards a `TableLikeClause` beside `inh_relations`,
   `partspec` and `of_typename`; it arrives inside `table_elts` rather than in a
   clause of its own.
+- **M14 — Seed files (spec §4.6, §8.8, §12.10–12.11).** Core: `seed.rs` —
+  parse, the allow-list (INSERT + ON CONFLICT, guard required on DO UPDATE,
+  explicit column list, qualified table), and the model checks (table, columns,
+  conflict target), all string-literal testable. Binary: discovery under
+  `seed_root`, `seed_run.rs` (per-file transaction, empty `search_path`,
+  `lock_timeout`, execute-record-probe-commit), the §8.6 summary line, §9
+  reporting. Ships the snowdrop story with a hand-vendored seed file; M15 is
+  not a prerequisite.
+- **M15 — `pgpushy generate` (spec §4.7).** `[[generate]]` config, argv
+  execution with captured stdout, the generated-source marker (distinct from
+  §8.7's document marker — opposite discovery polarity), the refusal to
+  overwrite unmarked files, and `--check`. Small by design: everything
+  downstream of discovery is untouched, and no other command executes a
+  configured generator.
 - **M10 — Names inside string literals (spec §4.3, §5.4). ✅ Done.** A bare
   name in a literal is rejected, naming the file, the line and the qualified
   form to write. `literal.rs` also carries the walk that §5.4's de-qualification
