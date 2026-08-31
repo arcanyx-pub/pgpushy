@@ -435,7 +435,9 @@ failure mode. Four refinements, each rejected with the remedy shown:
   MUST be rejected — a user-defined function can do arbitrary work, including
   exactly the deletes §12.10 forecloses. User-defined **types and domains**
   MAY appear but MUST be schema-qualified, since an unqualified one cannot
-  resolve at apply; a cast cannot write.
+  resolve at apply; a cast cannot write. validate enforces the rule for the
+  types the tree defines; a bare name it cannot recognize fails inside the
+  seed's transaction at apply, landing nothing.
 - **`DO UPDATE` without a `WHERE` guard MUST be rejected.** Whenever the
   statement seeds a row at all, the probe pass finds every one of those rows
   conflicting, every conflicting row takes the update arm, and Postgres

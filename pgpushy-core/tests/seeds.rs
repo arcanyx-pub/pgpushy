@@ -506,3 +506,29 @@ fn no_seed_files_is_no_seeds() {
     assert!(analysis.seeds.is_empty());
     assert_eq!(analysis.counts.seed_files, 0);
 }
+
+/// A named arbiter and its column-list spelling are the same conflict
+/// target, so the collision warning groups them together.
+#[test]
+fn collisions_are_detected_across_arbiter_spellings() {
+    let analysis = ok(
+        &[("machine.sql", MACHINE)],
+        &[
+            (
+                "a.sql",
+                "INSERT INTO public.machine AS m (machine_id, val) VALUES (1, 'a') \
+                 ON CONFLICT (val) DO UPDATE SET machine_id = excluded.machine_id \
+                 WHERE m.machine_id IS DISTINCT FROM excluded.machine_id;",
+            ),
+            (
+                "b.sql",
+                "INSERT INTO public.machine AS m (machine_id, val) VALUES (2, 'a') \
+                 ON CONFLICT ON CONSTRAINT machine_val_key DO UPDATE \
+                 SET machine_id = excluded.machine_id \
+                 WHERE m.machine_id IS DISTINCT FROM excluded.machine_id;",
+            ),
+        ],
+    );
+    assert_eq!(analysis.seeds.do_update_collisions.len(), 1);
+    assert_eq!(analysis.seeds.do_update_collisions[0].origins.len(), 2);
+}

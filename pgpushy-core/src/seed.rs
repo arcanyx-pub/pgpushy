@@ -189,15 +189,6 @@ fn check_insert(
     diagnostics: &mut Vec<Diagnostic>,
     do_updates: &mut BTreeMap<(QualifiedName, String), Vec<Origin>>,
 ) -> Option<QualifiedName> {
-    if insert.with_clause.is_some() {
-        diagnostics.push(disallowed(
-            "WITH is not allowed in a seed statement",
-            origin,
-            "a data-modifying CTE is a DELETE wearing an INSERT's statement kind, and \
-             even a read-only one makes the seeded rows depend on target state \
-             (spec §4.6)",
-        ));
-    }
     if !insert.returning_list.is_empty() {
         diagnostics.push(disallowed(
             "RETURNING is not allowed in a seed statement",
@@ -226,11 +217,27 @@ fn check_insert(
                 relation.relname
             ),
             origin,
-            format!(
-                "seed statements execute under an empty search_path (spec §8.8); write \
-                 the table schema-qualified, e.g. myschema.{}",
-                relation.relname
-            ),
+            {
+                // The model may already know the one table this can mean, in
+                // which case the remedy is its actual qualified form.
+                let candidates: Vec<_> = objects
+                    .tables
+                    .iter()
+                    .filter(|t| t.name.name == relation.relname)
+                    .collect();
+                match candidates.as_slice() {
+                    [table] => format!(
+                        "seed statements execute under an empty search_path (spec §8.8); \
+                         write {}",
+                        table.name
+                    ),
+                    _ => format!(
+                        "seed statements execute under an empty search_path (spec §8.8); \
+                         write the table schema-qualified, e.g. myschema.{}",
+                        relation.relname
+                    ),
+                }
+            },
         ));
         return None;
     }
@@ -269,11 +276,17 @@ fn check_insert(
             continue;
         };
         match shape.columns.get(target.name.as_str()) {
-            None => diagnostics.push(Diagnostic::new(
-                DiagnosticKind::SeedTargetMismatch,
-                format!("{name} has no column {}", target.name),
-                vec![origin.clone()],
-            )),
+            None => diagnostics.push(
+                Diagnostic::new(
+                    DiagnosticKind::SeedTargetMismatch,
+                    format!("{name} has no column {}", target.name),
+                    vec![origin.clone()],
+                )
+                .with_help(format!(
+                    "the columns of {name} are: {}",
+                    shape.columns.keys().cloned().collect::<Vec<_>>().join(", "),
+                )),
+            ),
             Some(Generated::Always) => diagnostics.push(
                 Diagnostic::new(
                     DiagnosticKind::SeedTargetMismatch,
@@ -300,7 +313,7 @@ fn check_insert(
         Some(clause) => {
             check_on_conflict(clause, &name, &shape, origin, diagnostics);
             if clause.action == OnConflictAction::OnconflictUpdate as i32 {
-                let signature = conflict_signature(clause);
+                let signature = conflict_signature(clause, &shape);
                 do_updates
                     .entry((name.clone(), signature))
                     .or_default()
@@ -366,15 +379,34 @@ fn check_on_conflict(
     };
 
     if !infer.conname.is_empty() {
-        if !shape.named_unique.contains(infer.conname.as_str()) {
-            diagnostics.push(Diagnostic::new(
-                DiagnosticKind::SeedTargetMismatch,
+        if !shape.named_unique.contains_key(infer.conname.as_str()) {
+            let help = if shape.named_unique.is_empty() {
                 format!(
-                    "ON CONSTRAINT {} names no PRIMARY KEY or UNIQUE constraint on {table}",
-                    infer.conname
-                ),
-                vec![origin.clone()],
-            ));
+                    "no PRIMARY KEY or UNIQUE constraint on {table} carries a name; \
+                     use ON CONFLICT (…) with the column list instead"
+                )
+            } else {
+                format!(
+                    "the named unique constraints on {table} are: {}",
+                    shape
+                        .named_unique
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                )
+            };
+            diagnostics.push(
+                Diagnostic::new(
+                    DiagnosticKind::SeedTargetMismatch,
+                    format!(
+                        "ON CONSTRAINT {} names no PRIMARY KEY or UNIQUE constraint on {table}",
+                        infer.conname
+                    ),
+                    vec![origin.clone()],
+                )
+                .with_help(help),
+            );
         }
         return;
     }
@@ -410,26 +442,43 @@ fn check_on_conflict(
     // a set (spec §4.6).
     if !shape.unique_sets.contains(&target) {
         let cols: Vec<_> = target.iter().cloned().collect();
-        diagnostics.push(Diagnostic::new(
-            DiagnosticKind::SeedTargetMismatch,
-            format!(
-                "the conflict target ({}) matches no primary key, unique constraint \
-                 or unique index on {table}",
-                cols.join(", ")
-            ),
-            vec![origin.clone()],
-        ));
+        let sets: Vec<String> = shape
+            .unique_sets
+            .iter()
+            .map(|set| format!("({})", set.iter().cloned().collect::<Vec<_>>().join(", ")))
+            .collect();
+        diagnostics.push(
+            Diagnostic::new(
+                DiagnosticKind::SeedTargetMismatch,
+                format!(
+                    "the conflict target ({}) matches no primary key, unique constraint \
+                     or unique index on {table}",
+                    cols.join(", ")
+                ),
+                vec![origin.clone()],
+            )
+            .with_help(format!(
+                "the unique column sets on {table} are: {}; or name a constraint with \
+                 ON CONFLICT ON CONSTRAINT …",
+                sets.join(", "),
+            )),
+        );
     }
 }
 
 /// A stable signature for one `DO UPDATE`'s conflict target, for collision
 /// grouping across files.
-fn conflict_signature(clause: &OnConflictClause) -> String {
+fn conflict_signature(clause: &OnConflictClause, shape: &Shape) -> String {
     let Some(infer) = clause.infer.as_deref() else {
         return String::new();
     };
     if !infer.conname.is_empty() {
-        return format!("constraint:{}", infer.conname);
+        // A named arbiter and its column-list spelling are one target, so a
+        // name the model knows resolves to its columns before grouping.
+        return match shape.named_unique.get(infer.conname.as_str()) {
+            Some(cols) => cols.iter().cloned().collect::<Vec<_>>().join(","),
+            None => format!("constraint:{}", infer.conname),
+        };
     }
     let mut cols = BTreeSet::new();
     for elem in &infer.index_elems {
@@ -592,15 +641,16 @@ struct Shape {
     /// Every column set a conflict target may name: the primary key, each
     /// UNIQUE constraint, and each unique non-partial plain-column index.
     unique_sets: Vec<BTreeSet<String>>,
-    /// Names ON CONFLICT ON CONSTRAINT may use.
-    named_unique: BTreeSet<String>,
+    /// Names ON CONFLICT ON CONSTRAINT may use, with their column sets, so
+    /// a named arbiter and its column-list spelling group as one target.
+    named_unique: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl Shape {
     fn of(table: &Table, objects: &Objects) -> Shape {
         let mut columns = BTreeMap::new();
         let mut unique_sets = Vec::new();
-        let mut named_unique = BTreeSet::new();
+        let mut named_unique = BTreeMap::new();
 
         for elt in &table.ast.table_elts {
             match elt.node.as_ref() {
@@ -618,10 +668,11 @@ impl Shape {
                         if c.contype == ConstrType::ConstrPrimary as i32
                             || c.contype == ConstrType::ConstrUnique as i32
                         {
-                            unique_sets.push(BTreeSet::from([col.colname.clone()]));
+                            let set = BTreeSet::from([col.colname.clone()]);
                             if !c.conname.is_empty() {
-                                named_unique.insert(c.conname.clone());
+                                named_unique.insert(c.conname.clone(), set.clone());
                             }
+                            unique_sets.push(set);
                         }
                     }
                     columns.insert(col.colname.clone(), generated);
@@ -638,11 +689,11 @@ impl Shape {
                             _ => None,
                         })
                         .collect();
+                    if !c.conname.is_empty() {
+                        named_unique.insert(c.conname.clone(), keys.clone());
+                    }
                     if !keys.is_empty() {
                         unique_sets.push(keys);
-                    }
-                    if !c.conname.is_empty() {
-                        named_unique.insert(c.conname.clone());
                     }
                 }
                 _ => {}

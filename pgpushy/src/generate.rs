@@ -38,6 +38,15 @@ pub fn run(loaded: &Loaded, output: Output, check: bool) -> Result<Outcome> {
     let settings = loaded.settings();
     let source_root = settings.source_root.clone();
     let seed_root = settings.seed_root.clone();
+    let matchers: Vec<globset::GlobMatcher> = settings
+        .exclude
+        .iter()
+        .map(|pattern| {
+            globset::Glob::new(pattern)
+                .map(|glob| glob.compile_matcher())
+                .with_context(|| format!("invalid exclude pattern {pattern:?}"))
+        })
+        .collect::<Result<_>>()?;
 
     let mut outputs = BTreeSet::new();
     let mut written = Vec::new();
@@ -45,6 +54,28 @@ pub fn run(loaded: &Loaded, output: Output, check: bool) -> Result<Outcome> {
 
     for entry in entries {
         let path = resolve_output(entry, loaded.base(), &source_root, seed_root.as_deref())?;
+        if let Ok(relative) = path.strip_prefix(&source_root) {
+            let relative = relative
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/");
+            if let Some(pattern) = settings
+                .exclude
+                .iter()
+                .zip(&matchers)
+                .find_map(|(pattern, matcher)| matcher.is_match(&relative).then_some(pattern))
+            {
+                bail!(
+                    "[[generate]] output {} matches the exclude pattern {pattern:?}\n\
+                     \n\
+                     Discovery would never read the file, so its content could not \
+                     become desired state (spec §4.7). Drop the pattern or move the \
+                     output.",
+                    entry.output.display(),
+                );
+            }
+        }
         if !outputs.insert(path.clone()) {
             bail!(
                 "two [[generate]] entries name the same output {}\n\
@@ -67,16 +98,24 @@ pub fn run(loaded: &Loaded, output: Output, check: bool) -> Result<Outcome> {
         }
 
         // Never overwrite a file this command cannot prove is its own —
-        // neither an operator's SQL nor a §8.7 document (spec §4.7).
-        match std::fs::read_to_string(&path) {
-            Ok(existing) if !existing.starts_with(GENERATED_SOURCE_MARKER) => bail!(
-                "{} exists and does not carry the generated-source marker\n\
-                 \n\
-                 pgpushy generate only overwrites files it wrote. Move or delete the \
-                 file if its content should come from [[generate]].",
-                path.display(),
-            ),
-            _ => {}
+        // neither an operator's SQL, nor a §8.7 document, nor anything it
+        // cannot even read (spec §4.7). Bytes, not text: a non-UTF-8 file is
+        // exactly the kind generate did not write.
+        match std::fs::read(&path) {
+            Ok(existing) if !existing.starts_with(GENERATED_SOURCE_MARKER.as_bytes()) => {
+                bail!(
+                    "{} exists and does not carry the generated-source marker\n\
+                     \n\
+                     pgpushy generate only overwrites files it wrote. Move or delete the \
+                     file if its content should come from [[generate]].",
+                    path.display(),
+                )
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| format!("reading {}", path.display()));
+            }
         }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
