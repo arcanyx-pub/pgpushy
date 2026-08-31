@@ -57,9 +57,12 @@ replace any of that. It sits in front of pgschema and removes two frictions:
 - pgpushy does not compute schema diffs or generate migration DDL; pgschema
   does (G3).
 - pgpushy does not provide its own connection, locking, or apply-safety
-  machinery beyond what it passes through to pgschema (§8.3).
+  machinery for schema changes beyond what it passes through to pgschema
+  (§8.3). Seed execution (§8.8) is the one deliberate exception, and carries
+  its own safety machinery: one transaction per file, and a convergence probe.
 - pgpushy is not a general SQL build system. It manages the object kinds in
-  the statement allow-list (§4.3) and rejects everything else.
+  the statement allow-list (§4.3), plus baseline rows through the seed file
+  class (§4.6), and rejects everything else.
 
 ### 1.3 Relationship to pgschema
 
@@ -387,11 +390,12 @@ with a diagnostic naming the offending source locations (G5):
 A source tree describes shape. Some baseline **rows** are as load-bearing as
 the shape that holds them: reference data the application requires in order to
 function at all. The motivating example is a library that provisions its own
-table — `snowdrop-id-postgres` cannot lease a machine ID until its lease table
-holds its 1024 seed rows — but every lookup table an application joins against
-is the same situation. Provisioning such rows has traditionally fallen either
-to a side script run by hand, or to the application at boot, which needs
-DDL-adjacent rights a production application role should not hold. Both are
+table — `snowdrop-id-postgres` cannot lease a machine ID until the lease table
+in its `snowdrop` schema holds its 1024 seed rows — but every lookup table an
+application joins against is the same situation. Provisioning such rows has
+traditionally fallen either to a side script run by hand, or to the
+application at boot (`auto_provision`-style), which needs DDL rights a
+production application role should not hold. Both are
 the kind of friction pgpushy exists to remove, so pgpushy owns the step — as a
 **separate file class** with its own rules, not as a relaxation of §4.3, whose
 reasons for rejecting DML are untouched: a statement in the desired state
@@ -402,30 +406,51 @@ anywhere near it.
 absent, there are no seed files and this section does not apply. Discovery
 under the seed root follows §4.1's rules — recursive `*.sql`, hidden entries
 ignored, the same symlink policy, the same deterministic byte-order — and its
-files are seed files, never desired state. The two roots MUST NOT be the same
-directory. A seed root inside the source root is excluded from desired-state
+files are seed files, never desired state; the `exclude` patterns of §4.1
+apply to the source tree only, never under the seed root (§14). The two roots
+MUST NOT be the same directory. A seed root inside the source root is excluded from desired-state
 discovery, reported the way exclusions are; a source root inside the seed root
 MUST be an error, because every schema file would then also be read as a seed
 and rejected by the allow-list below.
 
 **The seed allow-list.** Every statement in a seed file MUST be an `INSERT`
 carrying an `ON CONFLICT` clause — `DO NOTHING` or `DO UPDATE` — and anything
-else MUST be rejected, naming the file, the line and the statement kind. The
-rule is idempotence by construction (§11.1): a bare `INSERT` is a duplicate
-row or a unique-violation on the second apply, and either is this section's
-one failure mode. Two refinements, each rejected with the remedy shown:
+else MUST be rejected, naming the file, the line and the statement kind, with
+the `ON CONFLICT` form to add as the remedy for a bare `INSERT`. The rule is
+idempotence by construction (§11.1): a bare `INSERT` is a duplicate row or a
+unique-violation on the second apply, and either is this section's one
+failure mode. Four refinements, each rejected with the remedy shown:
 
-- **`DO UPDATE` without a `WHERE` guard MUST be rejected.** It provably cannot
-  pass the §8.8 probe: on the probe pass every seeded row conflicts, every
-  conflicting row takes the update arm, and Postgres counts a row updated to
-  its existing values as affected — so the pass reports at least the seeded
-  row count, never zero. The diagnostic MUST show the guard to add
+- **The source MUST NOT read the database**: `VALUES`, or a `SELECT` that
+  references no table or view — a set-returning built-in such as
+  `generate_series` is the useful case — and **no `WITH` clause at all**. A
+  data-modifying CTE is a `DELETE` wearing an `INSERT`'s statement kind, and
+  would quietly break §12.10's guarantee; even a read-only source query makes
+  the seeded rows a function of target state rather than of the repository,
+  the row-level version of the ambient input §4.7 rejects. `RETURNING` is
+  rejected with the rest; nothing consumes it.
+- **Expressions may call only built-in functions.** Under §8.8's empty
+  `search_path` an unqualified function resolves in `pg_catalog` or not at
+  all, so unqualified calls are safe; a call qualified with any other schema
+  MUST be rejected — a user-defined function can do arbitrary work, including
+  exactly the deletes §12.10 forecloses. User-defined **types and domains**
+  MAY appear but MUST be schema-qualified, since an unqualified one cannot
+  resolve at apply; a cast cannot write.
+- **`DO UPDATE` without a `WHERE` guard MUST be rejected.** Whenever the
+  statement seeds a row at all, the probe pass finds every one of those rows
+  conflicting, every conflicting row takes the update arm, and Postgres
+  counts a row updated to its existing values as affected — so the pass
+  cannot report zero. (A source yielding no rows converges vacuously, and
+  seeds nothing.) The diagnostic MUST show the guard to add
   (`WHERE t.col IS DISTINCT FROM excluded.col`), which is also simply good
   practice: without it every apply rewrites every seeded row — dead tuples,
   WAL, and triggers firing over no-ops.
-- **The column list MUST be explicit.** An `INSERT` without one binds values
-  to column positions, and breaks silently the day the table gains a column;
-  with one, validate can check every named column against the model.
+- **The column list MUST be explicit**, and MUST NOT name a column the model
+  declares `GENERATED ALWAYS` — as identity, which this form cannot insert
+  into without `OVERRIDING SYSTEM VALUE`, or as an expression, which nothing
+  can insert into. An `INSERT` without a column list binds values to
+  positions, and breaks silently the day the table gains a column; with one,
+  validate can check every named column against the model.
 
 **Qualification and the model.** The inserted-into table MUST be written
 schema-qualified. Seed files are executed verbatim (§8.8) under an empty
@@ -436,15 +461,20 @@ table pgpushy does not manage is writing rows into shape it cannot see, the
 row-level version of what §8.4 exists to prevent — and the model is what makes
 the offline checks possible at all. validate MUST check that the table and
 every named column exist, and that the conflict target is checkable: a plain
-column list equal to the table's primary key or to a unique constraint or
-unique index over exactly those columns, or `ON CONFLICT ON CONSTRAINT`
-naming a modeled constraint. A conflict target validate cannot check
-statically — an expression target, say — MUST be rejected, with the
-`ON CONSTRAINT` form as the remedy; admitting expression targets is possible
-later if wanted.
+column list equal — as a set; order carries no meaning — to the table's
+primary key or to a unique constraint or unique index over exactly those
+columns, or `ON CONFLICT ON CONSTRAINT` naming a modeled constraint.
+`DO NOTHING` MAY omit the conflict target, arbitrating on any conflict, which
+converges trivially; `DO UPDATE` cannot, and Postgres itself refuses it. A
+conflict target validate cannot check statically — an expression target, or
+one carrying a partial-index `WHERE` — MUST be rejected, with the
+`ON CONSTRAINT` form as the remedy; admitting them is possible later if
+wanted. validate SHOULD additionally warn when two `DO UPDATE` statements
+anywhere in the tree share a table and conflict target: the per-file probe
+cannot see two files converging against each other (§11.1, §12.11).
 
-Seed files never enter synthesis, never appear in any document, and are never
-shown to pgschema (§5, §8). Their execution is specified in §8.8; what they
+Seed files never enter synthesis, never appear in any document, are never
+shown to pgschema, and never reach the plan database (§5, §8, §10.4). Their execution is specified in §8.8; what they
 cannot do is stated in §12.10 and §12.11.
 
 ### 4.7 Generated sources
@@ -458,11 +488,14 @@ output by hand works until the dependency is bumped, at which point the copy
 is stale and nothing says so. `pgpushy generate` closes that loop.
 
 **Configuration.** The file MAY declare generators (§10.1): each `[[generate]]`
-entry names an `output` path — resolved against the configuration file's own
-directory, and it MUST land under the source root or the seed root, because a
-generated file nothing will discover is a configuration mistake — and a
-`command`, an argv vector executed **without a shell**, so there is no quoting
-or injection surface. The command runs with the configuration file's directory
+entry names an `output` path — relative, `..`-free, resolved against the
+configuration file's own directory without following symlinks — and a
+`command`, an argv vector executed **without a shell**, so there is no
+quoting or injection surface. The output MUST land under the source root or
+the seed root and MUST be a file discovery will retain (`*.sql`, not hidden,
+not excluded), because a generated file nothing will discover is a
+configuration mistake. Two entries MUST NOT share one output. With no entries
+configured, `generate` and `--check` succeed, and say so. The command runs with the configuration file's directory
 as its working directory; its stdout is the file's content; its stderr passes
 through; a nonzero exit or empty output MUST be an error.
 
@@ -470,10 +503,12 @@ through; a nonzero exit or empty output MUST be an error.
 output under a generated-**source** marker (§4.1) that names the command,
 states that the file is not to be edited, and says how to regenerate it. It
 MUST refuse to overwrite an existing file that does not begin with that
-marker — `generate` can create a new file anywhere it is pointed, but it can
-never clobber SQL a human wrote. **`pgpushy generate --check`** re-runs every
-generator, writes nothing, and MUST fail — naming each stale output — if any
-file differs from what would be written. That check is the freshness
+marker — `generate` can create a new file where none exists, but it can never
+overwrite a file it cannot prove is its own: neither an operator's SQL nor a
+§8.7 document. **`pgpushy generate --check`** re-runs every
+generator, writes nothing, and MUST fail — naming each stale output, with
+running `generate` as the remedy — if any output file differs from what would
+be written or is absent; a failing command is its own error, not staleness. That check is the freshness
 guarantee: run in CI, it forces a dependency bump that changes the emitted SQL
 to land as a reviewed `.sql` diff in the same change.
 
@@ -495,7 +530,7 @@ enforcement.
 > `npm exec` script, a pinned container — rather than at a globally installed
 > binary. The lockfile then pins the SQL's provenance, and `--check` fails the
 > moment an upgrade changes it. Two operational notes: `generate` executes
-> repository-configured commands, so CI MUST NOT run it on untrusted input
+> repository-configured commands, so CI should never run it on untrusted input
 > (the `pull_request_target` hazard in
 > [`github-action-sketch.md`](./github-action-sketch.md)); and removing a
 > `[[generate]]` entry leaves its marked output behind as an ordinary source
@@ -782,9 +817,9 @@ MUST name everything that is wrong rather than only the first problem found
 (G5).
 
 A consequence of this section is that **pgpushy issues no DDL of its own to
-the target** in 0.1: schema *and* content changes all flow through pgschema
-(satisfying G3), and every query pgpushy issues directly is read-only, so
-`plan` cannot mutate the target even incidentally.
+the target**: schema changes all flow through pgschema (satisfying G3), and
+outside `apply`'s seed execution (§8.8) every statement pgpushy issues
+directly is read-only, so `plan` cannot mutate the target even incidentally.
 
 ### 6.1 Every managed schema must exist
 
@@ -901,8 +936,9 @@ exists to make exactly that kind of divergence impossible.
 An unrecognized `sslmode` MUST be a hard error naming the value and listing
 the five accepted modes.
 
-This is the only place pgpushy accesses the target directly, and every
-statement it issues there MUST be read-only.
+Inspection and seed execution (§8.8) are the only places pgpushy accesses the
+target directly — §8.8 reuses this section's resolution — and every statement
+outside §8.8 MUST be read-only.
 
 ## 7. Cross-Schema Ordering
 
@@ -1141,7 +1177,8 @@ percent-encoded, so that a legal but hostile schema name yields a legal
 filename inside the directory and cannot escape it.
 
 **pgpushy owns the directory it is given.** It MUST create it if absent. If it
-exists, every file in it MUST carry pgpushy's generated-file marker (§4.1),
+exists, every file in it MUST carry pgpushy's generated-document marker
+(§4.1),
 otherwise pgpushy MUST refuse and name a file it did not write — so `--out`
 can never overwrite an operator's own SQL. On success pgpushy MUST remove
 generated files the current run did not write, so that a schema dropped from
@@ -1310,7 +1347,9 @@ password.
 Only things that describe *this run* or *this machine*, never the project or
 the target: `--config`, `--env`, `--pgschema-path` (which differs per machine
 and cannot affect what is reconciled), `--out`, `--auto-approve`,
-`--lock-timeout` (§10.5), `--verbose`, and `--no-color`.
+`--lock-timeout` (§10.5), `--verbose`, `--no-color`, and `generate`'s
+`--check`, which selects a mode of that command rather than anything about
+the project.
 
 ### 10.4 The plan database
 
@@ -1365,10 +1404,13 @@ per-schema `pgschema plan` is empty, and `pgpushy apply` is a no-op. (Verified
 for the multi-schema loop in the design spike.) §5.3's constraint-name rule
 exists to preserve this property for author-unnamed foreign keys.
 
-Seed files extend the property to rows, and prove it on every apply: a second
-`apply` MUST leave every seeded table unchanged, and §8.8's probe refuses to
-commit any seed file whose second pass in the same transaction touched
-anything. §4.6's static rules exist so the common violations fail at
+Seed files extend the property to rows, and prove it on every apply: each
+seed file MUST converge, and §8.8's probe refuses to commit any file whose
+second pass in the same transaction touched anything. The probe's scope is
+the file — two files `DO UPDATE`-ing the same row toward different values
+each converge alone while together rewriting the row on every apply, which
+validate warns about where it is statically visible (§4.6) and a whole-set
+probe could close (§14). §4.6's static rules exist so the common violations fail at
 `validate`, offline, with a file and a line; the probe is the backstop for
 what parsing cannot see. "Converged" is defined as **zero affected rows** on
 the probe pass — stricter than semantic idempotence for `DO UPDATE`, and
@@ -1531,12 +1573,20 @@ operator or the application.
 
 ### 12.11 The seed statement form is narrow
 
-`INSERT … ON CONFLICT`, with an explicit column list and a statically
-checkable conflict target, is the whole seed allow-list (§4.6): no `COPY`, no
-`UPDATE`-only fixups, no expression conflict targets. The narrowness is not
-incidental — it is what makes idempotence checkable at all, statically at
+`INSERT … ON CONFLICT`, with a database-free source, built-in functions
+only, an explicit column list and a statically checkable conflict target, is
+the whole seed allow-list (§4.6): no `COPY`, no `UPDATE`-only fixups, no
+`WITH` clause, no reading the target in a source query, no expression
+conflict targets. The narrowness is not incidental — it is what makes
+§12.10's guarantee and §11.1's convergence checkable at all, statically at
 `validate` and dynamically by §8.8's probe. Each exclusion is additive later
 if a real tree needs it.
+
+The probe's one blind spot is scope: it proves each file converges, not that
+the set does. Two files `DO UPDATE`-ing the same row toward different values
+each pass their own probe while the row is rewritten on every apply; validate
+warns on the statically visible shape (§4.6), and a whole-set probe is future
+work (§14).
 
 ## 13. Dependencies and Compatibility
 
@@ -1677,7 +1727,7 @@ if a real tree needs it.
      and changes on a logical restore, which is correct in both directions.
   4. **One `<schema>.json` per managed schema**, percent-encoded by §8.7's
      rule, in a directory pgpushy owns. The manifest is what marks the
-     directory as pgpushy's, since JSON cannot carry §4.1's generated-file
+     directory as pgpushy's, since JSON cannot carry §4.1's generated-document
      marker. Naming them by index — as the temporary files do today — would
      leave file order and manifest order able to disagree, and would make the
      artifact unreadable to whoever is approving it.
@@ -1760,11 +1810,13 @@ if a real tree needs it.
   process environment (Atlas does this with `--var`) rather than written out
   statically.
 - **Schema-drop management** (§12.3), behind an explicit opt-in.
-- **A plan-time seed probe.** `plan` lists seed files without executing them
-  (§8.8). A `BEGIN … ROLLBACK` double-run against the target would report
-  real would-insert counts and prove convergence before the deploy gate — but
-  it takes locks, burns transaction IDs, and fires triggers on what should be
-  a read, so it waits for someone to want it.
+- **A plan-time seed probe, and a whole-set probe.** `plan` lists seed files
+  without executing them (§8.8). A `BEGIN … ROLLBACK` double-run against the
+  target would report real would-insert counts and prove convergence before
+  the deploy gate — but it takes locks, burns transaction IDs, and fires
+  triggers on what should be a read, so it waits for someone to want it. The
+  same double-run over **all** files in one transaction would close §11.1's
+  per-file scope (§12.11).
 - **Ephemeral generators** — running `[[generate]]` commands at plan or apply
   time without vendoring the output. Rejected for now because unvendored
   output is ambient input (§4.7); revisit only against demonstrated need.
@@ -1977,8 +2029,8 @@ made after draft 2 of v0.1.
   rows belong to the deploy step, which is pgpushy's step. (§4.6, §8.8)
 - **[0.5] Seed idempotence is enforced twice** — statically at `validate`
   (every statement `INSERT … ON CONFLICT`; `DO UPDATE` without a `WHERE` guard
-  rejected, since on a second pass every seeded row conflicts and re-updates,
-  so it provably cannot converge to zero affected rows) and dynamically at
+  rejected, since whenever it seeds a row at all the probe pass re-updates
+  every one, so it cannot converge to zero affected rows) and dynamically at
   `apply`, where §8.8 runs each file twice in one transaction and commits only
   if the second pass touched nothing. The probe's placement is the decision: a
   passing probe changed nothing, so the commit commits exactly the first pass,
@@ -1998,7 +2050,11 @@ made after draft 2 of v0.1.
   column list breaks silently the day the table gains a column. Seeding a
   table the source tree does not describe is rejected: writing rows into shape
   pgpushy cannot see is the row-level version of the misattribution §5.4
-  exists to prevent. (§4.6)
+  exists to prevent. The statement's source may not read the database, and
+  its expressions may call only built-in functions — a data-modifying CTE is
+  a `DELETE` wearing an `INSERT`'s statement kind, a `SELECT` over a table
+  makes the rows a function of target state, and a user-defined function can
+  do arbitrary work; each would quietly break §12.10 or §11.3. (§4.6)
 - **[0.5] Generated sources are vendored, and vendoring is the only mode** —
   `generate` is upstream of discovery; `validate`, `plan` and `apply` execute
   no configured command and read only files. Unvendored generator output is

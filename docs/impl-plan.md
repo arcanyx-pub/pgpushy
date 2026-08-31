@@ -1,7 +1,7 @@
 # pgpushy Implementation Plan
 
 **Status:** Build guidance (non-normative)
-**Date:** 2026-08-18
+**Date:** 2026-08-31
 **Companion to:** [`docs/spec.md`](./spec.md) v0.5 (normative)
 
 This plan says *how* to build what `spec.md` defines. Where they disagree, the
@@ -825,12 +825,15 @@ comparing anything.
   The pgschema version in that matrix **is** the supported floor (spec §13):
   raising the matrix and raising `MIN_PGSCHEMA` are one action.
 - **Seeds** (spec §4.6, §8.8) — the static rules are string-literal core
-  tests: each allow-list rejection with its remedy, the WHERE-less `DO UPDATE`
-  rejection, unqualified table, implicit column list, unmodeled table, column
-  and conflict-target checks against the model. The probe is integration-only,
+  tests: each allow-list rejection with its remedy — the data-modifying CTE,
+  the `SELECT` over a table, the qualified user-function call, the WHERE-less
+  `DO UPDATE`, the unqualified table, the implicit column list, the
+  `GENERATED ALWAYS` column, the unmodeled table — plus the column and
+  conflict-target checks against the model and the cross-file `DO UPDATE`
+  collision warning. The probe is integration-only,
   against live Postgres: a well-formed seed applies once and re-applies as a
   no-op with the probe passing; a volatile seed (`random()` in a values list,
-  which passes every static check) MUST roll back leaving zero rows; a
+  which passes every static check) must roll back leaving zero rows; a
   `DO UPDATE` seed with the guard converges; the affected-count report matches
   what landed; and an empty schema plan with seeds present still prompts and
   still seeds. `generate` tests are CLI-level: marker written, overwrite of an
@@ -934,16 +937,18 @@ comparing anything.
   `partspec` and `of_typename`; it arrives inside `table_elts` rather than in a
   clause of its own.
 - **M14 — Seed files (spec §4.6, §8.8, §12.10–12.11).** Core: `seed.rs` —
-  parse, the allow-list (INSERT + ON CONFLICT, guard required on DO UPDATE,
-  explicit column list, qualified table), and the model checks (table, columns,
-  conflict target), all string-literal testable. Binary: discovery under
+  parse, the allow-list (INSERT + ON CONFLICT; no WITH or RETURNING; a
+  database-free source; built-in functions only; guard required on DO UPDATE;
+  explicit column list with no GENERATED ALWAYS column; qualified table), and
+  the model checks (table, columns, conflict target), all string-literal
+  testable. Binary: discovery under
   `seed_root`, `seed_run.rs` (per-file transaction, empty `search_path`,
   `lock_timeout`, execute-record-probe-commit), the §8.6 summary line, §9
   reporting. Ships the snowdrop story with a hand-vendored seed file; M15 is
   not a prerequisite.
 - **M15 — `pgpushy generate` (spec §4.7).** `[[generate]]` config, argv
   execution with captured stdout, the generated-source marker (distinct from
-  §8.7's document marker — opposite discovery polarity), the refusal to
+  §4.1's document marker — opposite discovery polarity), the refusal to
   overwrite unmarked files, and `--check`. Small by design: everything
   downstream of discovery is untouched, and no other command executes a
   configured generator.
