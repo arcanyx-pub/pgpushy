@@ -63,6 +63,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `apply` gains a write path to the target, scoped to seed DML: pgpushy
   still issues no DDL of its own, and `plan` still executes nothing.
+- `pgpushy-core` drops the unused `error::Analysis<T>` alias, which shadowed
+  the exported `Analysis` struct.
 - **`COMMENT ON SCHEMA` and `COMMENT ON CONSTRAINT` are rejected.** Both were
   accepted through 0.1 and silently dropped by pgschema — no plan step,
   nothing in the catalog — the same class as type and domain comments, found

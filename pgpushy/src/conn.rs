@@ -93,7 +93,7 @@ impl PlanConnection {
     /// database (spec §10.4), built the way the target's is and interpreting
     /// `sslmode` the same way (§6.4).
     pub fn pg_config(&self) -> Result<(postgres::Config, SslMode)> {
-        let sslmode = SslMode::parse(&self.sslmode, "plan_db")?;
+        let sslmode = SslMode::parse(&self.sslmode, "<name>.plan_db")?;
         let mut config = postgres::Config::new();
         config
             .host(&self.host)

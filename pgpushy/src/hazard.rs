@@ -75,7 +75,12 @@ pub fn check(
             continue;
         };
 
-        for step in plan.destructive_drops() {
+        // Raw drops, deliberately unpaired (spec §8.6): a widened referenced
+        // constraint presents as drop+create on one path, and the drop half
+        // still executes first — Postgres refuses it mid-apply (SQLSTATE
+        // 2BP01) when a foreign key depends on it. Pairing here would hide
+        // exactly the removal this check exists to catch (verified live).
+        for step in plan.drops() {
             let Some(object) = step
                 .path
                 .strip_prefix(&format!("{}.{}.", fk.to_schema, fk.to_table))
@@ -196,5 +201,22 @@ mod tests {
             plan_with(&drop_step("table.column", "up.other_table.alt")),
         )];
         assert!(check(&[foreign_key()], &plans, &[schema("up"), schema("down")]).is_empty());
+    }
+
+    /// A widened referenced constraint is drop+create on one path. The drop
+    /// half still executes first, so it is still a hazard — the §8.6 pairing
+    /// applies to the approval summary, never here (verified live: SQLSTATE
+    /// 2BP01 mid-apply without this).
+    #[test]
+    fn a_recreated_referenced_constraint_is_still_a_hazard() {
+        let steps = format!(
+            "{},{}",
+            drop_step("table.constraint", "up.parent.parent_alt_key"),
+            r#"{"type":"table.constraint","operation":"create","path":"up.parent.parent_alt_key"}"#,
+        );
+        let plans = vec![(schema("up"), plan_with(&steps))];
+        let hazards = check(&[foreign_key()], &plans, &[schema("up"), schema("down")]);
+        assert_eq!(hazards.len(), 1);
+        assert_eq!(hazards[0].dropped_kind, "constraint");
     }
 }

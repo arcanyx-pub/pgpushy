@@ -274,12 +274,12 @@ same reason the allow-list exists at all:
   1.12.0 — the standalone sequence is dropped and an owned one created in its
   place). An owned sequence is spelled `serial` or `GENERATED … AS IDENTITY`.
 - **`COMMENT ON` a type, a domain, a schema or a table constraint** MUST be
-  rejected, though a comment on a
-  sequence is accepted. pgschema generates no DDL for either: verified against
-  pgschema 1.12.3 by applying and re-planning, it emits the sequence's comment,
-  omits the other two, applies everything else, and then reports no changes —
-  so the comment never reaches the target and nothing ever says so. A comment
-  that silently does not exist is worse than one that is refused (§12.9).
+  rejected, though a comment on a sequence is accepted. pgschema generates no
+  DDL for any of the four: verified against pgschema 1.12.3 by applying and
+  re-planning, it emits the sequence's comment, omits the others, applies
+  everything else, and then reports no changes — so the comment never reaches
+  the target and nothing ever says so. A comment that silently does not exist
+  is worse than one that is refused (§12.9).
 - A **default calling `nextval`** — on a column or on a domain — MUST be
   rejected. pgschema models any such default as `SERIAL`: verified against
   pgschema 1.12.0, applying `CREATE SEQUENCE s` together with a column
@@ -538,6 +538,18 @@ enforcement.
 > `[[generate]]` entry leaves its marked output behind as an ordinary source
 > file — still discovered, still applied — so delete the file in the same
 > change.
+
+- **Qualified references into a managed schema that the tree does not
+  define.** A column type, a domain base type, or a name literal written
+  `S.name`, where `S` is managed but nothing in the tree defines `name`, MUST
+  be an error: in the plan database a managed schema holds only what the
+  source tree defines, so the reference cannot resolve there, and the failure
+  would otherwise surface mid-plan-loop as pgschema's error (G5). An
+  **unqualified** unknown name is left as written — `text` and an extension's
+  type are indistinguishable offline — and a qualified reference into an
+  unmanaged schema remains §12.6's and §14's business. For a literal, a
+  tree-defined table or index also satisfies the reference, since `regclass`
+  legitimately names either.
 
 ## 5. Desired-State Synthesis
 
@@ -1202,11 +1214,15 @@ nobody approved.
 A summary of "how many schemas change" and which changes are destructive is
 read from those plans — each step carries its own operation — and not derived
 by pgpushy comparing anything, which would be reimplementing the diffing G3
-reserves for pgschema. One refinement is required: a `drop` step paired with
-a `create` of the same kind and path is a **modification**, not a destructive
-change — pgschema's own rendering of a widened UNIQUE constraint is "1 to
-modify" over exactly such a pair (verified at 1.12.3) — so the summary and
-the §6.2 check MUST treat the pair as one alter.
+reserves for pgschema. One refinement is required, and it is scoped
+precisely: in the summary's **destructive classification**, a `drop` step
+paired with a `create` of the same kind and path is a modification, not a
+destructive change — pgschema's own rendering of a widened UNIQUE constraint
+is "1 to modify" over exactly such a pair (verified at 1.12.3). Step counts
+still count steps. The §6.2 check MUST NOT pair: the drop half executes
+first regardless, and Postgres refuses to drop a constraint a foreign key
+depends on (verified — SQLSTATE 2BP01, mid-apply), so a recreated referenced
+constraint is precisely the removal that check exists to catch.
 
 `pgpushy apply --auto-approve` skips step 5 for non-interactive use. When
 standard input is not a terminal and `--auto-approve` was not given, pgpushy
@@ -2184,8 +2200,21 @@ made after draft 2 of v0.1.
   that quietly does not exist is worse than one that is refused. (§4.3,
   §12.9)
 - **[0.6] A drop paired with a create on the same kind and path is a
-  modification** — pgschema renders a widened UNIQUE constraint as "1 to
-  modify" over exactly such a pair (verified), so counting the drop half as
-  destructive misreports routine migrations, and the §6.2 check reading it as
-  a removal would refuse a change pgschema itself calls an alter. The §8.6
-  summary and §6.2 both pair before they count. (§6.2, §8.6)
+  modification — for the approval summary alone** — pgschema renders a
+  widened UNIQUE constraint as "1 to modify" over exactly such a pair
+  (verified), so counting the drop half as destructive misreports routine
+  migrations. The §6.2 check deliberately does **not** pair: adversarial
+  review proved the pair is exactly how a cross-schema-referenced
+  constraint's removal presents, and the drop half still executes first —
+  Postgres refuses it mid-apply (SQLSTATE 2BP01) after earlier schemas have
+  already applied. Classification pairs; hazard detection never does.
+  (§6.2, §8.6)
+- **[0.6] A qualified reference into a managed schema that the tree does not
+  define fails at validate** — the previously unreachable diagnostic, made
+  reachable. Resolution deliberately leaves unknown *unqualified* names as
+  written, because `text` and an extension's type look identical offline; a
+  qualified miss carries a schema name, and when that schema is managed the
+  plan database provably cannot resolve it, so the reference would otherwise
+  detonate mid-plan-loop as pgschema's error. Tree-defined tables and indexes
+  satisfy a literal, which may legitimately name them (`'s.t'::regclass`).
+  (§4.5)
