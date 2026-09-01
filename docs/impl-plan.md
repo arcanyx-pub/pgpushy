@@ -331,6 +331,13 @@ commands are in [Appendix A](#appendix-a-reproduction-harness).
   (2026-09-01) — a floor that only holds under a non-default configuration
   is not a floor.
 
+**Verified while bumping the pin to 1.12.5 (2026-09-01)**
+- **Plan-database accumulation is unchanged at 1.12.5**: a cross-schema
+  closure member still lands as a real table in an external plan database,
+  and the §10.4 check refuses the second run by name — 1.12.4's
+  cross-schema-FK ignore stubs (pgschema #549) did not alter this path. The
+  full integration suite passes against 1.12.5.
+
 **Verified while designing the plan artifact (2026-08-31, pgschema 1.12.3)**
 - **`--output-json <path>` writes the plan to a file**, and `pgschema apply
   --plan <path>` applies it across processes and time — the fingerprint is

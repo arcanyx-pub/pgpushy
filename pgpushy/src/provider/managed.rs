@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 /// one should get the most fixed version that has been tested. Both ends of
 /// the CI matrix move with these constants, or the floor is a lie in one
 /// direction and the pin is untested in the other.
-pub const PINNED_PGSCHEMA: &str = "1.12.3";
+pub const PINNED_PGSCHEMA: &str = "1.12.5";
 
 /// SHA-256 of each release asset pgpushy pins, as `(version, platform, hash)`.
 ///
@@ -46,6 +46,26 @@ pub const PINNED_PGSCHEMA: &str = "1.12.3";
 /// Adding a version means adding four rows — one per platform — verified by
 /// downloading each asset and hashing it, not by copying from anywhere.
 const HASHES: &[(&str, &str, &str)] = &[
+    (
+        "1.12.5",
+        "linux-amd64",
+        "bcef715edb71321c6a27886fcc74a423f923c62d731852668314efcce1402698",
+    ),
+    (
+        "1.12.5",
+        "linux-arm64",
+        "a347cda5ce428109cd949ff2fcaccda380296016338722efa4488cd8e2f681ec",
+    ),
+    (
+        "1.12.5",
+        "darwin-amd64",
+        "2ee3f1ae1041c159a5cf21226858144b9231c3da7e799a78eeec39c0ed38c2a8",
+    ),
+    (
+        "1.12.5",
+        "darwin-arm64",
+        "45f72aad6d54d4c21815e19844c566690cf1150cb61358fd9a1839c0060bf9ea",
+    ),
     (
         "1.12.3",
         "linux-amd64",

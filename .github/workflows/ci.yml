@@ -33,11 +33,12 @@ jobs:
         # what the managed backend downloads, so `PINNED_PGSCHEMA` must equal
         # that. Changing either constant without changing this matrix makes
         # one of them a claim nothing tests.
-        # Floor and pin coincide at 1.12.3 (spec §13): the floor was raised
-        # off 1.12.0 on 2026-09-01, when its embedded plan database — whose
-        # Postgres version index predates 17.5 — started failing the moment
-        # the postgres:17 image's minor moved. One version, still both ends.
-        pgschema: ["1.12.3"]
+        # Both ends are load-bearing (spec §13): the lowest is the floor
+        # (MIN_PGSCHEMA), the highest is the pin (PINNED_PGSCHEMA). The floor
+        # sits at 1.12.3 since 2026-09-01, when 1.12.0's embedded plan
+        # database — whose Postgres version index predates 17.5 — started
+        # failing as the postgres:17 image's minor moved.
+        pgschema: ["1.12.3", "1.12.5"]
         # pgschema states PG 14-17; 18 is what the dev container runs. Both
         # ends of the claimed range plus the local reality.
         postgres: ["14", "17", "18"]
