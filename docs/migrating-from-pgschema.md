@@ -488,7 +488,7 @@ Notes for someone arriving from pgschema's flags:
   `verify-full`, which pgpushy interprets itself.
 - **pgschema is downloaded by default** — pinned to 1.12.3, verified against a
   SHA-256 pgpushy ships, and cached. Set `backend = "byo"` or a `path` to use
-  your own; a BYO binary must be 1.12.0 or newer.
+  your own; a BYO binary must be 1.12.3 or newer.
 - **Unknown keys are rejected**, because a mistyped key is otherwise invisible
   from behavior. One TOML consequence worth knowing: the top-level keys must
   come *before* the first `[section]` header, or they are parsed as part of that

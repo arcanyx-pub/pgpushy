@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The pgschema floor is raised to 1.12.3.** A bring-your-own binary below
+  it is now refused. Measured in CI: 1.12.0's embedded plan database selects
+  a Postgres matching the target's minor, and its version index predates
+  17.5, so it fails against current Postgres minors through its default path
+  as images drift. An external plan database sidesteps that, but a floor
+  that only holds under a non-default configuration is not a floor
+  (spec §13).
+
 ### Added
 
 - **A persistable plan artifact** (spec §8.9). `plan --plan-out <dir>` writes

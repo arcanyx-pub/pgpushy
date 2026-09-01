@@ -823,7 +823,7 @@ fn a_below_floor_pgschema_is_a_hard_error() {
         .assert()
         .failure()
         .stderr(predicates::str::contains("1.4.2"))
-        .stderr(predicates::str::contains("below the minimum 1.12.0"));
+        .stderr(predicates::str::contains("below the minimum 1.12.3"));
 }
 
 /// Spec §8.5: the `Version:` line is a human-readable string, not a stability
