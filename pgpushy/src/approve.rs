@@ -13,7 +13,7 @@
 
 use crate::plan_file::Plan;
 use anyhow::{Result, bail};
-use pgpushy_core::{Analysis, SchemaName};
+use pgpushy_core::{SchemaName, Seeds};
 use std::io::{IsTerminal, Write};
 
 /// What the operator decided.
@@ -24,11 +24,12 @@ pub enum Decision {
 
 /// Present every plan as one unit and ask once.
 pub fn confirm(
-    analysis: &Analysis,
+    seeds: &Seeds,
+    empty_schemas: &[SchemaName],
     plans: &[(SchemaName, Plan)],
     auto_approve: bool,
 ) -> Result<Decision> {
-    summarize(analysis, plans);
+    summarize(seeds, empty_schemas, plans);
 
     if auto_approve {
         println!("\n  --auto-approve given; applying without prompting.");
@@ -61,7 +62,7 @@ pub fn confirm(
 }
 
 /// The reviewable unit: what changes, where, and what is destructive.
-fn summarize(analysis: &Analysis, plans: &[(SchemaName, Plan)]) {
+fn summarize(seeds: &Seeds, empty_schemas: &[SchemaName], plans: &[(SchemaName, Plan)]) {
     let changing: Vec<_> = plans.iter().filter(|(_, plan)| !plan.is_empty()).collect();
     let steps: usize = plans.iter().map(|(_, plan)| plan.step_count()).sum();
     let drops: usize = plans.iter().map(|(_, plan)| plan.destructive_count()).sum();
@@ -96,7 +97,6 @@ fn summarize(analysis: &Analysis, plans: &[(SchemaName, Plan)]) {
 
     // Seeds are inside the approved unit (spec §8.6, §8.8): the writes they
     // make are writes, whatever the schema plans say.
-    let seeds = &analysis.seeds;
     if !seeds.is_empty() {
         println!(
             "\n  {} seed file{}, applied after the schemas, each in its own transaction:",
@@ -142,11 +142,7 @@ fn summarize(analysis: &Analysis, plans: &[(SchemaName, Plan)]) {
     // A managed schema with no source is reconciled to empty, which plans a
     // drop of everything the target holds there. Said again here because this
     // is the last moment before it happens.
-    let empty: Vec<_> = analysis
-        .empty_schemas
-        .iter()
-        .map(|schema| schema.as_str())
-        .collect();
+    let empty: Vec<_> = empty_schemas.iter().map(|schema| schema.as_str()).collect();
     if !empty.is_empty() {
         println!(
             "\n  WARNING: no source file describes {}; applying reconciles \

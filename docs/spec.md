@@ -1,6 +1,6 @@
 # pgpushy Specification
 
-**Version:** 0.6
+**Version:** 0.7
 **Date:** 2026-08-31
 **Status:** All design decisions resolved (§15).
 
@@ -1296,6 +1296,61 @@ volatile expression in a values list, a `DO UPDATE` that never converges.
 > everything else, but a trigger doing non-transactional work (an HTTP call
 > from an extension, say) will have done it twice.
 
+### 8.9 The plan artifact
+
+`plan` MAY be given `--plan-out <dir>`: a directory pgpushy owns, into which
+the plan pass is written as a reviewable, applicable artifact. `apply` MAY be
+given `--plan <dir>`, and then applies **exactly that artifact**: no
+discovery, no parsing, no synthesis — the deploy environment carries no
+source tree, because the apply order lives in the artifact and source drift
+after planning is not the apply step's business. This is the surface for the
+deployment shape a CLI prompt cannot serve: plan under a preview role,
+persist the plan, review and approve *that artifact*, apply exactly it under
+a deploy role.
+
+The artifact holds:
+
+- **`manifest.json`** — the artifact format version; the managed schemas in
+  apply order (the order is read from here, never re-derived); each schema's
+  plan file name with its SHA-256, so a plan file and its manifest entry
+  cannot disagree silently; the target's identity (§6.3: `system_identifier`
+  and database name); the pgschema version that planned; and the checked seed
+  statements (§4.6), carried verbatim — the seeds that run are the seeds that
+  were reviewed. The manifest is what marks the directory as pgpushy's, since
+  JSON cannot carry §4.1's marker.
+- **one `<schema>.json` per managed schema** — pgschema's plan, byte for
+  byte, named by §8.7's percent-encoding rule.
+- **`summary.json`** — the §9.1 machine-readable summary.
+
+Ownership follows §8.7's rules: pgpushy creates the directory, refuses one
+holding anything it cannot prove is an artifact of its own, and prunes files
+a fresh write does not produce.
+
+`apply --plan <dir>` MUST, in order:
+
+1. verify each plan file against its manifest hash;
+2. inspect the target (§6) and refuse if its identity differs from the
+   manifest's. pgschema's fingerprint covers target *drift*, not target
+   *identity* — it is silent exactly when two databases are kept identical,
+   which is what a promote-through-environments pipeline does on purpose;
+   each environment plans its own artifact;
+3. re-run the §6.2 removal check against a **fresh** inspection — the
+   per-schema fingerprint cannot see a relationship between two schemas — and
+   the §6.5 check, and §8.4's kind check over the artifact's plans;
+4. seek §8.6 approval, summarized from the artifact;
+5. apply each non-empty plan, in manifest order, via `pgschema apply
+   --plan`, from a working directory carrying §8.4's ignore file. **The
+   ignore file participates in pgschema's fingerprint** (verified at 1.12.3:
+   the same plan is refused when applied from a directory without it), so it
+   is part of a plan's identity, not decoration;
+6. execute the manifest's seed statements, per §8.8.
+
+A pgschema version differing from the manifest's SHOULD be warned about; the
+§8.5 floor applies regardless. And one consequence stated plainly: **an
+approved artifact is not a promise that it will apply.** The target can move
+underneath it, pgschema's fingerprint refuses (verified), and a pipeline
+needs a story for approved-then-refused — which is re-plan and re-approve.
+
 ## 9. Failure Handling
 
 `apply` MUST stop at the first schema whose apply fails; it MUST NOT continue
@@ -1311,6 +1366,33 @@ files themselves, `apply` MUST stop at the first that fails — on execution or
 on the probe — and report which were applied, which failed, and which were not
 attempted. Each file is atomic (§11.2): the failing file lands nothing, but
 files committed before it stay committed.
+
+### 9.1 Exit codes, and the destructive gate
+
+Exit codes are a contract a pipeline routes on: **0**, success; **1**,
+pgpushy refused the run or something failed — a rejected source tree, a §6.2
+or §6.5 or §8.4 refusal, a cycle, a pgschema failure; **2**, from `plan`
+alone: the plans are valid and would apply, but they contain destructive
+changes and the environment does not allow them. A broken tree and a dropped
+column route to different people, which is why 2 MUST NOT be 1.
+
+`plan` classifies destructiveness per §8.6 — a recreated pair is a
+modification — and, when any destructive change remains, exits 2 unless the
+environment sets `allow_destructive = true` (§10.2). Following Atlas, the
+opt-out lives in configuration rather than on the command line: §10.1's
+reasoning, since a flag that disables a safety check per invocation is the
+hazard configuration exists to prevent. Destructive tolerance is a property
+of the *target* — a development database says yes, production says no — which
+is why the key is per-environment. `apply` is not gated by it: approval
+(§8.6) is apply's gate, and the §8.6 summary names every destructive change
+before asking.
+
+With `--plan-out`, `plan` also writes the classification as
+**`summary.json`** (§8.9): a format version, the target's identity,
+per-schema step and destructive counts, and every destructive step as
+`drop.` plus pgschema's own type, with its path — `drop.table.column`,
+`drop.table` — so a pipeline can allowlist a specific finding rather than
+accept or reject a boolean.
 
 ## 10. Configuration
 
@@ -1408,14 +1490,20 @@ file that is easily committed to version control. The warning fires on actual
 use, so an overridden file password is silent, and it MUST NOT echo the
 password.
 
+**`allow_destructive`** MAY be set per environment. When absent or false,
+a `plan` whose classification finds any destructive change exits 2 (§9.1);
+when true, it exits 0 and the destructive changes are simply listed. It
+gates nothing at `apply`, where §8.6's approval is the gate.
+
 ### 10.3 What remains a flag
 
 Only things that describe *this run* or *this machine*, never the project or
 the target: `--config`, `--env`, `--pgschema-path` (which differs per machine
-and cannot affect what is reconciled), `--out`, `--auto-approve`,
-`--lock-timeout` (§10.5), `--verbose`, `--no-color`, and `generate`'s
-`--check`, which selects a mode of that command rather than anything about
-the project.
+and cannot affect what is reconciled), `--out`, `--plan-out` and `--plan`
+(§8.9 — where an artifact is written or read is about *this run*; what it
+contains never is), `--auto-approve`, `--lock-timeout` (§10.5), `--verbose`,
+`--no-color`, and `generate`'s `--check`, which selects a mode of that
+command rather than anything about the project.
 
 ### 10.4 The plan database
 
@@ -1771,110 +1859,26 @@ work (§14).
   cross-schema *type* reference correctly under a per-schema run — the
   identifier must survive un-stripped while the referring table's own
   qualifier is stripped to the scratch schema.
-- **A persistable plan, and applying exactly that plan.** `plan` computes a
-  plan per managed schema and discards them: they are written into a temporary
-  directory that dies with the process, and `apply` accepts no plan input, so
-  it re-plans. `--out` writes the synthesized *documents* (§8.7), which is a
-  different artifact for a different purpose.
-
-  That rules out a common deployment shape — plan under a low-privilege
-  **preview** role, persist the plan as a reviewable artifact, approve *that
-  artifact*, then apply exactly it under a separate **deploy** role.
-
-  Worth being precise about what is missing, because it is less than it looks:
-  `apply` has **no internal race**. It runs a full plan pass, presents it,
-  prompts once, and applies the plans it just showed, which pgschema refuses if
-  the target has moved since (§8.6 step 6). pgpushy already does
-  plan-artifact-then-apply-exactly-that; it simply never exposes the boundary
-  across a process. This is a missing surface, not a missing mechanism.
-
-  Four decisions, settled 2026-08-19 and recorded here so they are not
-  re-derived:
-
-  1. **The apply order lives in the artifact**, as a manifest naming the
-     managed schemas in order — not re-derived from the source tree. Applying
-     is applying the *plans*; source drift afterwards is not the apply step's
-     business, and re-deriving would force the deploy environment to carry a
-     checkout it has no other use for. A manifest has no equivalent of
-     pgschema's per-plan fingerprint, so pgpushy SHOULD cross-check each plan
-     against its manifest entry rather than trusting the manifest alone.
-  2. **The §6.2 removal check runs at both plan and apply time**, the second
-     against a fresh inspection. The fingerprint cannot substitute: it is
-     scoped to one schema, while the hazard is a relationship between two. A
-     cross-schema foreign key added to the target after approval leaves the
-     *referenced* schema's fingerprint untouched, so that schema applies and
-     drops the column, and only the referencing schema then refuses — after the
-     damage.
-  3. **The artifact records the target it was planned against** —
-     `system_identifier` and database name, both already read for §6.3 — and
-     apply refuses a different one. The fingerprint covers target *drift*, not
-     target *identity*, and it is silent exactly when two databases are kept
-     identical, which is what a promote-through-environments pipeline does on
-     purpose. Not host and port: those are what a pooler, a proxy or DNS will
-     lie about, while the system identifier survives a rename and a failover
-     and changes on a logical restore, which is correct in both directions.
-  4. **One `<schema>.json` per managed schema**, percent-encoded by §8.7's
-     rule, in a directory pgpushy owns. The manifest is what marks the
-     directory as pgpushy's, since JSON cannot carry §4.1's generated-document
-     marker. Naming them by index — as the temporary files do today — would
-     leave file order and manifest order able to disagree, and would make the
-     artifact unreadable to whoever is approving it.
-
-  One consequence to state in the interface: **an approved artifact is not a
-  promise that it will apply.** The target can move underneath it, and pgpushy
-  will refuse. A pipeline needs a story for approved-then-refused, which is
-  re-plan and re-approve.
-
-- **Comprehensive destructive-change detection.** pgpushy has no signal a
-  pipeline can route on: exit codes are success-or-failure, and how many
-  changes are destructive is said only in the approval text (§8.6). The
-  shallow fix is to report what pgschema already labels — `operation: drop`,
-  which covers dropped tables, columns and constraints. That is a usable
-  proxy and a narrow one.
-
-  It is narrow because pgschema classifies only `create`, `drop` and `alter`,
-  and nothing else: verified against pgschema 1.12.3, a plan's JSON carries
-  exactly `operation`, `path` and `type` per step, with no destructiveness
-  flag, no risk level and no summary, and its human output uses the same three
-  words. So `ALTER COLUMN wide TYPE varchar(10)` — which truncates or fails —
-  is reported identically to the widening change that is safe. pgschema is the
-  only party that knows both the old and the new state, so it is the only one
-  that can classify this cheaply; pgpushy could only do it by forming opinions
-  about generated SQL, where a false negative reads as approval.
-
-  **The near-term shape is decided**, and is the shallow fix done honestly:
-  `plan` emits a machine-readable summary — per-schema change and drop counts,
-  and per-step kinds derived from what pgschema already reports (`drop.table`,
-  `drop.table.column`) with their paths. Following Atlas, a plan containing
-  drops **fails by default**, with the opt-out in `pgpushy.toml` rather than as
-  a flag: Atlas puts the same switch in `atlas.hcl`, and §10.1 reaches the same
-  place independently, since a flag that disables a safety check is the hazard
-  that section exists to prevent. The exit code MUST NOT be `1`, which already
-  means pgpushy refused the run (§7, §6.2) — a caller has to be able to tell a
-  broken source tree from a plan that drops a column, because they route to
-  different people.
-
-  Atlas is worth reading before building this. Its analyzers are *coded* —
-  `DS102` table dropped, `DS103` column dropped, `MF104` nullable to
-  non-nullable — which lets a pipeline allowlist a specific finding rather than
-  accept or reject a boolean; per-step kinds give pgpushy the same granularity
-  for free. Note also that Atlas does **not** appear to flag a narrowing column
-  type either, so that gap is not peculiar to pgschema.
-
-  Doing the *comprehensive* version may therefore be a question about the engine
-  rather than about pgpushy. Worth evaluating when it is picked up: whether pgschema grows
-  the classification, whether another tool already has it —
-  [pgmold](https://github.com/fmguerreiro/pgmold) is one to look at — or
-  whether the diffing belongs in pgpushy after all. That last option reverses
-  G3, which is why it is a decision rather than a task.
+- **Comprehensive destructive-change detection.** The shallow-but-honest
+  version shipped (§9.1): what pgschema labels a drop, paired per §8.6, with
+  a distinct exit code and a machine-readable summary. What remains is the
+  *comprehensive* question — `ALTER COLUMN wide TYPE varchar(10)` truncates
+  or fails and is reported identically to the safe widening, and pgschema is
+  the only party that can classify that cheaply, since it alone holds both
+  states. Atlas's coded analyzers (DS102 table dropped, MF104 nullable to
+  non-nullable) are the model worth studying, and Atlas does not flag a
+  narrowing type either. Whether pgschema grows the classification, another
+  tool has it ([pgmold](https://github.com/fmguerreiro/pgmold) is one to look
+  at), or the diffing belongs in pgpushy after all — that last reverses G3 —
+  is a decision rather than a task.
 - **Release binaries, and a GitHub Action.** pgpushy publishes to crates.io
   only, so installing it in CI means libclang, `bindgen` and compiling
   libpg_query's C sources on every run. Per-platform release binaries would fix
   that, and pgpushy has already designed the shape once — its managed provider
   downloads, verifies and caches exactly such binaries for pgschema (§8.5).
 
-  They are the prerequisite for an action, which is where the plan artifact
-  above stops being a CLI feature and starts being useful: GitHub's
+  They are the prerequisite for an action, which is where the §8.9 plan
+  artifact stops being a CLI feature and starts being useful: GitHub's
   `environment:` with required reviewers is the approval gate that design
   needs, two environments give the preview and deploy roles their separate
   credentials, and an uploaded artifact is what makes the approval apply to a
@@ -2218,3 +2222,30 @@ made after draft 2 of v0.1.
   detonate mid-plan-loop as pgschema's error. Tree-defined tables and indexes
   satisfy a literal, which may legitimately name them (`'s.t'::regclass`).
   (§4.5)
+- **[0.7] The plan artifact** — the four decisions of 2026-08-19, now built
+  as §8.9: the apply order lives in the manifest, never re-derived, so the
+  deploy environment carries no checkout; the §6.2 check re-runs at apply
+  against a fresh inspection, because the per-schema fingerprint cannot see a
+  relationship between two schemas; the artifact records `system_identifier`
+  and database name and apply refuses a different target, since the
+  fingerprint covers drift, not identity; one plan file per managed schema,
+  percent-encoded, with the manifest as the directory's mark. Two additions
+  earned since: the manifest carries each plan's SHA-256, and it carries the
+  checked **seed statements** verbatim — seeds are part of the reviewed unit
+  (§8.8), and an artifact that applied the schemas but not the rows would
+  deliver half of what was approved. (§8.9)
+- **[0.7] The ignore file is part of a plan's identity** — measured at
+  1.12.3: `pgschema apply --plan` refuses the very plan it wrote when run
+  from a directory without the `.pgschemaignore` it was planned under, because
+  the ignore file participates in the fingerprint. So artifact apply keeps
+  running from a working directory pgpushy owns and writes (§8.4), exactly as
+  every other pgschema invocation does. (§8.9)
+- **[0.7] Destructive plans exit 2, and the opt-out is per-environment
+  configuration** — 1 already means pgpushy refused, and a caller must route
+  a broken tree and a dropped column to different people. The classification
+  is §8.6's — recreated pairs are modifications — which is what keeps the
+  gate from failing routine constraint widenings on day one. The opt-out is
+  `allow_destructive` in the environment, not a flag, per §10.1's reasoning
+  and following Atlas; per-environment because destructive tolerance is a
+  property of the target. `apply` is deliberately not gated: §8.6's approval
+  is its gate. (§9.1, §10.2)

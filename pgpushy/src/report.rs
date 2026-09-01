@@ -729,3 +729,74 @@ pub fn plan_db_leftovers(schemas: &[SchemaName], db: &str) {
          \n      DROP DATABASE {db}; CREATE DATABASE {db};"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The plan artifact (spec 8.9) and the destructive gate (spec 9.1)
+// ---------------------------------------------------------------------------
+
+pub fn artifact_written(dir: &Path, files: usize) {
+    println!(
+        "\n  wrote the plan artifact into {} ({})",
+        dir.display(),
+        plural(files, "file"),
+    );
+    println!(
+        "    review it, then apply exactly it: pgpushy apply --plan {}",
+        dir.display(),
+    );
+}
+
+pub fn artifact_read(dir: &Path, artifact: &crate::artifact::ReadArtifact) {
+    let manifest = &artifact.manifest;
+    println!(
+        "\n  plan artifact: {} ({}, {} seed file{}, planned by pgschema {} \
+         against {} on cluster {})",
+        dir.display(),
+        plural(manifest.schemas.len(), "schema"),
+        manifest.seeds.len(),
+        s(manifest.seeds.len()),
+        manifest.pgschema_version,
+        manifest.target.database,
+        manifest.target.system_identifier,
+    );
+}
+
+/// Spec 8.9 step 2: an artifact is bound to one database on one cluster.
+pub fn artifact_wrong_target(expected: &crate::artifact::TargetIdentity, actual: &Identity) {
+    eprintln!(
+        "\nerror: this artifact was planned against {} on cluster {}, but --env \
+         reaches {} on cluster {}\n\
+         \n\
+         An artifact applies only to the database it was planned against \
+         (spec 8.9): pgschema fingerprints cover drift, not identity, and are \
+         silent exactly when two databases are kept identical. Plan a separate \
+         artifact for each environment.",
+        expected.database, expected.system_identifier, actual.database, actual.system_identifier,
+    );
+}
+
+pub fn artifact_version_mismatch(planned: &str, current: &str) {
+    println!(
+        "  WARNING: the artifact was planned by pgschema {planned}; applying \
+         with {current}. The floor still applies (spec 8.5), but replanning \
+         with the current version is the safer path."
+    );
+}
+
+/// Spec 9.1: valid plans that would apply, but destroy.
+pub fn destructive_gate(summary: &crate::artifact::Summary) {
+    eprintln!(
+        "\nplan contains {}:",
+        plural(summary.total.destructive, "destructive change"),
+    );
+    for step in &summary.destructive {
+        eprintln!("  {}  {:<24} {}", step.schema, step.kind, step.path);
+    }
+    eprintln!(
+        "\n  Exiting 2 - distinct from 1, which means the run was refused - so \
+         a pipeline can route a dropped column and a broken tree differently \
+         (spec 9.1). If this environment may destroy, set\n\
+         \n      allow_destructive = true\n\
+         \n  in its [env.*] block."
+    );
+}

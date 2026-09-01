@@ -14,7 +14,7 @@ use crate::output::Output;
 use crate::plan_file::{Plan, Step};
 use crate::provider::{self, PgschemaBin};
 use crate::report;
-use crate::{discovery, hazard, outdir, pgschema, seeds};
+use crate::{artifact, discovery, hazard, outdir, pgschema, seeds};
 use anyhow::{Context, Result, bail};
 use pgpushy_core::{Analysis, AnalysisError, Options, SchemaName, analyze};
 use std::path::{Path, PathBuf};
@@ -28,6 +28,11 @@ use tempfile::TempDir;
 pub enum Outcome {
     Ok,
     Failed,
+    /// The plans are valid and would apply, but they contain destructive
+    /// changes the environment does not allow (spec §9.1). Distinct from
+    /// `Failed`, because a dropped column and a broken tree route to
+    /// different people.
+    Destructive,
 }
 
 impl Outcome {
@@ -35,6 +40,7 @@ impl Outcome {
         match self {
             Self::Ok => 0,
             Self::Failed => 1,
+            Self::Destructive => 2,
         }
     }
 }
@@ -81,6 +87,7 @@ pub fn plan(
     loaded: &Loaded,
     output: Output,
     out: Option<&Path>,
+    plan_out: Option<&Path>,
 ) -> Result<Outcome> {
     let session = match Session::open(target, pgschema_args, loaded, output, out)? {
         Opened::Session(session) => session,
@@ -125,25 +132,64 @@ pub fn plan(
         report::seeds_planned(&session.analysis.seeds);
     }
 
-    Ok(
-        if cycles.is_empty() && hazards.is_empty() && refused.is_empty() && violations.is_empty() {
-            Outcome::Ok
-        } else {
-            Outcome::Failed
-        },
-    )
+    // The §9.1 classification, and — when asked — the §8.9 artifact.
+    let summary = artifact::summarize(&plans, &session.inspection.identity);
+    if let Some(dir) = plan_out {
+        let plan_files: Vec<PathBuf> = (0..session.analysis.order.len())
+            .map(|index| session.plan_path(index))
+            .collect();
+        let written = artifact::write(
+            dir,
+            &session.analysis.order,
+            &plan_files,
+            &summary,
+            &pgschema_version(&session.binary),
+            &session.analysis.seeds,
+        )?;
+        report::artifact_written(dir, written.len());
+    }
+
+    if !(cycles.is_empty() && hazards.is_empty() && refused.is_empty() && violations.is_empty()) {
+        return Ok(Outcome::Failed);
+    }
+
+    // Spec §9.1: valid plans that would apply, but destroy. A distinct exit,
+    // gated by the environment rather than by a flag.
+    if summary.total.destructive > 0 && !session.connection.allow_destructive {
+        report::destructive_gate(&summary);
+        return Ok(Outcome::Destructive);
+    }
+
+    Ok(Outcome::Ok)
 }
 
 /// `pgpushy apply` — plan, review, approve, then apply the reviewed plans.
+// Eight arguments: every one is a distinct CLI surface, and bundling them
+// into a struct would only move the list.
+#[allow(clippy::too_many_arguments)]
 pub fn apply(
     target: &TargetArgs,
     pgschema_args: &PgschemaArgs,
     loaded: &Loaded,
     output: Output,
     out: Option<&Path>,
+    plan_artifact: Option<&Path>,
     auto_approve: bool,
     lock_timeout: Option<&str>,
 ) -> Result<Outcome> {
+    // Spec §8.9: applying an artifact reads no source tree at all.
+    if let Some(dir) = plan_artifact {
+        return apply_from_artifact(
+            dir,
+            target,
+            pgschema_args,
+            loaded,
+            output,
+            auto_approve,
+            lock_timeout,
+        );
+    }
+
     let session = match Session::open(target, pgschema_args, loaded, output, out)? {
         Opened::Session(session) => session,
         Opened::Stop(outcome) => return Ok(outcome),
@@ -185,7 +231,12 @@ pub fn apply(
         return Ok(Outcome::Failed);
     }
 
-    match approve::confirm(&session.analysis, &plans, auto_approve)? {
+    match approve::confirm(
+        &session.analysis.seeds,
+        &session.analysis.empty_schemas,
+        &plans,
+        auto_approve,
+    )? {
         Decision::Declined => {
             report::declined();
             return Ok(Outcome::Ok);
@@ -208,11 +259,13 @@ pub fn apply(
         return Ok(outcome);
     }
     match outcome {
-        Outcome::Failed => {
-            report::seeds_not_attempted(seeds);
-            Ok(Outcome::Failed)
-        }
         Outcome::Ok => seeds::execute(&session.connection, seeds, lock_timeout.as_deref()),
+        // apply_pass never yields Destructive, but a failed pass of any kind
+        // means the seeds' tables cannot be trusted to exist (spec §8.8).
+        other => {
+            report::seeds_not_attempted(seeds);
+            Ok(other)
+        }
     }
 }
 
@@ -551,6 +604,148 @@ fn canonical_seed_root(configured: &Path, source_root: &Path) -> Result<PathBuf>
         );
     }
     Ok(canonical)
+}
+
+/// `apply --plan <dir>` (spec §8.9): the artifact is the whole input.
+///
+/// No discovery, no synthesis — the apply order, the plans and the seeds all
+/// come from the manifest, and the checks that must be fresh (§6.2, §6.5,
+/// §8.4, identity) run against a new inspection before anything is touched.
+fn apply_from_artifact(
+    dir: &Path,
+    target: &TargetArgs,
+    pgschema_args: &PgschemaArgs,
+    loaded: &Loaded,
+    output: Output,
+    auto_approve: bool,
+    lock_timeout: Option<&str>,
+) -> Result<Outcome> {
+    let connection = Resolved::from(&loaded.environment(&target.env)?)?;
+    let artifact = artifact::read(dir)?;
+    report::artifact_read(dir, &artifact);
+
+    let managed: Vec<SchemaName> = artifact
+        .plans
+        .iter()
+        .map(|(schema, _)| schema.clone())
+        .collect();
+
+    let binary = provider::select(
+        config::backend(&loaded.file)?,
+        loaded.pgschema_path(pgschema_args.pgschema_path.as_deref()),
+        loaded.file.pgschema.version.clone(),
+        None,
+    )?;
+    report::pgschema(&binary);
+    let current = pgschema_version(&binary);
+    if current != artifact.manifest.pgschema_version {
+        report::artifact_version_mismatch(&artifact.manifest.pgschema_version, &current);
+    }
+
+    report::password_from_file(&connection, loaded);
+    let inspection = inspect::inspect(&connection, &managed)?;
+    report::target(&connection, &inspection.identity);
+
+    // Spec §8.9 step 2: identity, not drift — the fingerprint is silent
+    // exactly when two databases are kept identical.
+    if inspection.identity.database != artifact.manifest.target.database
+        || inspection.identity.system_identifier != artifact.manifest.target.system_identifier
+    {
+        report::artifact_wrong_target(&artifact.manifest.target, &inspection.identity);
+        return Ok(Outcome::Failed);
+    }
+
+    if !inspection.missing_schemas.is_empty() {
+        report::missing_schemas(&inspection.missing_schemas);
+        return Ok(Outcome::Failed);
+    }
+
+    // Spec §8.9 step 3: the fresh checks.
+    if !inspection.policies.is_empty() {
+        report::policies_refused(&inspection.policies, true);
+        return Ok(Outcome::Failed);
+    }
+    let violations = unmanaged_violations(&artifact.plans);
+    if !violations.is_empty() {
+        report::unmanaged_steps(&violations, true);
+        return Ok(Outcome::Failed);
+    }
+    let hazards = hazard::check(
+        &inspection.cross_schema_foreign_keys,
+        &artifact.plans,
+        &managed,
+    );
+    if !hazards.is_empty() {
+        report::hazards(&hazards, true);
+        return Ok(Outcome::Failed);
+    }
+
+    let seeds = artifact.seeds();
+    match approve::confirm(&seeds, &[], &artifact.plans, auto_approve)? {
+        Decision::Declined => {
+            report::declined();
+            return Ok(Outcome::Ok);
+        }
+        Decision::Approved => {}
+    }
+
+    // Spec §8.9 step 5: the ignore file is part of a plan's identity, so
+    // pgschema applies from a directory carrying the same one it planned
+    // under.
+    let workdir = tempfile::Builder::new()
+        .prefix("pgpushy-apply-")
+        .tempdir()
+        .context("creating a working directory for pgschema")?;
+    pgschema::write_ignore_file(workdir.path())?;
+
+    let lock_timeout = lock_timeout
+        .map(ToOwned::to_owned)
+        .or_else(|| connection.lock_timeout.clone());
+
+    let mut applied = Vec::new();
+    for (index, (schema, plan)) in artifact.plans.iter().enumerate() {
+        if plan.is_empty() {
+            report::skipped_unchanged(schema);
+            continue;
+        }
+        report::schema_heading(schema);
+        let ok = pgschema::apply_plan(
+            &binary,
+            &connection,
+            schema,
+            &artifact.paths[index],
+            lock_timeout.as_deref(),
+            workdir.path(),
+            output,
+        )?;
+        if !ok {
+            let unattempted: Vec<_> = artifact.plans[index + 1..]
+                .iter()
+                .map(|(schema, _)| schema.clone())
+                .collect();
+            report::partial_apply(&applied, schema, &unattempted);
+            if !seeds.is_empty() {
+                report::seeds_not_attempted(&seeds);
+            }
+            return Ok(Outcome::Failed);
+        }
+        applied.push(schema.clone());
+    }
+    report::applied(&applied);
+
+    if seeds.is_empty() {
+        return Ok(Outcome::Ok);
+    }
+    seeds::execute(&connection, &seeds, lock_timeout.as_deref())
+}
+
+/// The version string recorded in and checked against an artifact (§8.9).
+fn pgschema_version(binary: &PgschemaBin) -> String {
+    binary
+        .version
+        .as_ref()
+        .map(|version| version.to_string())
+        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 /// Plan steps naming kinds outside pgpushy's model (spec §8.4).

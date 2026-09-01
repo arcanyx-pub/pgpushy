@@ -1868,3 +1868,217 @@ fn a_recreated_constraint_is_not_counted_destructive() {
         "a recreate must not be listed as destructive:\n{stdout}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The plan artifact (spec §8.9) and the destructive gate (spec §9.1)
+// ---------------------------------------------------------------------------
+
+/// The whole point of §8.9: plan in one process, apply in another, no source
+/// tree at the apply end — and the seeds ride the artifact.
+#[test]
+fn an_artifact_plans_in_one_process_and_applies_in_another() {
+    let target = require_target!();
+    let schema = unique_schema("art");
+    let _schemas = Schemas::create(&target, std::slice::from_ref(&schema));
+
+    let project = target.project(
+        &format!("default_schema = \"{schema}\"\nseed_root = \"seeds\"\n"),
+        &[
+            (
+                "t.sql",
+                format!("CREATE TABLE {schema}.t (id int PRIMARY KEY, val text);"),
+            ),
+            (
+                "seeds/rows.sql",
+                format!(
+                    "INSERT INTO {schema}.t (id) VALUES (1), (2) \
+                     ON CONFLICT (id) DO NOTHING;"
+                ),
+            ),
+        ],
+    );
+    let art = project.dir.path().join("artifact");
+    project
+        .command("plan")
+        .arg("--plan-out")
+        .arg(&art)
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("wrote the plan artifact"));
+    assert!(art.join("manifest.json").exists());
+    assert!(art.join("summary.json").exists());
+
+    // The deploy side: a config with a target and nothing else that works —
+    // the source root points nowhere, and apply --plan must never look.
+    let deploy = target.project("source_root = \"no-such-tree\"\n", &[]);
+    deploy
+        .command("apply")
+        .arg("--plan")
+        .arg(&art)
+        .arg("--auto-approve")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("plan artifact:"))
+        .stdout(predicates::str::contains("2 rows affected; probe passed"));
+
+    let mut client = target.client();
+    let rows: i64 = client
+        .query_one(&format!("SELECT count(*) FROM {schema}.t"), &[])
+        .expect("count")
+        .get(0);
+    assert_eq!(rows, 2);
+}
+
+/// Spec §8.9's stated consequence: an approved artifact is not a promise it
+/// will apply. The target moves, pgschema's fingerprint refuses, nothing is
+/// applied.
+#[test]
+fn a_drifted_target_refuses_the_artifact() {
+    let target = require_target!();
+    let schema = unique_schema("artdrift");
+    let _schemas = Schemas::create(&target, std::slice::from_ref(&schema));
+
+    let project = target.project(
+        &format!("default_schema = \"{schema}\""),
+        &[(
+            "t.sql",
+            format!("CREATE TABLE {schema}.t (id int PRIMARY KEY);"),
+        )],
+    );
+    let art = project.dir.path().join("artifact");
+    project
+        .command("plan")
+        .arg("--plan-out")
+        .arg(&art)
+        .assert()
+        .success();
+
+    let mut client = target.client();
+    client
+        .batch_execute(&format!("CREATE TABLE {schema}.drift (id int)"))
+        .expect("drift the target");
+
+    project
+        .command("apply")
+        .arg("--plan")
+        .arg(&art)
+        .arg("--auto-approve")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("fingerprint mismatch"));
+
+    let exists: i64 = client
+        .query_one(
+            &format!(
+                "SELECT count(*) FROM information_schema.tables
+                 WHERE table_schema = '{schema}' AND table_name = 't'"
+            ),
+            &[],
+        )
+        .expect("check")
+        .get(0);
+    assert_eq!(exists, 0, "the stale plan must not have applied");
+}
+
+/// Spec §8.9 step 2: the artifact is bound to the database it was planned
+/// against — a different database on the same cluster is refused by name.
+#[test]
+fn an_artifact_refuses_a_different_database() {
+    let target = require_target!();
+    let schema = unique_schema("artwrong");
+    let _schemas = Schemas::create(&target, std::slice::from_ref(&schema));
+
+    let project = target.project(
+        &format!("default_schema = \"{schema}\""),
+        &[(
+            "t.sql",
+            format!("CREATE TABLE {schema}.t (id int PRIMARY KEY);"),
+        )],
+    );
+    let art = project.dir.path().join("artifact");
+    project
+        .command("plan")
+        .arg("--plan-out")
+        .arg(&art)
+        .assert()
+        .success();
+
+    let other_db = format!("{schema}_other");
+    let mut admin = target.client();
+    admin
+        .batch_execute(&format!("DROP DATABASE IF EXISTS {other_db}"))
+        .expect("drop stale");
+    admin
+        .batch_execute(&format!("CREATE DATABASE {other_db}"))
+        .expect("create other db");
+
+    let config = project.dir.path().join("pgpushy.toml");
+    let text = std::fs::read_to_string(&config).expect("read config");
+    std::fs::write(
+        &config,
+        text.replace(
+            &format!("db = \"{}\"", parse(&target.url).dbname),
+            &format!("db = \"{other_db}\""),
+        ),
+    )
+    .expect("point env at the other database");
+
+    project
+        .command("apply")
+        .arg("--plan")
+        .arg(&art)
+        .arg("--auto-approve")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("planned against"));
+
+    admin
+        .batch_execute(&format!("DROP DATABASE IF EXISTS {other_db}"))
+        .ok();
+}
+
+/// Spec §9.1: a destructive plan exits 2 — distinct from 1 — names each
+/// destructive step, and the per-environment opt-out restores 0.
+#[test]
+fn a_destructive_plan_exits_2_and_the_optout_restores_0() {
+    let target = require_target!();
+    let schema = unique_schema("gate");
+    let _schemas = Schemas::create(&target, std::slice::from_ref(&schema));
+
+    let mut client = target.client();
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE {schema}.t (id int PRIMARY KEY, doomed text);"
+        ))
+        .expect("seed table");
+
+    let project = target.project(
+        &format!("default_schema = \"{schema}\""),
+        &[(
+            "t.sql",
+            format!("CREATE TABLE {schema}.t (id int PRIMARY KEY);"),
+        )],
+    );
+
+    let art = project.dir.path().join("artifact");
+    project
+        .command("plan")
+        .arg("--plan-out")
+        .arg(&art)
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("drop.table.column"))
+        .stderr(predicates::str::contains("allow_destructive"));
+
+    let summary = std::fs::read_to_string(art.join("summary.json")).expect("summary");
+    assert!(summary.contains("drop.table.column"), "{summary}");
+    assert!(summary.contains(&format!("{schema}.t.doomed")), "{summary}");
+
+    // The opt-out is the environment's, not a flag's (spec §9.1, §10.2).
+    let config = project.dir.path().join("pgpushy.toml");
+    let mut text = std::fs::read_to_string(&config).expect("read config");
+    text.push_str("allow_destructive = true\n");
+    std::fs::write(&config, text).expect("write config");
+
+    project.command("plan").assert().success();
+}

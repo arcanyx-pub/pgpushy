@@ -5,6 +5,32 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **A persistable plan artifact** (spec §8.9). `plan --plan-out <dir>` writes
+  the plan pass as a reviewable, applicable artifact: one plan file per
+  managed schema, hash-pinned by a manifest that also records the apply
+  order, the target's identity, the pgschema version, and the checked seed
+  statements verbatim. `apply --plan <dir>` applies exactly it — no source
+  tree is read at the deploy end — after verifying the hashes, refusing a
+  different database (pgschema's fingerprint covers drift, not identity),
+  and re-running the cross-schema, policy and unmanaged-kind checks against
+  a fresh inspection. The seeds that run are the seeds that were reviewed.
+  One measured fact worth knowing: the `.pgschemaignore` participates in
+  pgschema's fingerprint, so applying always runs from a working directory
+  pgpushy writes.
+- **A destructive gate with a distinct exit code** (spec §9.1). A valid plan
+  containing destructive changes exits **2** — never 1, which means a refused
+  run — so a pipeline can route a dropped column and a broken tree to
+  different people. The classification pairs a drop with a create on the same
+  kind and path as a modification, so a widened constraint does not trip the
+  gate. The opt-out is `allow_destructive = true` in the environment, not a
+  flag. With `--plan-out`, the classification is also written as
+  `summary.json`: per-schema counts and every destructive step as `drop.` +
+  pgschema's own type, with its path.
+
 ## [0.2.0] - 2026-08-31
 
 ### Added

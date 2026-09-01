@@ -37,6 +37,8 @@ pub struct Resolved {
     pub plan_db: Option<PlanConnection>,
     /// The environment's lock timeout, before any flag overrides it (§10.5).
     pub lock_timeout: Option<String>,
+    /// Spec §9.1: whether a destructive plan may exit 0.
+    pub allow_destructive: bool,
 }
 
 /// A resolved external plan database.
@@ -286,6 +288,7 @@ impl Resolved {
                 .as_ref()
                 .map(|plan| PlanConnection::from(plan, plan_password)),
             lock_timeout: target.lock_timeout.clone(),
+            allow_destructive: target.allow_destructive,
         })
     }
 
@@ -399,6 +402,7 @@ mod tests {
             sslmode: "require".into(),
             password: Some("s3cret".into()),
             lock_timeout: None,
+            allow_destructive: false,
             plan_db: None,
         }
     }
