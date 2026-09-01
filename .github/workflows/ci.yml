@@ -67,7 +67,10 @@ jobs:
           curl -fsSL "$url" -o /usr/local/bin/pgschema
           chmod +x /usr/local/bin/pgschema
           echo "PGPUSHY_TEST_PGSCHEMA=/usr/local/bin/pgschema" >> "$GITHUB_ENV"
-      - run: cargo test --workspace --all-features
+      # Two threads, not the default four: every plan pass spawns pgschema's
+      # embedded Postgres (initdb + start), and four at once on a four-core
+      # runner is a startup storm that flakes the heavier tests.
+      - run: cargo test --workspace --all-features -- --test-threads=2
 
   example:
     name: Example project
