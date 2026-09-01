@@ -2093,7 +2093,7 @@ fn a_destructive_plan_exits_2_and_the_optout_restores_0() {
 #[test]
 fn a_tampered_manifest_seed_is_rejected() {
     let target = require_target!();
-    let schema = unique_schema("tamper");
+    let schema = unique_schema("mtamper");
     let _schemas = Schemas::create(&target, std::slice::from_ref(&schema));
 
     let project = target.project(
