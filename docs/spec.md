@@ -67,7 +67,7 @@ replace any of that. It sits in front of pgschema and removes two frictions:
 
 pgpushy invokes the `pgschema` binary as a subprocess (§8), obtaining that
 binary through a provider (§8.5). It relies on pgschema behavior verified as of
-pgschema **1.12.0**, in particular foreign-key deferral and deterministic
+pgschema **1.12.3**, in particular foreign-key deferral and deterministic
 cycle-breaking during plan generation (pgschema PR #156, first released in
 v1.4.2 on 2025-11-14). The minimum supported version is the version pgpushy is
 tested against (§13).
@@ -1794,18 +1794,26 @@ work (§14).
 - **pgschema** — required at runtime, resolved through the provider (§8.5):
   downloaded by the managed backend or supplied by the operator (BYO).
 
-  Two versions matter, and they are **not** the same number. The **floor** is
-  the oldest version pgpushy is tested against — currently **v1.12.0** —
-  expressed as a `>=` requirement; newer is accepted. The **pin** is the
-  newest version pgpushy is tested against — currently **v1.12.3** — and is
-  what the managed backend downloads. Both ends MUST appear in pgpushy's CI
-  matrix, or one of them is a claim nothing tests.
+  Two versions matter, and they need **not** be the same number. The
+  **floor** is the oldest version pgpushy is tested against — currently
+  **v1.12.3** — expressed as a `>=` requirement; newer is accepted. The
+  **pin** is the newest version pgpushy is tested against — currently also
+  **v1.12.3** — and is what the managed backend downloads. Both ends MUST
+  appear in pgpushy's CI matrix, or one of them is a claim nothing tests;
+  today they coincide, so the matrix carries one version.
 
   Keeping them apart answers two different questions. An operator who brings
   their own binary should not be made to upgrade because pgpushy prefers a
   newer release; an operator who lets pgpushy fetch one should get the most
   fixed release that has actually been tested. Collapsing them forces one of
   those two to lose.
+
+  The floor moved from v1.12.0 on 2026-09-01, measured rather than chosen:
+  1.12.0's embedded plan database selects a Postgres matching the target's
+  minor, and its version index predates 17.5, so it fails against current
+  Postgres minors through its default path the moment an image's minor
+  drifts. An external plan database sidesteps that — but a floor that only
+  holds under a non-default configuration is not a floor.
 
   The floor is not overridable: a below-floor binary is a hard error, and the
   remedy is to upgrade pgschema or use the managed backend. The relied-upon
@@ -2285,3 +2293,11 @@ made after draft 2 of v0.1.
   minting an appliable artifact whose one unrecheckable failure — a
   cross-schema cycle — would then apply; a refused run therefore writes no
   artifact at all, which is the only place that hole can be closed. (§8.9)
+- **[0.7] The floor is raised to v1.12.3** — CI measured 1.12.0's embedded
+  plan database failing against a Postgres 17.5 target (`no version found
+  matching 17.5.0`): it selects an embedded server matching the target's
+  minor, and its version index ends earlier, so the failure arrives from
+  image drift and will reach every combination in time. An external plan
+  database sidesteps it, but a floor that only holds under a non-default
+  configuration is not a floor. Floor and pin coincide until a newer pin is
+  tested. (§13)

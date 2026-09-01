@@ -22,7 +22,12 @@ use std::path::PathBuf;
 /// that would work — the relied-upon foreign-key deferral landed in v1.4.2.
 /// Raising this constant and raising the CI matrix are the same action, and
 /// there is deliberately no override.
-pub const MIN_PGSCHEMA: &str = "1.12.0";
+// Raised from 1.12.0 on 2026-09-01: its embedded plan database selects a
+// Postgres matching the target's minor, and its version index predates 17.5,
+// so it fails against current Postgres minors through its default path
+// (impl-plan §1). A floor that only holds under a non-default configuration
+// is not a floor.
+pub const MIN_PGSCHEMA: &str = "1.12.3";
 
 /// A resolved pgschema binary.
 pub struct PgschemaBin {

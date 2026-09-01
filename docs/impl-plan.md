@@ -326,9 +326,10 @@ commands are in [Appendix A](#appendix-a-reproduction-harness).
   matching 17.5.0`. 1.12.3 knows 17.5. The failure arrives from *image
   drift* — the same matrix cell passed while postgres:17 meant 17.4 — and
   the same mechanism will eventually reach any old pgschema on any new
-  minor. An external plan database sidesteps it entirely, which is why the
-  floor is not simply raised; the 1.12.0×17 cell is excluded from the
-  matrix with this note.
+  minor. An external plan database sidesteps it entirely. The cell was
+  first excluded from the matrix; the floor was then raised to 1.12.3
+  (2026-09-01) — a floor that only holds under a non-default configuration
+  is not a floor.
 
 **Verified while designing the plan artifact (2026-08-31, pgschema 1.12.3)**
 - **`--output-json <path>` writes the plan to a file**, and `pgschema apply
@@ -691,7 +692,8 @@ struct PgschemaBin { path: PathBuf, version: Option<Version> }
   The path also keys on platform as well as version, so a cache on a shared
   network home directory cannot serve one architecture's binary to another.
 
-**Floor constant:** `MIN_PGSCHEMA = "1.12.0"` (the tested version). True
+**Floor constant:** `MIN_PGSCHEMA = "1.12.3"` (the tested version; raised
+off 1.12.0 on 2026-09-01 — see the CI-verified §1 entry). True
 behavioral floor is v1.4.2 — headroom to lower later *with tests*, not the
 supported floor. Bump `MIN_PGSCHEMA` as CI tests newer releases; the CI matrix
 and this constant are the same decision written twice (§10).
@@ -1301,7 +1303,7 @@ Read version: `docker run --rm pgplex/pgschema:latest --help | grep '^Version:'`
 
 **Local development.** A longer-lived container serves the integration tests:
 Postgres as `pgpushy-dev` on port 55434 (`postgres`/`pw`), plus a pgschema
-1.12.0 binary anywhere on disk. Export `PGPUSHY_TEST_PG_URL` and
+1.12.3 binary anywhere on disk. Export `PGPUSHY_TEST_PG_URL` and
 `PGPUSHY_TEST_PGSCHEMA` to run them, `PGPUSHY_TEST_DOWNLOAD=1` to include the
 managed provider's real download, and run `just msrv` before pushing — a modern
 toolchain cannot see MSRV breakage, and CI has caught exactly that.

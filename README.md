@@ -488,7 +488,7 @@ path    = "/usr/local/bin/pgschema"   # or omit, to look on PATH
 ```
 
 `--pgschema-path` does the same for a single run. A bring-your-own binary must
-be **1.12.0 or newer**: that is the oldest version pgpushy's CI tests, and the
+be **1.12.3 or newer**: that is the oldest version pgpushy's CI tests, and the
 floor is not overridable. The two numbers are deliberately different — an
 operator who brings their own binary should not be made to upgrade because
 pgpushy prefers a newer release, while one who lets pgpushy fetch a binary
