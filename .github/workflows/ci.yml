@@ -37,6 +37,17 @@ jobs:
         # pgschema states PG 14-17; 18 is what the dev container runs. Both
         # ends of the claimed range plus the local reality.
         postgres: ["14", "17", "18"]
+        exclude:
+          # Measured 2026-09-01: pgschema 1.12.0's embedded plan database
+          # selects a Postgres matching the target's minor, and its version
+          # index predates 17.5 ("no version found matching 17.5.0"), so
+          # every plan fails the moment the postgres:17 image's minor moved.
+          # The floor still works against PG 17 with an external plan
+          # database, so this is a matrix gap, not a support drop; the same
+          # mechanism will eventually bite other combinations, at which
+          # point raising MIN_PGSCHEMA is the honest fix (spec §13).
+          - pgschema: "1.12.0"
+            postgres: "17"
     services:
       postgres:
         image: postgres:${{ matrix.postgres }}-alpine
