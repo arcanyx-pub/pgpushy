@@ -872,7 +872,7 @@ fn a_missing_pgschema_says_how_to_get_one() {
 #[cfg(unix)]
 #[test]
 fn warns_when_the_password_comes_from_the_config_file() {
-    let dir = stub_project("", "Version: 1.12.0@abc linux/amd64 2026-07-06 00:00:00");
+    let dir = stub_project("", "Version: 1.12.3@abc linux/amd64 2026-07-06 00:00:00");
     // Append a password to the generated [env.test] block.
     let config = dir.path().join("pgpushy.toml");
     let mut text = std::fs::read_to_string(&config).expect("read config");
@@ -894,7 +894,7 @@ fn warns_when_the_password_comes_from_the_config_file() {
 #[cfg(unix)]
 #[test]
 fn does_not_warn_when_the_file_password_is_overridden() {
-    let dir = stub_project("", "Version: 1.12.0@abc linux/amd64 2026-07-06 00:00:00");
+    let dir = stub_project("", "Version: 1.12.3@abc linux/amd64 2026-07-06 00:00:00");
     let config = dir.path().join("pgpushy.toml");
     let mut text = std::fs::read_to_string(&config).expect("read config");
     text.push_str("password = \"hunter2\"\n");
@@ -912,7 +912,7 @@ fn does_not_warn_when_the_file_password_is_overridden() {
 #[cfg(unix)]
 #[test]
 fn an_ambient_pghost_does_not_redirect_a_named_environment() {
-    let dir = stub_project("", "Version: 1.12.0@abc linux/amd64 2026-07-06 00:00:00");
+    let dir = stub_project("", "Version: 1.12.3@abc linux/amd64 2026-07-06 00:00:00");
 
     stub_plan(&dir)
         .env("PGHOST", "somewhere.else.example")
