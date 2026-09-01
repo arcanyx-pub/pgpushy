@@ -319,6 +319,17 @@ commands are in [Appendix A](#appendix-a-reproduction-harness).
   `CREATE SCHEMA IF NOT EXISTS` tolerates. The §10.4 check keys on non-empty
   managed schemas for exactly this reason.
 
+**Verified in CI (2026-09-01)**
+- **pgschema 1.12.0's embedded plan database cannot serve a Postgres 17.5
+  target**: it selects an embedded server matching the target's minor and
+  its version index ends earlier, failing every plan with `no version found
+  matching 17.5.0`. 1.12.3 knows 17.5. The failure arrives from *image
+  drift* — the same matrix cell passed while postgres:17 meant 17.4 — and
+  the same mechanism will eventually reach any old pgschema on any new
+  minor. An external plan database sidesteps it entirely, which is why the
+  floor is not simply raised; the 1.12.0×17 cell is excluded from the
+  matrix with this note.
+
 **Verified while designing the plan artifact (2026-08-31, pgschema 1.12.3)**
 - **`--output-json <path>` writes the plan to a file**, and `pgschema apply
   --plan <path>` applies it across processes and time — the fingerprint is
