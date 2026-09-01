@@ -676,7 +676,7 @@ pub fn policies_refused(findings: &[PolicyOrRls], applying: bool) {
         }
     }
     eprintln!(
-        "\n  pgschema\'s ignore file has no section for these, so reconciling the \
+        "\n  pgschema's ignore file has no section for these, so reconciling the \
          schema would drop the policies and disable the security. Drop them first, \
          or leave the schema out of the managed set."
     );
@@ -687,7 +687,7 @@ pub fn policies_refused(findings: &[PolicyOrRls], applying: bool) {
     }
 }
 
-/// Steps outside pgpushy\'s model (spec §8.4): the enforcement behind the
+/// Steps outside pgpushy's model (spec §8.4): the enforcement behind the
 /// ignore-file suppression.
 pub fn unmanaged_steps(violations: &[(SchemaName, crate::plan_file::Step)], applying: bool) {
     let n = violations.len();
@@ -723,7 +723,7 @@ pub fn plan_db_leftovers(schemas: &[SchemaName], db: &str) {
         if schemas.len() == 1 { "s" } else { "" },
     );
     eprintln!(
-        "\n  An external plan database accumulates each run\'s cross-schema closure \
+        "\n  An external plan database accumulates each run's cross-schema closure \
          members, and the next run fails on them midway through the loop \
          (spec §10.4). It is scratch space: drop and recreate it, then re-run.\n\
          \n      DROP DATABASE {db}; CREATE DATABASE {db};"
@@ -731,7 +731,7 @@ pub fn plan_db_leftovers(schemas: &[SchemaName], db: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// The plan artifact (spec 8.9) and the destructive gate (spec 9.1)
+// The plan artifact (spec §8.9) and the destructive gate (spec §9.1)
 // ---------------------------------------------------------------------------
 
 pub fn artifact_written(dir: &Path, files: usize) {
@@ -768,7 +768,7 @@ pub fn artifact_wrong_target(expected: &crate::artifact::TargetIdentity, actual:
          reaches {} on cluster {}\n\
          \n\
          An artifact applies only to the database it was planned against \
-         (spec 8.9): pgschema fingerprints cover drift, not identity, and are \
+         (spec §8.9): pgschema fingerprints cover drift, not identity, and are \
          silent exactly when two databases are kept identical. Plan a separate \
          artifact for each environment.",
         expected.database, expected.system_identifier, actual.database, actual.system_identifier,
@@ -778,7 +778,7 @@ pub fn artifact_wrong_target(expected: &crate::artifact::TargetIdentity, actual:
 pub fn artifact_version_mismatch(planned: &str, current: &str) {
     println!(
         "  WARNING: the artifact was planned by pgschema {planned}; applying \
-         with {current}. The floor still applies (spec 8.5), but replanning \
+         with {current}. The floor still applies (spec §8.5), but replanning \
          with the current version is the safer path."
     );
 }
@@ -795,8 +795,58 @@ pub fn destructive_gate(summary: &crate::artifact::Summary) {
     eprintln!(
         "\n  Exiting 2 - distinct from 1, which means the run was refused - so \
          a pipeline can route a dropped column and a broken tree differently \
-         (spec 9.1). If this environment may destroy, set\n\
+         (spec §9.1). If this environment may destroy, set\n\
          \n      allow_destructive = true\n\
          \n  in its [env.*] block."
+    );
+}
+
+/// Spec §8.9: a refused run must not mint an appliable artifact.
+pub fn artifact_not_written() {
+    eprintln!(
+        "\n  --plan-out: no artifact was written. A refused run must not mint one \
+         (spec §8.9): a cross-schema cycle cannot be re-detected at apply, so a \
+         cyclic artifact must never exist. Fix the refusal and re-plan."
+    );
+}
+
+/// Spec §10.2: the opt-out still lists what it is allowing.
+pub fn destructive_allowed(summary: &crate::artifact::Summary) {
+    println!(
+        "\n  plan contains {}, allowed by this environment (allow_destructive):",
+        plural(summary.total.destructive, "destructive change"),
+    );
+    for step in &summary.destructive {
+        println!("    {}  {:<24} {}", step.schema, step.kind, step.path);
+    }
+}
+
+/// Spec §8.9 step 4: the re-check failed, so the manifest was edited.
+pub fn artifact_seeds_rejected() {
+    eprintln!(
+        "\n  The artifact's seed statements no longer pass the seed rules \
+         (spec §4.6, §8.9), which means the manifest was edited after it was \
+         written. Nothing is applied; re-run `pgpushy plan --plan-out`."
+    );
+}
+
+pub fn artifact_seed_outside_schemas(path: &str, table: &pgpushy_core::QualifiedName) {
+    eprintln!(
+        "\nerror: seed {path} inserts into {table}, outside the artifact's own \
+         schemas\n\
+         \n\
+         A manifest seed may only touch the schemas the manifest manages \
+         (spec §8.9); the manifest was edited after it was written. Nothing is \
+         applied; re-run `pgpushy plan --plan-out`."
+    );
+}
+
+/// Spec §8.9: a partial apply moves the target under the artifact.
+pub fn artifact_spent(dir: &Path) {
+    eprintln!(
+        "\n  This artifact is now spent: the partial apply itself moved the \
+         target, so the applied schemas' fingerprints no longer match and \
+         {} cannot be retried (spec §8.9). Re-plan and re-approve.",
+        dir.display(),
     );
 }

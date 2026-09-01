@@ -12,8 +12,7 @@
 use crate::inspect::Identity;
 use crate::plan_file::Plan;
 use anyhow::{Context, Result, bail};
-use pgpushy_core::seed::{SeedFile, SeedStatement};
-use pgpushy_core::{Origin, QualifiedName, SchemaName, Seeds};
+use pgpushy_core::{SchemaName, Seeds};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -36,6 +35,9 @@ pub struct Manifest {
     /// The pgschema version that planned; a differing one at apply is
     /// warned about (spec §8.9).
     pub pgschema_version: String,
+    /// Managed schemas whose desired state is empty, so §8.6's loudest
+    /// warning survives the process boundary.
+    pub empty_schemas: Vec<String>,
     /// The managed schemas in apply order, each pinning its plan file.
     pub schemas: Vec<SchemaEntry>,
     /// The checked seed statements (spec §4.6, §8.8), verbatim.
@@ -148,6 +150,7 @@ pub fn write(
     plan_files: &[PathBuf],
     summary: &Summary,
     pgschema_version: &str,
+    empty_schemas: &[SchemaName],
     seeds: &Seeds,
 ) -> Result<Vec<PathBuf>> {
     prepare_directory(dir)?;
@@ -175,6 +178,10 @@ pub fn write(
             system_identifier: summary.target.system_identifier.clone(),
         },
         pgschema_version: pgschema_version.to_owned(),
+        empty_schemas: empty_schemas
+            .iter()
+            .map(|schema| schema.as_str().to_owned())
+            .collect(),
         schemas,
         seeds: seeds
             .files
@@ -219,37 +226,6 @@ pub struct ReadArtifact {
     pub paths: Vec<PathBuf>,
 }
 
-impl ReadArtifact {
-    /// The manifest's seeds, rebuilt for §8.8 execution.
-    pub fn seeds(&self) -> Seeds {
-        Seeds {
-            files: self
-                .manifest
-                .seeds
-                .iter()
-                .map(|file| SeedFile {
-                    path: file.path.clone(),
-                    statements: file
-                        .statements
-                        .iter()
-                        .map(|stmt| SeedStatement {
-                            origin: Origin {
-                                file: file.path.clone(),
-                                line: stmt.line,
-                            },
-                            sql: stmt.sql.clone(),
-                            table: parse_qualified(&stmt.table),
-                        })
-                        .collect(),
-                })
-                .collect(),
-            // Collision analysis is validate's business; the artifact
-            // carries what was already checked.
-            do_update_collisions: Vec::new(),
-        }
-    }
-}
-
 /// Read and verify an artifact (spec §8.9).
 pub fn read(dir: &Path) -> Result<ReadArtifact> {
     let manifest_path = dir.join(MANIFEST);
@@ -273,6 +249,21 @@ pub fn read(dir: &Path) -> Result<ReadArtifact> {
             manifest.version,
             FORMAT_VERSION,
         );
+    }
+
+    for file in &manifest.seeds {
+        for stmt in &file.statements {
+            if !stmt.table.contains('.') {
+                bail!(
+                    "the manifest names seed table {:?} without a schema\n\
+                     \n\
+                     pgpushy writes every table schema-qualified; an unqualified one \
+                     means the manifest was edited after it was written. Re-run \
+                     `pgpushy plan --plan-out`.",
+                    stmt.table,
+                );
+            }
+        }
     }
 
     let mut plans = Vec::with_capacity(manifest.schemas.len());
@@ -304,26 +295,44 @@ pub fn read(dir: &Path) -> Result<ReadArtifact> {
     })
 }
 
-/// The artifact directory must be pgpushy's alone, by §8.7's rule; the
-/// manifest is the mark, since JSON cannot carry §4.1's marker.
+/// The artifact directory must be pgpushy's alone (spec §8.9, §8.7's rule):
+/// every file present must be provable as a previous artifact's — named by
+/// its manifest, or the manifest and summary themselves. Anything else is
+/// refused before a byte is written, because `write` prunes.
 fn prepare_directory(dir: &Path) -> Result<()> {
     if !dir.exists() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         return Ok(());
     }
-    let has_manifest = dir.join(MANIFEST).exists();
-    let mut entries = std::fs::read_dir(dir)
-        .with_context(|| format!("reading {}", dir.display()))?
-        .peekable();
-    if entries.peek().is_some() && !has_manifest {
-        bail!(
-            "{} exists and is not a plan artifact directory\n\
-             \n\
-             pgpushy owns the directory --plan-out names: it prunes stale plans \
-             from it, so it refuses one holding files it cannot prove it wrote. \
-             Point --plan-out at a new or empty directory.",
-            dir.display(),
-        );
+
+    let manifest_path = dir.join(MANIFEST);
+    let mut owned: std::collections::BTreeSet<String> =
+        [MANIFEST.to_owned(), SUMMARY.to_owned()].into();
+    if manifest_path.exists() {
+        let text = std::fs::read_to_string(&manifest_path)
+            .with_context(|| format!("reading {}", manifest_path.display()))?;
+        let previous: Manifest = serde_json::from_str(&text)
+            .with_context(|| format!("parsing {}", manifest_path.display()))?;
+        owned.extend(previous.schemas.iter().map(|entry| entry.plan.clone()));
+    }
+
+    for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+        let path = entry?.path();
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if path.is_dir() || !owned.contains(&name) {
+            bail!(
+                "{} holds {name}, which pgpushy cannot prove is part of an artifact \
+                 it wrote\n\
+                 \n\
+                 pgpushy owns the directory --plan-out names: it prunes stale plans \
+                 from it, so it refuses one holding anything else. Point --plan-out \
+                 at a new or empty directory, or move the file.",
+                dir.display(),
+            );
+        }
     }
     Ok(())
 }
@@ -362,15 +371,6 @@ fn hex_sha256(bytes: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// A manifest table name is `schema.name` as pgpushy printed it. Splitting on
-/// the first dot is correct because pgpushy wrote it from a `QualifiedName`.
-fn parse_qualified(name: &str) -> QualifiedName {
-    match name.split_once('.') {
-        Some((schema, object)) => QualifiedName::new(SchemaName::new(schema), object),
-        None => QualifiedName::new(SchemaName::new("public"), name),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -406,6 +406,7 @@ mod tests {
             &[plan_src],
             &summary,
             "1.12.3",
+            &[],
             &Seeds::default(),
         )
         .unwrap();
@@ -442,6 +443,7 @@ mod tests {
             &[plan_src],
             &summary,
             "1.12.3",
+            &[],
             &Seeds::default(),
         )
         .unwrap();
@@ -461,7 +463,7 @@ mod tests {
         std::fs::write(
             dir.path().join("manifest.json"),
             r#"{"version":99,"target":{"database":"d","system_identifier":"1"},
-               "pgschema_version":"1.12.3","schemas":[],"seeds":[]}"#,
+               "pgschema_version":"1.12.3","empty_schemas":[],"schemas":[],"seeds":[]}"#,
         )
         .unwrap();
         let err = read(dir.path()).unwrap_err().to_string();
@@ -478,10 +480,18 @@ mod tests {
             system_identifier: "1".into(),
         };
         let summary = summarize(&[], &identity);
-        let err = write(dir.path(), &[], &[], &summary, "1.12.3", &Seeds::default())
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("not a plan artifact directory"), "{err}");
+        let err = write(
+            dir.path(),
+            &[],
+            &[],
+            &summary,
+            "1.12.3",
+            &[],
+            &Seeds::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("cannot prove is part of an artifact"), "{err}");
         assert!(dir.path().join("precious.sql").exists());
     }
 
@@ -507,5 +517,54 @@ mod tests {
         assert_eq!(summary.total.destructive, 1);
         assert_eq!(summary.destructive[0].kind, "drop.table.column");
         assert_eq!(summary.destructive[0].path, "a.t.old");
+    }
+
+    /// A file beside a valid manifest is still foreign (spec §8.9): prune
+    /// must never be able to reach a file pgpushy cannot prove it wrote.
+    #[test]
+    fn a_foreign_file_beside_a_manifest_is_refused() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let plan_src = dir.path().join("src-plan.json");
+        std::fs::write(&plan_src, r#"{"groups":null}"#).unwrap();
+        let out = dir.path().join("artifact");
+        let order = [SchemaName::new("a")];
+        let plans = vec![(
+            SchemaName::new("a"),
+            serde_json::from_str::<Plan>(r#"{"groups":null}"#).unwrap(),
+        )];
+        let identity = crate::inspect::Identity {
+            database: "d".into(),
+            server: "x:1".into(),
+            system_identifier: "1".into(),
+        };
+        let summary = summarize(&plans, &identity);
+        write(
+            &out,
+            &order,
+            std::slice::from_ref(&plan_src),
+            &summary,
+            "1.12.3",
+            &[],
+            &Seeds::default(),
+        )
+        .unwrap();
+
+        std::fs::write(out.join("operator-notes.txt"), "precious").unwrap();
+        let err = write(
+            &out,
+            &order,
+            std::slice::from_ref(&plan_src),
+            &summary,
+            "1.12.3",
+            &[],
+            &Seeds::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("operator-notes.txt"), "{err}");
+        assert!(
+            out.join("operator-notes.txt").exists(),
+            "must not be pruned"
+        );
     }
 }
