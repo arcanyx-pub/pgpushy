@@ -11,7 +11,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-pgpushy-core = { version = "0.3.0", path = "../pgpushy-core" }
+pgpushy-core = { version = "0.3.1", path = "../pgpushy-core" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 globset = "0.4"
