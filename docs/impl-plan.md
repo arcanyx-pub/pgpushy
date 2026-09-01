@@ -2,7 +2,7 @@
 
 **Status:** Build guidance (non-normative)
 **Date:** 2026-08-31
-**Companion to:** [`docs/spec.md`](./spec.md) v0.6 (normative)
+**Companion to:** [`docs/spec.md`](./spec.md) v0.7 (normative)
 
 This plan says *how* to build what `spec.md` defines. Where they disagree, the
 spec wins. It is written to be read cold: §1 distills everything we learned
@@ -318,6 +318,19 @@ commands are in [Appendix A](#appendix-a-reproduction-harness).
   `pgschema_tmp_*`, and the leftover named schema stays empty, which
   `CREATE SCHEMA IF NOT EXISTS` tolerates. The §10.4 check keys on non-empty
   managed schemas for exactly this reason.
+
+**Verified while designing the plan artifact (2026-08-31, pgschema 1.12.3)**
+- **`--output-json <path>` writes the plan to a file**, and `pgschema apply
+  --plan <path>` applies it across processes and time — the fingerprint is
+  state-based, not session-based.
+- **The `.pgschemaignore` participates in the fingerprint.** The same plan,
+  applied from a directory without the ignore file it was planned under, is
+  refused with the regenerate-review-apply guidance. Artifact apply must run
+  from a working directory carrying the same ignore file pgpushy always
+  writes.
+- **Drift refusal is loud and safe**: mutate the target between plan and
+  apply and `apply --plan` refuses with a numbered remedy (regenerate,
+  review, apply); nothing is applied.
 
 ## 2. Tech stack & conventions
 
@@ -1001,6 +1014,21 @@ comparing anything.
   not define so `validate.rs` can finally reach its `UnresolvedReference`
   arm for managed schemas; `parse.rs` rejects `COMMENT ON SCHEMA` and
   `COMMENT ON CONSTRAINT` alongside types and domains.
+- **M18 — The plan artifact (spec §8.9).** A new `artifact.rs` in the
+  binary: write (manifest + per-schema plans + summary, §8.7 ownership
+  rules), read (hash verification, format-version check), and the
+  `apply --plan` path through `run.rs` — no discovery, no analyze; identity
+  check, fresh §6.2/§6.5/§8.4 checks, §8.6 approval from the artifact,
+  pgschema applies in manifest order from a directory carrying the ignore
+  file, then the manifest's seeds. Integration tests are the point:
+  plan-out in one process, apply --plan in another; a doctored plan file
+  refused by hash; a different database refused by identity; a drifted
+  target refused by pgschema's fingerprint with pgpushy reporting it.
+- **M19 — The destructive gate (spec §9.1).** `Outcome` gains a
+  distinct exit (2); `plan` classifies via `destructive_drops` and consults
+  the environment's `allow_destructive`; `summary.json` written with
+  `--plan-out`. Tests: a drop exits 2 and the summary names it; a widened
+  constraint exits 0; `allow_destructive = true` exits 0 listing the drops.
 - **M15 — `pgpushy generate` (spec §4.7).** `[[generate]]` config, argv
   execution with captured stdout, the generated-source marker (distinct from
   §4.1's document marker — opposite discovery polarity), the refusal to

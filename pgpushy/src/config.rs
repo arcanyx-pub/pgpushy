@@ -99,6 +99,10 @@ pub struct Environment {
     pub password: Option<String>,
     /// How long to wait for a lock before giving up, e.g. `"30s"` (spec §10.5).
     pub lock_timeout: Option<String>,
+    /// Whether a destructive plan exits 0 rather than 2 (spec §9.1). Per
+    /// environment, because destructive tolerance is a property of the
+    /// target: a development database says yes, production says no.
+    pub allow_destructive: Option<bool>,
     /// An external plan database (spec §10.4).
     pub plan_db: Option<PlanDatabase>,
 }
@@ -236,6 +240,7 @@ impl Loaded {
             sslmode: env.sslmode.clone().unwrap_or_else(|| "prefer".to_owned()),
             password: env.password.clone(),
             lock_timeout: env.lock_timeout.clone(),
+            allow_destructive: env.allow_destructive.unwrap_or(false),
             plan_db,
         })
     }
@@ -287,6 +292,8 @@ pub struct Target {
     pub password: Option<String>,
     /// The environment's lock timeout, before `--lock-timeout` is considered.
     pub lock_timeout: Option<String>,
+    /// Spec §9.1: whether a destructive plan may exit 0.
+    pub allow_destructive: bool,
     pub plan_db: Option<ResolvedPlanDatabase>,
 }
 

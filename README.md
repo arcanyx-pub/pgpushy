@@ -318,6 +318,15 @@ Apply is not atomic across schemas. A failure partway stops the run and reports
 what landed, what broke, what was never attempted, and that the applied schemas
 are not rolled back.
 
+For pipelines, `plan --plan-out <dir>` persists the plan pass as an
+**artifact** — the plans, a manifest binding them to the target database, and
+a machine-readable `summary.json` — and `apply --plan <dir>` applies exactly
+that artifact, reading no source tree: review the artifact, gate on it, apply
+it under a separate deploy role. A valid plan containing destructive changes
+exits **2** (distinct from 1, a refused run) unless the environment sets
+`allow_destructive = true`, so CI can route a dropped column and a broken
+tree differently.
+
 Every diagnostic names every instance rather than the first, with file and
 line:
 
@@ -375,6 +384,7 @@ sslmode = "verify-full"
 # How long Postgres waits for a lock before giving up. Worth setting on a busy
 # production database, where an unbounded wait blocks everything behind it.
 lock_timeout = "30s"
+# allow_destructive = true   # let a destructive plan exit 0 (spec §9.1)
 
 # Optional. pgschema builds its comparison model in an ephemeral embedded
 # Postgres by default; name an external one if spawning a process is not

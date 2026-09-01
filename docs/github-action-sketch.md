@@ -27,12 +27,11 @@ adoptable at all; the CLI alone is not where teams meet a schema tool.
 |---|---|
 | Run `validate` on a PR | now |
 | Run `plan` and post the human output as a PR comment | now |
-| Upload the plan as an artifact, apply exactly it | **blocked** on §14's persistable plan |
-| Label or gate a PR on destructive changes | **blocked** on §14's drop signal |
+| Upload the plan as an artifact, apply exactly it | now — `plan --plan-out` / `apply --plan` (spec §8.9) |
+| Label or gate a PR on destructive changes | now — exit 2 + `summary.json` (spec §9.1) |
 
-So a first version is worth shipping before either lands — posting the plan on
-a pull request is most of the day-to-day value — but it should be designed
-knowing the other half is coming, or the interface will have to change.
+Both halves now exist, so the action can be designed whole; release binaries
+remain the real first task below.
 
 ## The prerequisite nobody would guess: release binaries
 

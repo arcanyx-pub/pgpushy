@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 mod approve;
+mod artifact;
 mod cli;
 mod config;
 mod conn;
@@ -67,11 +68,20 @@ error: {err:#}"
             target,
             pgschema,
             out,
-        } => run::plan(target, pgschema, &loaded, output, out.as_deref()),
+            plan_out,
+        } => run::plan(
+            target,
+            pgschema,
+            &loaded,
+            output,
+            out.as_deref(),
+            plan_out.as_deref(),
+        ),
         Command::Apply {
             target,
             pgschema,
             out,
+            plan,
             auto_approve,
             lock_timeout,
         } => run::apply(
@@ -80,6 +90,7 @@ error: {err:#}"
             &loaded,
             output,
             out.as_deref(),
+            plan.as_deref(),
             *auto_approve,
             lock_timeout.as_deref(),
         ),

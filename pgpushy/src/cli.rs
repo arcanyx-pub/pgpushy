@@ -95,6 +95,12 @@ pub enum Command {
         /// `<schema>.sql` per managed schema.
         #[arg(long, value_name = "PATH")]
         out: Option<PathBuf>,
+
+        /// Write the plan pass as a persistable artifact: the plans, their
+        /// manifest, and the machine-readable summary (spec 8.9). Review
+        /// that artifact, then apply exactly it with `apply --plan`.
+        #[arg(long, value_name = "PATH")]
+        plan_out: Option<PathBuf>,
     },
 
     /// Reconcile the database: plan every managed schema, then apply.
@@ -114,6 +120,13 @@ pub enum Command {
         /// `<schema>.sql` per managed schema.
         #[arg(long, value_name = "PATH")]
         out: Option<PathBuf>,
+
+        /// Apply a reviewed plan artifact exactly (spec 8.9). No source
+        /// tree is read: the apply order, the plans and the seeds all come
+        /// from the artifact `plan --plan-out` wrote, and the target must be
+        /// the database the artifact was planned against.
+        #[arg(long, value_name = "PATH", conflicts_with = "out")]
+        plan: Option<PathBuf>,
 
         /// Apply without prompting. Required when stdin is not a terminal.
         #[arg(long)]
