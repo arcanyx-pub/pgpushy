@@ -132,6 +132,16 @@ pub fn plan(
         report::seeds_planned(&session.analysis.seeds);
     }
 
+    if !(cycles.is_empty() && hazards.is_empty() && refused.is_empty() && violations.is_empty()) {
+        // Spec §8.9: a refused run writes no artifact — a cross-schema cycle
+        // cannot be re-detected at apply, so a cyclic artifact must never
+        // exist to be applied.
+        if plan_out.is_some() {
+            report::artifact_not_written();
+        }
+        return Ok(Outcome::Failed);
+    }
+
     // The §9.1 classification, and — when asked — the §8.9 artifact.
     let summary = artifact::summarize(&plans, &session.inspection.identity);
     if let Some(dir) = plan_out {
@@ -144,20 +154,22 @@ pub fn plan(
             &plan_files,
             &summary,
             &pgschema_version(&session.binary),
+            &session.analysis.empty_schemas,
             &session.analysis.seeds,
         )?;
         report::artifact_written(dir, written.len());
     }
 
-    if !(cycles.is_empty() && hazards.is_empty() && refused.is_empty() && violations.is_empty()) {
-        return Ok(Outcome::Failed);
-    }
-
     // Spec §9.1: valid plans that would apply, but destroy. A distinct exit,
-    // gated by the environment rather than by a flag.
-    if summary.total.destructive > 0 && !session.connection.allow_destructive {
-        report::destructive_gate(&summary);
-        return Ok(Outcome::Destructive);
+    // gated by the environment rather than by a flag — and when the
+    // environment allows it, the changes are still listed (§10.2).
+    if summary.total.destructive > 0 {
+        if session.connection.allow_destructive {
+            report::destructive_allowed(&summary);
+        } else {
+            report::destructive_gate(&summary);
+            return Ok(Outcome::Destructive);
+        }
     }
 
     Ok(Outcome::Ok)
@@ -621,6 +633,12 @@ fn apply_from_artifact(
     lock_timeout: Option<&str>,
 ) -> Result<Outcome> {
     let connection = Resolved::from(&loaded.environment(&target.env)?)?;
+    // A relative --plan must survive pgschema running from its own working
+    // directory, so the artifact's paths are made absolute here.
+    let dir = dir
+        .canonicalize()
+        .with_context(|| format!("resolving --plan {}", dir.display()))?;
+    let dir = dir.as_path();
     let artifact = artifact::read(dir)?;
     report::artifact_read(dir, &artifact);
 
@@ -638,7 +656,10 @@ fn apply_from_artifact(
     )?;
     report::pgschema(&binary);
     let current = pgschema_version(&binary);
-    if current != artifact.manifest.pgschema_version {
+    if current != artifact.manifest.pgschema_version
+        && current != "unknown"
+        && artifact.manifest.pgschema_version != "unknown"
+    {
         report::artifact_version_mismatch(&artifact.manifest.pgschema_version, &current);
     }
 
@@ -680,8 +701,46 @@ fn apply_from_artifact(
         return Ok(Outcome::Failed);
     }
 
-    let seeds = artifact.seeds();
-    match approve::confirm(&seeds, &[], &artifact.plans, auto_approve)? {
+    // Spec §8.9 step 4: a manifest is editable, so its seed statements
+    // re-pass every §4.6 form rule here — the model checks ran at plan time,
+    // but the form rules are what §12.10's guarantee rests on — and each
+    // table must stay inside the manifest's own schemas.
+    let seed_sources: Vec<pgpushy_core::SourceFile> = artifact
+        .manifest
+        .seeds
+        .iter()
+        .map(|file| pgpushy_core::SourceFile {
+            path: file.path.clone(),
+            contents: file
+                .statements
+                .iter()
+                .map(|stmt| format!("{};", stmt.sql))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        })
+        .collect();
+    let (seeds, seed_diagnostics) = pgpushy_core::seed::recheck(&seed_sources);
+    if !seed_diagnostics.is_empty() {
+        report::diagnostics(&seed_diagnostics);
+        report::artifact_seeds_rejected();
+        return Ok(Outcome::Failed);
+    }
+    for file in &seeds.files {
+        for stmt in &file.statements {
+            if !managed.contains(&stmt.table.schema) {
+                report::artifact_seed_outside_schemas(&file.path, &stmt.table);
+                return Ok(Outcome::Failed);
+            }
+        }
+    }
+
+    let empty_schemas: Vec<SchemaName> = artifact
+        .manifest
+        .empty_schemas
+        .iter()
+        .map(SchemaName::new)
+        .collect();
+    match approve::confirm(&seeds, &empty_schemas, &artifact.plans, auto_approve)? {
         Decision::Declined => {
             report::declined();
             return Ok(Outcome::Ok);
@@ -727,6 +786,7 @@ fn apply_from_artifact(
             if !seeds.is_empty() {
                 report::seeds_not_attempted(&seeds);
             }
+            report::artifact_spent(dir);
             return Ok(Outcome::Failed);
         }
         applied.push(schema.clone());

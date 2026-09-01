@@ -1299,7 +1299,13 @@ volatile expression in a values list, a `DO UPDATE` that never converges.
 ### 8.9 The plan artifact
 
 `plan` MAY be given `--plan-out <dir>`: a directory pgpushy owns, into which
-the plan pass is written as a reviewable, applicable artifact. `apply` MAY be
+the plan pass is written as a reviewable, applicable artifact — **only when
+the run is not refused**. A plan that exits 1 (a cycle, a §6.2, §6.5 or §8.4
+refusal) MUST NOT write one: an artifact's checks re-run at apply where they
+can — §6.2, §6.5, §8.4 — but a cross-schema cycle cannot be re-detected
+without the source tree, so the only place to stop a cyclic artifact is to
+never mint it. A destructive plan (exit 2, §9.1) DOES write the artifact:
+the artifact is precisely what its reviewer gates on. `apply` MAY be
 given `--plan <dir>`, and then applies **exactly that artifact**: no
 discovery, no parsing, no synthesis — the deploy environment carries no
 source tree, because the apply order lives in the artifact and source drift
@@ -1311,13 +1317,25 @@ a deploy role.
 The artifact holds:
 
 - **`manifest.json`** — the artifact format version; the managed schemas in
-  apply order (the order is read from here, never re-derived); each schema's
-  plan file name with its SHA-256, so a plan file and its manifest entry
-  cannot disagree silently; the target's identity (§6.3: `system_identifier`
-  and database name); the pgschema version that planned; and the checked seed
-  statements (§4.6), carried verbatim — the seeds that run are the seeds that
-  were reviewed. The manifest is what marks the directory as pgpushy's, since
-  JSON cannot carry §4.1's marker.
+  apply order (the order is read from here, never re-derived); the schemas
+  whose desired state is empty, so §8.6's loudest warning survives the
+  boundary; each schema's plan file name with its SHA-256, so a plan file and
+  its manifest entry cannot disagree silently; the target's identity (§6.3:
+  `system_identifier` and database name); the pgschema version that planned;
+  and the checked seed statements (§4.6), carried verbatim. The manifest is
+  what marks the directory as pgpushy's, since JSON cannot carry §4.1's
+  marker.
+
+  The hashes are scoped honestly: they catch corruption and mixups — a plan
+  file swapped, truncated, or paired with the wrong entry — not a hostile
+  editor, who could rewrite the hashes too. What *is* enforced against
+  editing is the executable content: the manifest's seed statements are
+  **re-checked at apply time** against every §4.6 form rule — `INSERT … ON
+  CONFLICT` only, the `DO UPDATE` guard, no `WITH`, a database-free source,
+  built-in functions only, an explicit column list, a qualified table — and a
+  seed whose table lies outside the manifest's own managed schemas is
+  refused. The model checks ran at plan time; the form rules are what
+  §12.10's guarantee rests on, so they run again at the point of use.
 - **one `<schema>.json` per managed schema** — pgschema's plan, byte for
   byte, named by §8.7's percent-encoding rule.
 - **`summary.json`** — the §9.1 machine-readable summary.
@@ -1337,19 +1355,26 @@ a fresh write does not produce.
 3. re-run the §6.2 removal check against a **fresh** inspection — the
    per-schema fingerprint cannot see a relationship between two schemas — and
    the §6.5 check, and §8.4's kind check over the artifact's plans;
-4. seek §8.6 approval, summarized from the artifact;
-5. apply each non-empty plan, in manifest order, via `pgschema apply
+4. re-check the manifest's seed statements against §4.6's form rules, and
+   refuse a seed whose table is outside the manifest's managed schemas;
+5. seek §8.6 approval, summarized from the artifact — including the
+   manifest's empty-desired-state schemas, called out per §8.6;
+6. apply each non-empty plan, in manifest order, via `pgschema apply
    --plan`, from a working directory carrying §8.4's ignore file. **The
    ignore file participates in pgschema's fingerprint** (verified at 1.12.3:
    the same plan is refused when applied from a directory without it), so it
    is part of a plan's identity, not decoration;
-6. execute the manifest's seed statements, per §8.8.
+7. execute the re-checked seed statements, per §8.8.
 
 A pgschema version differing from the manifest's SHOULD be warned about; the
 §8.5 floor applies regardless. And one consequence stated plainly: **an
 approved artifact is not a promise that it will apply.** The target can move
 underneath it, pgschema's fingerprint refuses (verified), and a pipeline
 needs a story for approved-then-refused — which is re-plan and re-approve.
+The same story covers a **partial** artifact apply: the apply itself moves
+the target, so the already-applied schemas' fingerprints no longer match and
+the artifact is spent; pgpushy MUST say so when reporting the partial
+failure.
 
 ## 9. Failure Handling
 
@@ -2249,3 +2274,14 @@ made after draft 2 of v0.1.
   and following Atlas; per-environment because destructive tolerance is a
   property of the target. `apply` is deliberately not gated: §8.6's approval
   is its gate. (§9.1, §10.2)
+- **[0.7] An artifact's integrity is validation, not hashing** — adversarial
+  review proved the obvious-in-hindsight: with no trust anchor, hashes over
+  the plan files cannot bind a hostile editor, who rewrites the manifest —
+  and the manifest carries the seed statements, a direct write path to the
+  target. So the hashes are scoped to corruption and mixups, and the defense
+  for executable content is re-validation at the point of use: every §4.6
+  form rule re-runs over the manifest's seeds at apply, bounded to the
+  manifest's own schemas. The same review showed a refused plan happily
+  minting an appliable artifact whose one unrecheckable failure — a
+  cross-schema cycle — would then apply; a refused run therefore writes no
+  artifact at all, which is the only place that hole can be closed. (§8.9)

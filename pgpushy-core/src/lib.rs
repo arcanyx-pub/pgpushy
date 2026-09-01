@@ -186,7 +186,7 @@ pub fn analyze(
     // Validity and seed checks are collected together, so a tree with a bad
     // reference and a bad seed reports both in one run (impl-plan §12).
     let mut diagnostics = validate::check(&objects, &managed);
-    let (seeds, seed_diagnostics) = seed::check(seed_files, &objects);
+    let (seeds, seed_diagnostics) = seed::check(seed_files, Some(&objects));
     diagnostics.extend(seed_diagnostics);
     if !diagnostics.is_empty() {
         return Err(AnalysisError::Source(diagnostics));

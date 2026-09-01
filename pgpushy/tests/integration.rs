@@ -2080,5 +2080,153 @@ fn a_destructive_plan_exits_2_and_the_optout_restores_0() {
     text.push_str("allow_destructive = true\n");
     std::fs::write(&config, text).expect("write config");
 
-    project.command("plan").assert().success();
+    // Spec §10.2: allowed still means listed.
+    project
+        .command("plan")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("allowed by this environment"));
+}
+
+/// The adversarial finding, closed: editing the manifest's seed SQL after
+/// review is caught by the §8.9 re-check, and nothing is applied.
+#[test]
+fn a_tampered_manifest_seed_is_rejected() {
+    let target = require_target!();
+    let schema = unique_schema("tamper");
+    let _schemas = Schemas::create(&target, std::slice::from_ref(&schema));
+
+    let project = target.project(
+        &format!("default_schema = \"{schema}\"\nseed_root = \"seeds\"\n"),
+        &[
+            (
+                "t.sql",
+                format!("CREATE TABLE {schema}.t (id int PRIMARY KEY);"),
+            ),
+            (
+                "seeds/rows.sql",
+                format!("INSERT INTO {schema}.t (id) VALUES (1) ON CONFLICT (id) DO NOTHING;"),
+            ),
+        ],
+    );
+    let art = project.dir.path().join("artifact");
+    project
+        .command("plan")
+        .arg("--plan-out")
+        .arg(&art)
+        .assert()
+        .success();
+
+    let manifest = art.join("manifest.json");
+    let text = std::fs::read_to_string(&manifest).expect("read manifest");
+    let doctored = text.replace(
+        &format!("INSERT INTO {schema}.t (id) VALUES (1) ON CONFLICT (id) DO NOTHING"),
+        &format!("UPDATE {schema}.t SET id = 9"),
+    );
+    assert_ne!(text, doctored, "the seed SQL must be present to doctor");
+    std::fs::write(&manifest, doctored).expect("write doctored manifest");
+
+    project
+        .command("apply")
+        .arg("--plan")
+        .arg(&art)
+        .arg("--auto-approve")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("must be an INSERT"))
+        .stderr(predicates::str::contains("manifest was edited"));
+
+    // Nothing was applied: the schemas were never reached.
+    let mut client = target.client();
+    let tables: i64 = client
+        .query_one(
+            &format!(
+                "SELECT count(*) FROM information_schema.tables
+                 WHERE table_schema = '{schema}'"
+            ),
+            &[],
+        )
+        .expect("count")
+        .get(0);
+    assert_eq!(tables, 0);
+}
+
+/// The other adversarial finding, closed: a refused run mints no artifact,
+/// because a cross-schema cycle cannot be re-detected at apply (spec §8.9).
+#[test]
+fn a_refused_plan_writes_no_artifact() {
+    let target = require_target!();
+    let sa = unique_schema("cyca");
+    let sb = unique_schema("cycb");
+    let _schemas = Schemas::create(&target, &[sa.clone(), sb.clone()]);
+
+    let project = target.project(
+        &format!("default_schema = \"{sa}\""),
+        &[(
+            "t.sql",
+            format!(
+                "CREATE TABLE {sa}.a (id int PRIMARY KEY, b_id int);
+                 CREATE TABLE {sb}.b (id int PRIMARY KEY, a_id int);
+                 ALTER TABLE {sa}.a ADD CONSTRAINT a_b FOREIGN KEY (b_id)
+                     REFERENCES {sb}.b (id);
+                 ALTER TABLE {sb}.b ADD CONSTRAINT b_a FOREIGN KEY (a_id)
+                     REFERENCES {sa}.a (id);"
+            ),
+        )],
+    );
+    let art = project.dir.path().join("artifact");
+    project
+        .command("plan")
+        .arg("--plan-out")
+        .arg(&art)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("no artifact was written"));
+    assert!(
+        !art.join("manifest.json").exists(),
+        "a refused run must not mint an artifact"
+    );
+}
+
+/// The natural CI invocation: a relative --plan path must survive pgschema
+/// running from its own working directory.
+#[test]
+fn a_relative_plan_path_applies() {
+    let target = require_target!();
+    let schema = unique_schema("relpath");
+    let _schemas = Schemas::create(&target, std::slice::from_ref(&schema));
+
+    let project = target.project(
+        &format!("default_schema = \"{schema}\""),
+        &[(
+            "t.sql",
+            format!("CREATE TABLE {schema}.t (id int PRIMARY KEY);"),
+        )],
+    );
+    let art = project.dir.path().join("artifact");
+    project
+        .command("plan")
+        .arg("--plan-out")
+        .arg(&art)
+        .assert()
+        .success();
+
+    let mut command = project.command("apply");
+    command
+        .current_dir(project.dir.path())
+        .args(["--plan", "artifact", "--auto-approve"]);
+    command.assert().success();
+
+    let mut client = target.client();
+    let tables: i64 = client
+        .query_one(
+            &format!(
+                "SELECT count(*) FROM information_schema.tables
+                 WHERE table_schema = '{schema}' AND table_name = 't'"
+            ),
+            &[],
+        )
+        .expect("count")
+        .get(0);
+    assert_eq!(tables, 1);
 }

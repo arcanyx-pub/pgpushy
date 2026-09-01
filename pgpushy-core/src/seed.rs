@@ -84,7 +84,15 @@ pub struct DoUpdateCollision {
 ///
 /// Like the rest of the pipeline, this collects *all* problems rather than
 /// stopping at the first (impl-plan §12).
-pub(crate) fn check(files: &[SourceFile], objects: &Objects) -> (Seeds, Vec<Diagnostic>) {
+/// Re-check statements carried by a plan artifact (spec §8.9): every §4.6
+/// **form** rule, with no source tree in sight. The model checks ran at plan
+/// time; the form rules are what §12.10's guarantee rests on, and a manifest
+/// is editable, so they run again at the point of use.
+pub fn recheck(files: &[SourceFile]) -> (Seeds, Vec<Diagnostic>) {
+    check(files, None)
+}
+
+pub(crate) fn check(files: &[SourceFile], objects: Option<&Objects>) -> (Seeds, Vec<Diagnostic>) {
     let mut seeds = Seeds::default();
     let mut diagnostics = Vec::new();
     let mut do_updates: BTreeMap<(QualifiedName, String), Vec<Origin>> = BTreeMap::new();
@@ -185,7 +193,7 @@ fn slice_sql(contents: &str, location: i32, len: i32) -> String {
 fn check_insert(
     insert: &InsertStmt,
     origin: &Origin,
-    objects: &Objects,
+    objects: Option<&Objects>,
     diagnostics: &mut Vec<Diagnostic>,
     do_updates: &mut BTreeMap<(QualifiedName, String), Vec<Origin>>,
 ) -> Option<QualifiedName> {
@@ -221,10 +229,14 @@ fn check_insert(
                 // The model may already know the one table this can mean, in
                 // which case the remedy is its actual qualified form.
                 let candidates: Vec<_> = objects
-                    .tables
-                    .iter()
-                    .filter(|t| t.name.name == relation.relname)
-                    .collect();
+                    .map(|objects| {
+                        objects
+                            .tables
+                            .iter()
+                            .filter(|t| t.name.name == relation.relname)
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 match candidates.as_slice() {
                     [table] => format!(
                         "seed statements execute under an empty search_path (spec §8.8); \
@@ -245,22 +257,32 @@ fn check_insert(
         SchemaName::new(relation.schemaname.clone()),
         relation.relname.clone(),
     );
-    let Some(table) = objects.tables.iter().find(|t| t.name == name) else {
-        diagnostics.push(
-            Diagnostic::new(
-                DiagnosticKind::SeedTargetMismatch,
-                format!("seed inserts into {name}, which the source tree does not describe"),
-                vec![origin.clone()],
-            )
-            .with_help(
-                "a seed may only insert into a table the desired state defines, in a \
-             managed schema — writing rows into shape pgpushy cannot see is what \
-             spec §4.6 rejects",
-            ),
-        );
-        return None;
+    let shape = match objects {
+        Some(objects) => {
+            let Some(table) = objects.tables.iter().find(|t| t.name == name) else {
+                diagnostics.push(
+                    Diagnostic::new(
+                        DiagnosticKind::SeedTargetMismatch,
+                        format!(
+                            "seed inserts into {name}, which the source tree does not describe"
+                        ),
+                        vec![origin.clone()],
+                    )
+                    .with_help(
+                        "a seed may only insert into a table the desired state defines, in a \
+                         managed schema — writing rows into shape pgpushy cannot see is what \
+                         spec §4.6 rejects",
+                    ),
+                );
+                return None;
+            };
+            Some(Shape::of(table, objects))
+        }
+        // Re-checking an artifact's seeds (spec §8.9): the model is gone, the
+        // form rules below still run, and run.rs bounds every table to the
+        // manifest's managed schemas.
+        None => None,
     };
-    let shape = Shape::of(table, objects);
 
     // The explicit column list (spec §4.6).
     if insert.cols.is_empty() {
@@ -271,34 +293,36 @@ fn check_insert(
              silently when the table gains a column; name the columns (spec §4.6)",
         ));
     }
-    for col in &insert.cols {
-        let Some(NodeEnum::ResTarget(target)) = col.node.as_ref() else {
-            continue;
-        };
-        match shape.columns.get(target.name.as_str()) {
-            None => diagnostics.push(
-                Diagnostic::new(
-                    DiagnosticKind::SeedTargetMismatch,
-                    format!("{name} has no column {}", target.name),
-                    vec![origin.clone()],
-                )
-                .with_help(format!(
-                    "the columns of {name} are: {}",
-                    shape.columns.keys().cloned().collect::<Vec<_>>().join(", "),
-                )),
-            ),
-            Some(Generated::Always) => diagnostics.push(
-                Diagnostic::new(
-                    DiagnosticKind::SeedTargetMismatch,
-                    format!("column {} of {name} is GENERATED ALWAYS", target.name),
-                    vec![origin.clone()],
-                )
-                .with_help(
-                    "a generated column cannot be seeded; leave it out of the column list \
-                 and let the table produce it (spec §4.6)",
+    if let Some(shape) = shape.as_ref() {
+        for col in &insert.cols {
+            let Some(NodeEnum::ResTarget(target)) = col.node.as_ref() else {
+                continue;
+            };
+            match shape.columns.get(target.name.as_str()) {
+                None => diagnostics.push(
+                    Diagnostic::new(
+                        DiagnosticKind::SeedTargetMismatch,
+                        format!("{name} has no column {}", target.name),
+                        vec![origin.clone()],
+                    )
+                    .with_help(format!(
+                        "the columns of {name} are: {}",
+                        shape.columns.keys().cloned().collect::<Vec<_>>().join(", "),
+                    )),
                 ),
-            ),
-            Some(Generated::No) => {}
+                Some(Generated::Always) => diagnostics.push(
+                    Diagnostic::new(
+                        DiagnosticKind::SeedTargetMismatch,
+                        format!("column {} of {name} is GENERATED ALWAYS", target.name),
+                        vec![origin.clone()],
+                    )
+                    .with_help(
+                        "a generated column cannot be seeded; leave it out of the column list \
+                 and let the table produce it (spec §4.6)",
+                    ),
+                ),
+                Some(Generated::No) => {}
+            }
         }
     }
 
@@ -311,9 +335,9 @@ fn check_insert(
              ON CONFLICT (…) DO NOTHING, or DO UPDATE with a WHERE guard (spec §4.6)",
         )),
         Some(clause) => {
-            check_on_conflict(clause, &name, &shape, origin, diagnostics);
+            check_on_conflict(clause, &name, shape.as_ref(), origin, diagnostics);
             if clause.action == OnConflictAction::OnconflictUpdate as i32 {
-                let signature = conflict_signature(clause, &shape);
+                let signature = conflict_signature(clause, shape.as_ref());
                 do_updates
                     .entry((name.clone(), signature))
                     .or_default()
@@ -335,7 +359,7 @@ fn check_insert(
 fn check_on_conflict(
     clause: &OnConflictClause,
     table: &QualifiedName,
-    shape: &Shape,
+    shape: Option<&Shape>,
     origin: &Origin,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
@@ -379,7 +403,9 @@ fn check_on_conflict(
     };
 
     if !infer.conname.is_empty() {
-        if !shape.named_unique.contains_key(infer.conname.as_str()) {
+        if let Some(shape) = shape
+            && !shape.named_unique.contains_key(infer.conname.as_str())
+        {
             let help = if shape.named_unique.is_empty() {
                 format!(
                     "no PRIMARY KEY or UNIQUE constraint on {table} carries a name; \
@@ -440,7 +466,9 @@ fn check_on_conflict(
 
     // Order carries no meaning: the target must equal a unique column set as
     // a set (spec §4.6).
-    if !shape.unique_sets.contains(&target) {
+    if let Some(shape) = shape
+        && !shape.unique_sets.contains(&target)
+    {
         let cols: Vec<_> = target.iter().cloned().collect();
         let sets: Vec<String> = shape
             .unique_sets
@@ -468,14 +496,14 @@ fn check_on_conflict(
 
 /// A stable signature for one `DO UPDATE`'s conflict target, for collision
 /// grouping across files.
-fn conflict_signature(clause: &OnConflictClause, shape: &Shape) -> String {
+fn conflict_signature(clause: &OnConflictClause, shape: Option<&Shape>) -> String {
     let Some(infer) = clause.infer.as_deref() else {
         return String::new();
     };
     if !infer.conname.is_empty() {
         // A named arbiter and its column-list spelling are one target, so a
         // name the model knows resolves to its columns before grouping.
-        return match shape.named_unique.get(infer.conname.as_str()) {
+        return match shape.and_then(|shape| shape.named_unique.get(infer.conname.as_str())) {
             Some(cols) => cols.iter().cloned().collect::<Vec<_>>().join(","),
             None => format!("constraint:{}", infer.conname),
         };
@@ -498,7 +526,7 @@ fn conflict_signature(clause: &OnConflictClause, shape: &Shape) -> String {
 fn scan_expressions(
     value: &Value,
     table: &QualifiedName,
-    objects: &Objects,
+    objects: Option<&Objects>,
     origin: &Origin,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
@@ -600,7 +628,7 @@ fn qualified_outside_pg_catalog(names: Option<&Value>) -> Option<String> {
 /// catalog, but a type the source tree defines is known — and a bare
 /// reference to one cannot resolve at apply, so it is caught here rather
 /// than in the seed's transaction.
-fn bare_tree_type(cast: &Value, objects: &Objects) -> Option<String> {
+fn bare_tree_type(cast: &Value, objects: Option<&Objects>) -> Option<String> {
     let names = cast.get("type_name")?.get("names")?.as_array()?;
     if names.len() != 1 {
         return None;
@@ -611,7 +639,7 @@ fn bare_tree_type(cast: &Value, objects: &Objects) -> Option<String> {
         .get("String")?
         .get("sval")?
         .as_str()?;
-    objects
+    objects?
         .types
         .iter()
         .any(|t| t.name.name == name)
@@ -619,11 +647,9 @@ fn bare_tree_type(cast: &Value, objects: &Objects) -> Option<String> {
 }
 
 /// The qualified spelling to suggest for a bare tree-defined type.
-fn bare_qualified(name: &str, objects: &Objects) -> String {
+fn bare_qualified(name: &str, objects: Option<&Objects>) -> String {
     objects
-        .types
-        .iter()
-        .find(|t| t.name.name == name)
+        .and_then(|objects| objects.types.iter().find(|t| t.name.name == name))
         .map(|t| t.name.to_string())
         .unwrap_or_else(|| name.to_owned())
 }

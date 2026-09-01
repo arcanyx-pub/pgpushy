@@ -1020,10 +1020,15 @@ comparing anything.
   `apply --plan` path through `run.rs` — no discovery, no analyze; identity
   check, fresh §6.2/§6.5/§8.4 checks, §8.6 approval from the artifact,
   pgschema applies in manifest order from a directory carrying the ignore
-  file, then the manifest's seeds. Integration tests are the point:
-  plan-out in one process, apply --plan in another; a doctored plan file
-  refused by hash; a different database refused by identity; a drifted
-  target refused by pgschema's fingerprint with pgpushy reporting it.
+  file, then the re-checked seeds (the manifest is editable, so its
+  statements re-pass every §4.6 form rule at apply, bounded to the
+  manifest's schemas). Integration tests are the point: plan-out in one
+  process, apply --plan in another; a doctored plan file refused by hash
+  (unit-level) and a tampered manifest seed refused by the re-check; a
+  refused run minting no artifact; a different database refused by
+  identity; a drifted target refused by pgschema's fingerprint with
+  pgpushy reporting it; a relative --plan path surviving pgschema's
+  working directory.
 - **M19 — The destructive gate (spec §9.1).** `Outcome` gains a
   distinct exit (2); `plan` classifies via `destructive_drops` and consults
   the environment's `allow_destructive`; `summary.json` written with
