@@ -912,7 +912,7 @@ dependencies = [
 
 [[package]]
 name = "pgpushy"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -936,7 +936,7 @@ dependencies = [
 
 [[package]]
 name = "pgpushy-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "pg_query",
  "serde_json",
