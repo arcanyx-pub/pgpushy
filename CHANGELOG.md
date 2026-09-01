@@ -5,6 +5,18 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **The managed backend downloads pgschema 1.12.5** (was 1.12.3), with all
+  four platform hashes computed from the release assets and cross-checked
+  against GitHub's per-asset digests. Re-verified before pinning: the full
+  live integration suite passes against 1.12.5, and the external
+  plan-database accumulation the §10.4 check is calibrated to is unchanged —
+  1.12.4's cross-schema-FK ignore stubs did not alter that path. The floor
+  stays at 1.12.3.
+
 ## [0.3.0] - 2026-09-01
 
 ### Changed
