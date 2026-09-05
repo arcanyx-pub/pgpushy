@@ -5,6 +5,21 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Prebuilt CLI binaries on every release.** A release tag now also builds
+  `pgpushy` for `linux-amd64`, `linux-arm64`, `darwin-amd64` and
+  `darwin-arm64` and attaches them to a GitHub release, named
+  `pgpushy-<version>-<os>-<arch>` — the same shape as the pgschema assets the
+  managed backend already downloads and verifies — beside a `SHA256SUMS` file
+  that `sha256sum -c` reads as it stands. Each binary is built natively on a
+  runner of its architecture, and the Linux ones are statically linked against
+  musl, so they carry no glibc floor from the image that built them.
+  Installing pgpushy in CI no longer means compiling libpg_query's C sources
+  through bindgen.
+
 ## [0.3.1] - 2026-09-01
 
 ### Changed

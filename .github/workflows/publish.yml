@@ -3,9 +3,23 @@ name: Publish
 # Tagging is the release. `just publish` pushes `vX.Y.Z` from an up-to-date
 # main, and this is what that tag starts. Nothing publishes on a merge, so a
 # release is always a deliberate second action.
+#
+# A release has two independent halves — the crates on crates.io and the
+# per-platform binaries on the GitHub release — and neither `needs:` the
+# other. They fail for unrelated reasons (a registry hiccup, one runner
+# image), and coupling them would mean a green half waiting on a red one it
+# has nothing to do with. Both halves are re-runnable, so a partial release is
+# repaired by re-running the workflow rather than by cutting a new version.
+#
+# `workflow_dispatch` exists so the binaries can be built from a branch as a
+# dry run: the build matrix runs and leaves the four binaries as workflow
+# artifacts, while the two jobs that publish anything — the crates and the
+# GitHub release — are gated on `github.event_name == 'push'` and sit out. A
+# release is only ever a tag.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -14,6 +28,9 @@ jobs:
   publish:
     name: Publish to crates.io
     runs-on: ubuntu-latest
+    # A manual run is a build rehearsal, never a publish: a crates.io release
+    # cannot be taken back, so it is reachable only from a tag.
+    if: github.event_name == 'push'
     # Load-bearing, not decoration: crates.io's Trusted Publishing config for
     # both crates names this environment, and it checks the claim in the OIDC
     # token. A job outside it — or in one spelled differently — is refused at
@@ -108,3 +125,214 @@ jobs:
           fi
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+  build:
+    name: Build ${{ matrix.suffix }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # A macOS runner that fails to provision should not cancel three legs
+      # that had nothing to do with it. Nothing is released either way — the
+      # release job needs all four — so the only thing cancelling buys is a
+      # run that says less about what is actually broken.
+      fail-fast: false
+      matrix:
+        include:
+          # Native builds only: `pg_query` compiles libpg_query's C sources
+          # through the `cc` crate and generates bindings with `bindgen`, so a
+          # cross-compile means a cross C toolchain and a matching libclang
+          # sysroot per target. GitHub hosts a runner for each of the four
+          # platforms we ship, which buys the same result for the price of a
+          # matrix entry.
+          #
+          # Linux is built against musl so the binaries are static: the whole
+          # point of shipping them is that a CI job can curl one and run it,
+          # and a glibc build inherits the builder image's glibc floor as a
+          # silent requirement on every machine that runs it.
+          - suffix: linux-amd64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - suffix: linux-arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          # macOS runner labels split by architecture rather than by version:
+          # `macos-latest` is Apple Silicon, and Intel needs the explicit
+          # `macos-15-intel` label (`macos-latest` has not been Intel since
+          # the macOS 14 images).
+          - suffix: darwin-amd64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - suffix: darwin-arm64
+            runner: macos-latest
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      # Safe to cache here, unlike the crates job above: nothing in this job
+      # runs `cargo publish`, so there is no target/package/ tree for
+      # rust-cache's pruning step to trip over. Keyed by target so the four
+      # legs do not overwrite each other's cache.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # musl-tools supplies `musl-gcc`, which compiles libpg_query's C sources
+      # and links the binary. Both variables are needed: without the linker
+      # override rustc hands the objects to the system `cc`, which links
+      # against glibc's crt files and undoes the point of the musl target.
+      #
+      # The bindgen argument is the third thing this build needs and the least
+      # obvious. `pg_query` generates its bindings with libclang, which for a
+      # non-host target stops finding the headers it would otherwise pick up
+      # implicitly and fails on `stddef.h`. Pointing it at musl's own headers
+      # fixes that and is what the bindings should have been generated from
+      # anyway — reproduced and verified locally on x86_64 before this landed.
+      # The path is derived rather than written out because the two Linux legs
+      # differ only by architecture, and asserted because a wrong path here
+      # resurfaces as the same confusing header error.
+      - name: Install the musl toolchain
+        if: endsWith(matrix.target, '-musl')
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          target="${{ matrix.target }}"
+          headers="/usr/include/${target%%-*}-linux-musl"
+          if [ ! -d "$headers" ]; then
+            echo "musl-dev did not put its headers at $headers" >&2
+            exit 1
+          fi
+          underscored=$(echo "$target" | tr - _)
+          uppercased=$(echo "$target" | tr 'a-z-' 'A-Z_')
+          {
+            echo "CC_${underscored}=musl-gcc"
+            echo "CARGO_TARGET_${uppercased}_LINKER=musl-gcc"
+            echo "BINDGEN_EXTRA_CLANG_ARGS_${underscored}=-I${headers}"
+          } >> "$GITHUB_ENV"
+
+      # The same tag-versus-workspace check the crates job makes, for the same
+      # reason: an asset named after the wrong version is as wrong as a crate
+      # published under one. A manual run has no tag to compare against, so it
+      # only reports the version the assets will carry.
+      - name: Resolve the version being built
+        id: version
+        run: |
+          set -euo pipefail
+          declared=$(cargo pkgid -p pgpushy | sed 's/.*[#@]//')
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            tagged="${GITHUB_REF_NAME#v}"
+            if [ "$tagged" != "$declared" ]; then
+              echo "tag $GITHUB_REF_NAME does not match the workspace version $declared" >&2
+              echo "run 'just bump' and merge that before tagging" >&2
+              exit 1
+            fi
+          fi
+          echo "building $declared"
+          echo "version=$declared" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: cargo build --release --locked -p pgpushy --target ${{ matrix.target }}
+
+      # `pgpushy-<version>-<os>-<arch>`, mirroring the shape of pgschema's own
+      # release assets (spec §8.5) — pgpushy already downloads and verifies
+      # those, and a consumer that can fetch one can fetch these with the same
+      # code path.
+      #
+      # The binary is then made to state its own version. A rename cannot tell
+      # a stale target/ from a fresh one, and an asset whose name and contents
+      # disagree is worse than a failed build: it would be published, hashed,
+      # and believed.
+      - name: Name the asset and check what it reports
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          asset="pgpushy-$version-${{ matrix.suffix }}"
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/pgpushy" "dist/$asset"
+          chmod +x "dist/$asset"
+          reported=$("./dist/$asset" --version)
+          if [ "$reported" != "pgpushy $version" ]; then
+            echo "$asset reports '$reported', expected 'pgpushy $version'" >&2
+            exit 1
+          fi
+          echo "$reported"
+
+      # One artifact per leg. On a tag these are what the release job
+      # assembles; on a manual run they are the whole output — downloadable
+      # from the run's summary page, which is how a change to this workflow
+      # gets tested without releasing anything.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pgpushy-${{ matrix.suffix }}
+          path: dist/pgpushy-*-${{ matrix.suffix }}
+          if-no-files-found: error
+
+  release:
+    name: GitHub release
+    needs: build
+    # Only a tag names a release to attach assets to. A manual run stops after
+    # `build`, having produced the binaries as artifacts and nothing public.
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      # The only job that writes anything to this repository. The workflow's
+      # default stays read-only so that raising it is visible here.
+      contents: write
+    steps:
+      # For CHANGELOG.md; the release notes are read out of the tagged tree
+      # rather than written twice.
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: pgpushy-*
+          merge-multiple: true
+
+      # `sha256sum` format with bare filenames, so that a consumer who has
+      # downloaded the assets into one directory can run `sha256sum -c
+      # SHA256SUMS` there without editing it first. This is the same guarantee
+      # pgpushy demands of pgschema, which ships no checksums and forces
+      # pgpushy to carry hashes for it (spec §8.5).
+      - name: Checksum the assets
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          sha256sum pgpushy-* > SHA256SUMS
+          cat SHA256SUMS
+
+      # The CHANGELOG is the release notes; keeping them in one place means
+      # they cannot drift. A version with no section is a bug in the release
+      # rather than a reason to fail it at the last step, so the fallback
+      # points at the file and lets the release through.
+      - name: Extract the release notes from the CHANGELOG
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          awk -v heading="## [$version]" '
+            index($0, heading) == 1 { found = 1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md | sed -e '/./,$!d' > notes.md
+          if [ ! -s notes.md ]; then
+            echo "no '## [$version]' section in CHANGELOG.md; linking it instead" >&2
+            echo "See [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/CHANGELOG.md) for what changed in this release." > notes.md
+          fi
+          cat notes.md
+
+      # Re-runnable, like the crates job: a run that uploaded three of five
+      # assets before a network failure has to be repairable by pressing
+      # re-run. So an existing release is updated rather than recreated, and
+      # `--clobber` replaces assets already attached instead of refusing them.
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "release $GITHUB_REF_NAME exists; updating it"
+            gh release edit "$GITHUB_REF_NAME" --notes-file notes.md
+          else
+            gh release create "$GITHUB_REF_NAME" --notes-file notes.md
+          fi
+          gh release upload "$GITHUB_REF_NAME" dist/* --clobber
