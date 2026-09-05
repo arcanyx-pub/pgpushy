@@ -496,6 +496,21 @@ should get the newest release that has actually been tested.
 
 ## Installing
 
+Every [release](https://github.com/arcanyx-pub/pgpushy/releases) carries a
+prebuilt CLI for Linux and macOS on amd64 and arm64, named
+`pgpushy-<version>-<os>-<arch>`, with a `SHA256SUMS` file beside it. The Linux
+builds are static, so they need nothing installed to run:
+
+```sh
+ver=X.Y.Z plat=linux-amd64   # a published release; darwin-arm64, etc.
+base=https://github.com/arcanyx-pub/pgpushy/releases/download/v$ver
+curl -fsSL -O "$base/pgpushy-$ver-$plat" -O "$base/SHA256SUMS"
+sha256sum --ignore-missing -c SHA256SUMS   # shasum -a 256 -c on macOS
+chmod +x "pgpushy-$ver-$plat"
+```
+
+Or build it from crates.io, which needs libclang (see [Building](#building)):
+
 ```console
 $ cargo install pgpushy
 ```

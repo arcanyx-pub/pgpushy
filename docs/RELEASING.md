@@ -18,6 +18,15 @@ or in one spelled differently, is refused at the token exchange. Both crates
 carry the same entry — the workflow publishes both, and fails on whichever was
 missed.
 
+A release has a second half. The same tag also builds the `pgpushy` CLI for
+four platforms and attaches those binaries, with a `SHA256SUMS` file, to a
+GitHub release — see [The release binaries](#the-release-binaries). The two
+halves are independent jobs in
+[`publish.yml`](../.github/workflows/publish.yml): neither waits on the other,
+because they fail for unrelated reasons, and each is re-runnable, so a release
+where one half went red is repaired by re-running the workflow rather than by
+cutting a new version.
+
 **Why lockstep:** one version, one CHANGELOG, one tag. `pgpushy` depends on
 `pgpushy-core` at an exact version anyway, and while the two move together
 there is nothing to gain from separate numbering. Worth revisiting if
@@ -99,6 +108,82 @@ never build one like it (impl-plan §1).
    already exists and `just publish` will refuse the retry — delete the tag
    locally and on the remote first. Each publish step skips a version already
    in the index, so re-running after a half-finished release is safe.
+
+   The same tag runs the build matrix and the release job alongside that, so
+   the GitHub release with the four binaries appears without a second action.
+
+## The release binaries
+
+`cargo install pgpushy` compiles libpg_query's C sources through `bindgen`,
+which needs libclang and costs minutes. That is fine on a workstation and
+wrong in a CI job, so every release also ships a built CLI for the four
+platforms pgpushy itself supports:
+
+| asset | runner | target |
+| --- | --- | --- |
+| `pgpushy-X.Y.Z-linux-amd64` | `ubuntu-latest` | `x86_64-unknown-linux-musl` |
+| `pgpushy-X.Y.Z-linux-arm64` | `ubuntu-24.04-arm` | `aarch64-unknown-linux-musl` |
+| `pgpushy-X.Y.Z-darwin-amd64` | `macos-15-intel` | `x86_64-apple-darwin` |
+| `pgpushy-X.Y.Z-darwin-arm64` | `macos-latest` | `aarch64-apple-darwin` |
+
+The naming is `pgpushy-<version>-<os>-<arch>`, deliberately the same shape as
+pgschema's own release assets — the ones the managed backend already downloads
+and verifies (spec §8.5). Anything that can fetch one can fetch these.
+
+Every leg builds natively on a runner of that architecture. `pg_query`
+compiles C and generates bindings, so cross-compiling would mean a cross C
+toolchain and a matching libclang sysroot per target; GitHub hosts a runner
+for each of the four, which is cheaper in every sense. The Linux binaries are
+**statically linked against musl**, so they carry no glibc floor inherited
+from whichever runner image built them.
+
+The release also carries a `SHA256SUMS` file in `sha256sum` format with bare
+filenames, so a consumer who has downloaded assets into one directory can
+verify them in place:
+
+```console
+$ sha256sum -c SHA256SUMS
+```
+
+### Dry-running the build
+
+The workflow accepts `workflow_dispatch`, and a manual run builds the matrix
+and stops: it uploads the four binaries as workflow artifacts and publishes
+nothing. Both jobs that publish — the crates and the GitHub release — are
+gated on the event being a tag push. So a change to the build can be tested
+from a branch before it is merged:
+
+```console
+$ gh workflow run publish.yml --ref <branch>
+$ gh run watch
+```
+
+The artifacts are on the run's summary page. Download one and run it — a
+binary that builds is not yet a binary that works.
+
+### What to check on the first real run
+
+- **All four legs are green.** `fail-fast` is off, so one bad runner image
+  reports as one red leg rather than cancelling the other three.
+- **The assets are named for the tag's version** and each one's `--version`
+  agrees. The build asserts this itself, but it is the claim the whole thing
+  rests on.
+- **`sha256sum -c SHA256SUMS` passes** against freshly downloaded assets,
+  from a different machine than the one that read the release page.
+- **The Linux binaries are static** — `file pgpushy-*-linux-*` should say
+  `static-pie linked`, and `ldd` should say `statically linked`. Run one on a
+  distro with a different libc, since that is the property being claimed.
+- **The release notes are that version's CHANGELOG section**, not the
+  fallback link. The fallback means the CHANGELOG heading did not match.
+
+### Retrying
+
+The release job is re-runnable: an existing release is updated rather than
+recreated, and assets are uploaded with `--clobber`. A run that failed
+partway — three assets attached, a network error on the fourth — is repaired
+by re-running the job, not by deleting the release or cutting a new version.
+The crates job is independently re-runnable in the same way, and re-running
+the whole workflow is safe when only one half failed.
 
 ## What the first workflow run showed
 
