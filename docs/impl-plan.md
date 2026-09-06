@@ -2,7 +2,7 @@
 
 **Status:** Build guidance (non-normative)
 **Date:** 2026-08-31
-**Companion to:** [`docs/spec.md`](./spec.md) v0.7 (normative)
+**Companion to:** [`docs/spec.md`](./spec.md) v0.8 (normative)
 
 This plan says *how* to build what `spec.md` defines. Where they disagree, the
 spec wins. It is written to be read cold: §1 distills everything we learned
