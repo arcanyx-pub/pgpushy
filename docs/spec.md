@@ -1,7 +1,7 @@
 # pgpushy Specification
 
-**Version:** 0.7
-**Date:** 2026-08-31
+**Version:** 0.8
+**Date:** 2026-09-06
 **Status:** All design decisions resolved (§15).
 
 This document specifies **pgpushy**, a declarative Postgres schema-management
@@ -519,7 +519,7 @@ execute a configured command; generation is upstream of discovery, and
 everything downstream reads only files. Output that is not persisted is
 ambient input: `plan` and `apply` could disagree when the tool changes between
 them, review never sees the schema a dependency bump changed, and a persisted
-plan (§14) stops being reproducible from the tree. This is the same family of
+plan (§8.9) stops being reproducible from the tree. This is the same family of
 hazard as the working-directory `.pgschemaignore` (§8.4) and `PG*` overrides
 (§10.2), and it gets the same answer. Running generators at plan or apply time
 is listed in §14, to be built only against demonstrated need.
@@ -533,8 +533,9 @@ enforcement.
 > binary. The lockfile then pins the SQL's provenance, and `--check` fails the
 > moment an upgrade changes it. Two operational notes: `generate` executes
 > repository-configured commands, so CI should never run it on untrusted input
-> (the `pull_request_target` hazard in
-> [`github-action-sketch.md`](./github-action-sketch.md)); and removing a
+> (the `pull_request_target` hazard the
+> [action](https://github.com/arcanyx-pub/pgpushy-action#never-use-this-with-pull_request_target)
+> spells out); and removing a
 > `[[generate]]` entry leaves its marked output behind as an ordinary source
 > file — still discovered, still applied — so delete the file in the same
 > change.
@@ -1376,6 +1377,17 @@ the target, so the already-applied schemas' fingerprints no longer match and
 the artifact is spent; pgpushy MUST say so when reporting the partial
 failure.
 
+> **Non-normative.** The deployment shape this surface exists for is served by
+> [`pgpushy-action`](https://github.com/arcanyx-pub/pgpushy-action): one job
+> plans under a preview role and uploads the artifact, a second applies
+> exactly it under a deploy role, behind the required reviewers of a GitHub
+> `environment:` — which is the approval §8.6 asks for and a non-interactive
+> run cannot seek for itself. Measured with 0.3.2: "the deploy environment
+> carries no source tree" does not extend to the configuration file. `apply
+> --plan` reads a `pgpushy.toml`, because `--env <name>` names a block in one
+> (§10.2), so the deploy job carries one — a file holding nothing but that
+> `[env.<name>]` block is enough — and nothing else of the tree.
+
 ## 9. Failure Handling
 
 `apply` MUST stop at the first schema whose apply fails; it MUST NOT continue
@@ -1903,19 +1915,6 @@ work (§14).
   tool has it ([pgmold](https://github.com/fmguerreiro/pgmold) is one to look
   at), or the diffing belongs in pgpushy after all — that last reverses G3 —
   is a decision rather than a task.
-- **Release binaries, and a GitHub Action.** pgpushy publishes to crates.io
-  only, so installing it in CI means libclang, `bindgen` and compiling
-  libpg_query's C sources on every run. Per-platform release binaries would fix
-  that, and pgpushy has already designed the shape once — its managed provider
-  downloads, verifies and caches exactly such binaries for pgschema (§8.5).
-
-  They are the prerequisite for an action, which is where the §8.9 plan
-  artifact stops being a CLI feature and starts being useful: GitHub's
-  `environment:` with required reviewers is the approval gate that design
-  needs, two environments give the preview and deploy roles their separate
-  credentials, and an uploaded artifact is what makes the approval apply to a
-  reviewed object rather than a recomputed one. See
-  [`github-action-sketch.md`](./github-action-sketch.md).
 - **Plan-database hygiene** — an external plan database accumulates state
   across runs (§10.4), and stale objects can make a broken desired state
   appear to work. With grants making an external plan database mandatory for
@@ -2183,7 +2182,7 @@ made after draft 2 of v0.1.
   `generate` is upstream of discovery; `validate`, `plan` and `apply` execute
   no configured command and read only files. Unvendored generator output is
   ambient input: plan and apply can disagree across tool versions, review
-  never sees the schema a dependency bump changed, and a persisted plan (§14)
+  never sees the schema a dependency bump changed, and a persisted plan (§8.9)
   stops being reproducible from the tree — the same family as the rejected
   working-directory `.pgschemaignore` and `PG*` overrides, with the same
   answer. Version authority is delegated to the repository's own lockfile by
@@ -2300,3 +2299,24 @@ made after draft 2 of v0.1.
   database sidesteps it, but a floor that only holds under a non-default
   configuration is not a floor. Floor and pin coincide until a newer pin is
   tested. (§13)
+- **[0.8] Release binaries, and the action they make possible** — a release
+  tag builds `pgpushy-<version>-<os>-<arch>` for the platforms pgschema
+  publishes for — Linux and macOS, amd64 and arm64 — beside a `SHA256SUMS`
+  file. The asset naming, the SHA-256 verification and the
+  cache-by-version-and-platform are §8.5's shape, reused: pgpushy's managed
+  provider already is a downloader and verifier of exactly such binaries.
+  They are what makes pgpushy installable in CI, where a crates.io install
+  means libclang, `bindgen` and libpg_query's C sources on every run. §8.9's
+  artifact flow is then served by
+  [`pgpushy-action`](https://github.com/arcanyx-pub/pgpushy-action), in a
+  repository of its own so `@v1` tagging works the way consumers expect. The
+  approval is GitHub's: required reviewers on the job's `environment:` have
+  answered before the job starts, so artifact apply there always passes
+  `--auto-approve`. The destructive opt-out stays `allow_destructive` per
+  environment (§10.2) and the action offers no input for it, since a flag
+  disabling a safety check per invocation is the hazard configuration exists
+  to prevent. One point measured rather than assumed (0.3.2): the deploy job
+  carries no source tree, but it does carry a `pgpushy.toml`, because `--env
+  <name>` names a block in one. The action's own CI exercises the artifact
+  path end to end, the wrong-target refusal included — the failure this whole
+  shape exists to prevent. (§8.5, §8.9, §9.1, §10.2)

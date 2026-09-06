@@ -346,6 +346,93 @@ error: unsupported statement: CREATE VIEW
 2 problems found in the source tree
 ```
 
+## In CI
+
+[`arcanyx-pub/pgpushy-action`](https://github.com/arcanyx-pub/pgpushy-action)
+runs pgpushy in GitHub Actions, and is where the plan artifact stops being a
+CLI feature. It installs a release binary — verified against the release's
+`SHA256SUMS` — plans against a real database and posts the plan as a pull
+request comment, and applies **exactly the plan that was reviewed** behind an
+environment's required reviewers. Two jobs:
+
+```yaml
+# .github/workflows/schema.yml
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    environment: db-preview          # credentials that can read, not write
+    permissions:
+      contents: read
+      pull-requests: write           # only for `comment: true`
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: arcanyx-pub/pgpushy-action@v1
+        with:
+          command: plan
+          version: 0.3.2
+          env: prod                  # the [env.prod] block in pgpushy.toml
+          plan-out: ./plan
+          # A fork's token cannot comment, so asking it to would fail the run.
+          comment: ${{ !github.event.pull_request.head.repo.fork }}
+        env:
+          PGPASSWORD: ${{ secrets.DB_PREVIEW_PASSWORD }}
+
+      # The reviewed object. A destructive plan exits 2 and fails the step
+      # above, so nothing reaches here for a human to approve by accident.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: pgpushy-plan
+          path: ./plan
+
+  apply:
+    needs: plan
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: db-deploy           # required reviewers — this is the gate
+    steps:
+      # Not the source tree: the apply order, the plans and the seeds all
+      # live in the artifact. What this job needs from the repository is the
+      # one file that says which database `prod` is.
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: pgpushy.toml
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: pgpushy-plan
+          path: ./plan
+
+      - uses: arcanyx-pub/pgpushy-action@v1
+        with:
+          command: apply
+          version: 0.3.2
+          env: prod
+          plan: ./plan               # apply exactly this
+        env:
+          PGPASSWORD: ${{ secrets.DB_DEPLOY_PASSWORD }}
+```
+
+Approval is GitHub's: the required reviewers on `db-deploy` have answered by
+the time the job starts, so `apply` runs with `--auto-approve`. There is no
+`allow_destructive` input either — destructive tolerance is a property of the
+target rather than of a run, so it stays in that environment's block in
+`pgpushy.toml`, where changing it is a reviewed diff.
+
+The action's own README carries the detail: every input and output, the
+offline `validate` and `generate --check` jobs that need no database, how the
+plan comment is edited in place, and why `pull_request_target` is never the
+event to run this on.
+
 ## Configuration
 
 pgpushy requires a `pgpushy.toml`. It reconciles a whole database, so it will
