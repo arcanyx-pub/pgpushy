@@ -2326,7 +2326,8 @@ decision it sits in, landing in that version.
   means libclang, `bindgen` and libpg_query's C sources on every run. §8.9's
   artifact flow is then served by
   [`pgpushy-action`](https://github.com/arcanyx-pub/pgpushy-action), in a
-  repository of its own so `@v1` tagging works the way consumers expect; it
+  repository of its own so major-version tagging (`@v2`) works the way
+  consumers expect; it
   is worth the second repository because the CLI alone is not where teams
   meet a schema tool — Atlas's `ariga/atlas-action` is a large part of why
   Atlas is adoptable. It is a **composite** action, not Docker and not

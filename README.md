@@ -523,8 +523,8 @@ install-cli`.
 
 [`arcanyx-pub/pgpushy-action`](https://github.com/arcanyx-pub/pgpushy-action)
 runs pgpushy in GitHub Actions, and is where the plan artifact stops being a
-CLI feature. It installs a release binary — verified against the release's
-`SHA256SUMS` — plans against a real database and posts the plan as a pull
+CLI feature. It installs the pgpushy release the action pins — verified against a hash the
+action ships — plans against a real database and posts the plan as a pull
 request comment, and applies **exactly the plan that was reviewed** behind an
 environment's required reviewers.
 
@@ -535,17 +535,15 @@ under credentials that can write, in an environment whose required reviewers
 are the gate. The two pgpushy steps at the heart of it:
 
 ```yaml
-- uses: arcanyx-pub/pgpushy-action@v1
+- uses: arcanyx-pub/pgpushy-action@v2
   with:
     command: plan
-    version: 0.3.2
     env: prod                  # the [env.prod] block in pgpushy.toml
     plan-out: ./plan
 
-- uses: arcanyx-pub/pgpushy-action@v1
+- uses: arcanyx-pub/pgpushy-action@v2
   with:
     command: apply
-    version: 0.3.2
     env: prod
     plan: ./plan               # apply exactly this
 ```
