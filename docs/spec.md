@@ -2017,11 +2017,12 @@ decision it sits in, landing in that version.
   passes them explicitly to pgschema, making divergent resolution impossible
   by construction rather than detecting it afterwards. (§6.3, §6.4, §13)
 - **pgschema version & resolution** — **[0.4]** the floor and the pin are
-  separate numbers: the floor is the *oldest* tested version (`>= v1.12.0`
-  today) and the pin is the *newest* (`v1.12.3`), with both ends in the CI
-  matrix. A BYO operator is not made to upgrade for a release pgpushy merely
-  prefers, and a managed one gets the most fixed release that was tested. The
-  floor tracks pgpushy's CI matrix and is **not overridable**.
+  separate numbers: the floor is the *oldest* tested version and the pin is
+  the *newest*, with both ends in the CI matrix. §13 carries the numbers, so
+  a version bump never has to edit this record. A BYO operator is not made to
+  upgrade for a release pgpushy merely prefers, and a managed one gets the
+  most fixed release that was tested. The floor tracks pgpushy's CI matrix and
+  is **not overridable**.
   pgpushy resolves the binary through a provider: managed download (intended
   default, pinned + SHA-256-verified) with a permanent BYO override that
   parses `pgschema --help` and enforces the floor. The plan was for the first

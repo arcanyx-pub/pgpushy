@@ -18,9 +18,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   table and the second run against the same plan database is still refused
   by name, while a single-schema project still re-plans against one
   indefinitely. 1.13.0 is a fixes-only release, all of it dependency
-  ordering and sequence modelling, and it moves none of the flags, version
-  reporting or plan JSON pgpushy reads. The floor stays at 1.12.3, and the
-  CI matrix now runs the two ends alone — 1.12.3 and 1.13.0 — since a
+  ordering and sequence modelling. Every *shape* pgpushy reads is unchanged
+  — the same flags, the same `Version:` line, the same plan JSON — but a
+  plan's *content* can differ, in one way: pgschema now models sequence
+  ownership, so a sequence the target owns and the source tree declares
+  standalone plans a single `ALTER SEQUENCE … OWNED BY NONE` where 1.12.5
+  planned nothing at all. That step is already inside pgpushy's model, so
+  §8.4's tripwire passes it and §8.6 classifies it as non-destructive; a new
+  integration test pins the step, the classification, and that applying it
+  converges, at both ends of the CI matrix. The floor stays at 1.12.3, and
+  the CI matrix now runs the two ends alone — 1.12.3 and 1.13.0 — since a
   version between them tests nothing the ends do not.
 ## [0.3.2] - 2026-09-06
 

@@ -1423,6 +1423,143 @@ fn a_tree_with_types_domains_and_sequences_converges() {
     assert_eq!(increment, 5);
 }
 
+/// The pgschema version under test, read the way pgpushy reads it: the
+/// `Version:` line in `--help`, since pgschema has no `--version` flag.
+///
+/// `None` when the line cannot be read, which callers treat as "too old to
+/// promise the newer behaviour" rather than failing the run.
+fn pgschema_version(path: &Path) -> Option<(u64, u64, u64)> {
+    let output = std::process::Command::new(path)
+        .arg("--help")
+        .output()
+        .ok()?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let line = text
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Version:"))?;
+    let number = line.split_whitespace().next()?.split('@').next()?;
+    let mut parts = number.split('.');
+    let mut next = || parts.next()?.parse::<u64>().ok();
+    Some((next()?, next()?, next()?))
+}
+
+/// Sequence *ownership* drift: the one new step pgschema 1.13.0 can hand
+/// pgpushy (impl-plan §1).
+///
+/// The target's sequence is owned by a column and the source tree declares
+/// the same sequence standalone. From 1.13.0 that difference is modelled and
+/// plans as a single `ALTER SEQUENCE ... OWNED BY NONE`; at the floor it is
+/// invisible and the same pair plans nothing. Measured on PG 18.4: 1.12.3 and
+/// 1.12.5 plan zero steps here, 1.13.0 plans exactly one.
+///
+/// Ownership is deliberately independent of any column default. §4.3 refuses
+/// a source tree that defaults a column to `nextval`, so this — ownership set
+/// out of band on a column that does not default to it — is the only shape in
+/// which an owned sequence reaches pgpushy at all.
+///
+/// The invariants are asserted at both ends of the matrix, since both ends
+/// run in CI: whatever is planned stays inside pgpushy's model (§8.4 — an
+/// unmanaged kind exits non-zero before this assertion is reached), nothing
+/// is destructive (§8.6), and apply converges. The step itself is asserted
+/// only where the binary is new enough to plan it.
+#[test]
+fn a_sequence_ownership_difference_plans_an_alter_and_converges() {
+    let target = require_target!();
+    let schema = unique_schema("seqown");
+    let _schemas = Schemas::create(&target, std::slice::from_ref(&schema));
+
+    // The drift, set out of band: ownership the source tree does not describe.
+    target
+        .client()
+        .batch_execute(&format!(
+            "CREATE SEQUENCE {schema}.s;
+             CREATE TABLE {schema}.t (id int PRIMARY KEY);
+             ALTER SEQUENCE {schema}.s OWNED BY {schema}.t.id;"
+        ))
+        .expect("set up the owned sequence");
+
+    let project = target.project(
+        &format!("default_schema = \"{schema}\""),
+        &[(
+            "schema.sql",
+            "CREATE SEQUENCE s;
+             CREATE TABLE t (id int PRIMARY KEY);"
+                .to_owned(),
+        )],
+    );
+
+    // Through the artifact, because summary.json *is* the classification:
+    // its totals are `step_count()` and `destructive_drops().len()`.
+    let art = project.dir.path().join("artifact");
+    project
+        .command("plan")
+        .arg("--plan-out")
+        .arg(&art)
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("cannot describe").not());
+
+    let read = |path: PathBuf| -> serde_json::Value {
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("reading {}: {err}", path.display()));
+        serde_json::from_str(&text).expect("the artifact holds JSON")
+    };
+    let summary = read(art.join("summary.json"));
+    assert_eq!(
+        summary["total"]["destructive"].as_u64(),
+        Some(0),
+        "ownership drift removes nothing"
+    );
+
+    // The manifest names the plan file; nothing here re-derives it.
+    let manifest = read(art.join("manifest.json"));
+    let plan_name = manifest["schemas"][0]["plan"]
+        .as_str()
+        .expect("the manifest names a plan file")
+        .to_owned();
+    let plan = read(art.join(plan_name));
+    let steps: Vec<&serde_json::Value> = plan["groups"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|group| group["steps"].as_array())
+        .flatten()
+        .collect();
+
+    if pgschema_version(&target.pgschema).is_some_and(|version| version >= (1, 13, 0)) {
+        assert_eq!(
+            steps.len(),
+            1,
+            "one step, the ownership alter; got: {steps:?}"
+        );
+        assert_eq!(steps[0]["type"].as_str(), Some("sequence"));
+        assert_eq!(steps[0]["operation"].as_str(), Some("alter"));
+        assert_eq!(summary["total"]["steps"].as_u64(), Some(1));
+    } else {
+        assert_eq!(
+            summary["total"]["steps"].as_u64(),
+            Some(0),
+            "the floor does not model ownership; got: {steps:?}"
+        );
+    }
+
+    project
+        .command("apply")
+        .arg("--auto-approve")
+        .assert()
+        .success();
+
+    project
+        .command("plan")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("No changes detected"));
+}
+
 // ---------------------------------------------------------------------------
 // Seeds (spec §8.8): execution and the convergence probe, against a real
 // database. The offline rules are covered in pgpushy-core/tests/seeds.rs.

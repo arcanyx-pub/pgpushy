@@ -348,25 +348,50 @@ commands are in [Appendix A](#appendix-a-reproduction-harness).
   re-plans against the same plan database indefinitely: three consecutive
   runs succeeded and its named schema stayed empty. The full integration
   suite passes against 1.13.0.
-- **1.13.0 moves nothing pgpushy reads.** The `Version:` line keeps its
-  `X.Y.Z@<hash> <os>/<arch> <buildtime>` shape, and `plan`/`apply` expose the
+- **1.13.0 moves no *shape* pgpushy reads.** The `Version:` line keeps its
+  `X.Y.Z@<hash> <os>/<arch> <buildtime>` form, and `plan`/`apply` expose the
   same flags as 1.12.5. The release is fixes only, all of it dependency
   ordering (expression indexes after the functions they call, quoted
   identifiers in function dependency detection, multi-file dump includes,
   aggregates and SQL function bodies after their views) and sequence
   modelling.
-- **Not measured, and the reason to look again: pgschema #573/#577/#578
-  narrow the SERIAL collapse.** From 1.13.0 a `nextval` default renders as
-  `SERIAL` only when the sequence is genuinely owned by the column *and*
-  carries Postgres' default `<table>_<column>_seq` name; any other sequence
-  keeps its explicit `DEFAULT nextval(...)` and gets an explicit
-  `CREATE SEQUENCE`, and an ownership-only difference now emits
-  `ALTER SEQUENCE … OWNED BY`. That is the exact mechanism spec §12.8 and
+- **Sequence ownership is newly modelled, and it is the only change in what
+  a plan can *contain*.** Measured by planning each pair with pgschema
+  directly, target state built out of band, `plan --output-json` read for
+  step type and operation:
+
+  | target vs source | 1.12.3 | 1.12.5 | 1.13.0 |
+  | --- | --- | --- | --- |
+  | sequence owned by a column; source declares it standalone | nothing | nothing | one `sequence` `alter` — `ALTER SEQUENCE s OWNED BY NONE;` |
+  | standalone sequence; source declares `OWNED BY t.id` | nothing | nothing | one `sequence` `alter` — `ALTER SEQUENCE s OWNED BY t.id;` |
+  | column written `serial`; target owns a differently-named sequence | `sequence` drop + `sequence` create + `table.column` alter | identical | identical |
+
+  Both new steps are `sequence`/`alter`, a kind already in `MODEL_KINDS`, so
+  §8.4's tripwire passes them and §8.6 counts them non-destructive. The third
+  row is the SERIAL collapse and is unchanged since the floor — it is not a
+  1.13.0 behaviour. Only the first row is reachable through pgpushy: §4.3
+  refuses a source tree that defaults a column to `nextval`, refuses
+  `CREATE SEQUENCE … OWNED BY`, and does not support `ALTER SEQUENCE` at all
+  — all three re-checked with `pgpushy validate` at this pin — so ownership
+  set out of band, on a column that does not default to the sequence, is the
+  one shape that reaches a plan. That row is verified end to end — `pgpushy
+  plan` reports `Plan: 1 to modify`, applies, and re-plans clean — and is
+  pinned by `a_sequence_ownership_difference_plans_an_alter_and_converges`,
+  which asserts the step where the binary is new enough to plan it, and the
+  invariants at both ends of the matrix.
+
+**Not measured while bumping to 1.13.0 — a lift candidate for a later pass**
+- **pgschema #573/#577/#578 narrow the SERIAL collapse.** From 1.13.0 a
+  `nextval` default renders as `SERIAL` only when the sequence is genuinely
+  owned by the column *and* carries Postgres' default `<table>_<column>_seq`
+  name; any other sequence keeps its explicit `DEFAULT nextval(...)` and gets
+  an explicit `CREATE SEQUENCE`. That is the exact mechanism spec §12.8 and
   the §4.3 rejections of `CREATE SEQUENCE … OWNED BY` and of `nextval`
   defaults rest on, so both become candidates to lift — but only on a
-  measurement that applies and re-plans, which this bump did not make. The
-  domain-default half of §12.8 is a different mechanism (pgschema applies
-  domains before sequences) and the notes do not touch it.
+  measurement that applies and re-plans a source tree carrying those forms,
+  which this bump did not make. The domain-default half of §12.8 is a
+  different mechanism (pgschema applies domains before sequences) and these
+  notes do not touch it.
 
 **Verified while designing the plan artifact (2026-08-31, pgschema 1.12.3)**
 - **`--output-json <path>` writes the plan to a file**, and `pgschema apply
@@ -1340,7 +1365,7 @@ Read version: `docker run --rm pgplex/pgschema:latest --help | grep '^Version:'`
 
 **Local development.** A longer-lived container serves the integration tests:
 Postgres as `pgpushy-dev` on port 55434 (`postgres`/`pw`), plus a pgschema
-1.12.3 binary anywhere on disk. Export `PGPUSHY_TEST_PG_URL` and
+binary at or above the floor (spec §13) anywhere on disk. Export `PGPUSHY_TEST_PG_URL` and
 `PGPUSHY_TEST_PGSCHEMA` to run them, `PGPUSHY_TEST_DOWNLOAD=1` to include the
 managed provider's real download, and run `just msrv` before pushing — a modern
 toolchain cannot see MSRV breakage, and CI has caught exactly that.
