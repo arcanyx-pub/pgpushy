@@ -1822,7 +1822,7 @@ work (§14).
   **floor** is the oldest version pgpushy is tested against — currently
   **v1.12.3** — expressed as a `>=` requirement; newer is accepted. The
   **pin** is the newest version pgpushy is tested against — currently
-  **v1.12.5** — and is what the managed backend downloads. Both ends MUST
+  **v1.13.0** — and is what the managed backend downloads. Both ends MUST
   appear in pgpushy's CI matrix, or one of them is a claim nothing tests.
 
   Keeping them apart answers two different questions. An operator who brings

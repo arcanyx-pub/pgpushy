@@ -338,6 +338,36 @@ commands are in [Appendix A](#appendix-a-reproduction-harness).
   cross-schema-FK ignore stubs (pgschema #549) did not alter this path. The
   full integration suite passes against 1.12.5.
 
+**Verified while bumping the pin to 1.13.0 (2026-09-08, PG 18.4)**
+- **Plan-database accumulation is unchanged at 1.13.0.** Measured with the
+  `example/` project against an external plan database on the same cluster:
+  the cross-schema closure member `app.orders` — pulled in by
+  `billing.invoices`'s foreign key — still lands as a real table there while
+  `billing` and `snowdrop` stay empty, and the §10.4 check still refuses the
+  second run by name, before delegating. A single-schema project still
+  re-plans against the same plan database indefinitely: three consecutive
+  runs succeeded and its named schema stayed empty. The full integration
+  suite passes against 1.13.0.
+- **1.13.0 moves nothing pgpushy reads.** The `Version:` line keeps its
+  `X.Y.Z@<hash> <os>/<arch> <buildtime>` shape, and `plan`/`apply` expose the
+  same flags as 1.12.5. The release is fixes only, all of it dependency
+  ordering (expression indexes after the functions they call, quoted
+  identifiers in function dependency detection, multi-file dump includes,
+  aggregates and SQL function bodies after their views) and sequence
+  modelling.
+- **Not measured, and the reason to look again: pgschema #573/#577/#578
+  narrow the SERIAL collapse.** From 1.13.0 a `nextval` default renders as
+  `SERIAL` only when the sequence is genuinely owned by the column *and*
+  carries Postgres' default `<table>_<column>_seq` name; any other sequence
+  keeps its explicit `DEFAULT nextval(...)` and gets an explicit
+  `CREATE SEQUENCE`, and an ownership-only difference now emits
+  `ALTER SEQUENCE … OWNED BY`. That is the exact mechanism spec §12.8 and
+  the §4.3 rejections of `CREATE SEQUENCE … OWNED BY` and of `nextval`
+  defaults rest on, so both become candidates to lift — but only on a
+  measurement that applies and re-plans, which this bump did not make. The
+  domain-default half of §12.8 is a different mechanism (pgschema applies
+  domains before sequences) and the notes do not touch it.
+
 **Verified while designing the plan artifact (2026-08-31, pgschema 1.12.3)**
 - **`--output-json <path>` writes the plan to a file**, and `pgschema apply
   --plan <path>` applies it across processes and time — the fingerprint is

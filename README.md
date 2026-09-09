@@ -217,10 +217,10 @@ $ pgpushy plan --env local
   2 tables, 1 foreign key, 1 index
 
   managed schemas: public
-  downloading pgschema 1.12.3 (linux-amd64)...
-  cached at /home/joe/.cache/pgpushy/pgschema/1.12.3/linux-amd64/pgschema
+  downloading pgschema 1.13.0 (linux-amd64)...
+  cached at /home/joe/.cache/pgpushy/pgschema/1.13.0/linux-amd64/pgschema
 
-  pgschema 1.12.3 (/home/joe/.cache/pgpushy/pgschema/1.12.3/linux-amd64/pgschema)
+  pgschema 1.13.0 (/home/joe/.cache/pgpushy/pgschema/1.13.0/linux-amd64/pgschema)
   env local: myapp_dev on 127.0.0.1:5432 (cluster 7668031834611146801)
 
 ── public ──
@@ -263,7 +263,7 @@ $ pgpushy apply --env local
 
   managed schemas: public
 
-  pgschema 1.12.3 (/home/joe/.cache/pgpushy/pgschema/1.12.3/linux-amd64/pgschema)
+  pgschema 1.13.0 (/home/joe/.cache/pgpushy/pgschema/1.13.0/linux-amd64/pgschema)
   env local: myapp_dev on 127.0.0.1:5432 (cluster 7668031834611146801)
 
 ── public ──
@@ -369,7 +369,7 @@ managed_schemas = ["app", "billing"]
 # a checksum it ships. Point it at your own binary instead if you prefer:
 # backend = "byo"
 # path    = "/usr/local/bin/pgschema"
-# version = "1.12.3"               # managed backend only
+# version = "1.13.0"               # managed backend only
 
 [env.local]
 db   = "myapp_dev"
@@ -471,7 +471,7 @@ suppressed automatically when output is not a terminal, and `--no-color` or
 
 By default pgpushy **downloads pgschema for you** and caches it under
 `$XDG_CACHE_HOME/pgpushy` — there is no install step. The pinned version is
-**1.12.3**. The download is over HTTPS and verified against a SHA-256 that
+**1.13.0**. The download is over HTTPS and verified against a SHA-256 that
 pgpushy ships for each version it pins, because pgschema publishes no checksums
 of its own. The cache is re-checked against that hash on every run rather than
 trusted for existing; a mismatch is reported and re-fetched rather than
