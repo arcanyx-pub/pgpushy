@@ -533,9 +533,9 @@ enforcement.
 > binary. The lockfile then pins the SQL's provenance, and `--check` fails the
 > moment an upgrade changes it. Two operational notes: `generate` executes
 > repository-configured commands, so CI should never run it on untrusted input
-> (the `pull_request_target` hazard the
-> [action](https://github.com/arcanyx-pub/pgpushy-action#never-use-this-with-pull_request_target)
-> spells out); and removing a
+> — the hazard the [action](https://github.com/arcanyx-pub/pgpushy-action)
+> spells out, since `pull_request_target` would run a fork's `[[generate]]`
+> command with the base repository's secrets in scope; and removing a
 > `[[generate]]` entry leaves its marked output behind as an ordinary source
 > file — still discovered, still applied — so delete the file in the same
 > change.
@@ -1310,8 +1310,11 @@ the artifact is precisely what its reviewer gates on. `apply` MAY be
 given `--plan <dir>`, and then applies **exactly that artifact**: no
 discovery, no parsing, no synthesis — the deploy environment carries no
 source tree, because the apply order lives in the artifact and source drift
-after planning is not the apply step's business. This is the surface for the
-deployment shape a CLI prompt cannot serve: plan under a preview role,
+after planning is not the apply step's business. A `pgpushy.toml` is still
+required there, as everywhere (§10.1): `--env <name>` names a block in one
+(§10.2), so the deploy environment carries that one file and nothing else of
+the tree — see the note at the end of this section. This is the surface for
+the deployment shape a CLI prompt cannot serve: plan under a preview role,
 persist the plan, review and approve *that artifact*, apply exactly it under
 a deploy role.
 
@@ -1381,12 +1384,21 @@ failure.
 > [`pgpushy-action`](https://github.com/arcanyx-pub/pgpushy-action): one job
 > plans under a preview role and uploads the artifact, a second applies
 > exactly it under a deploy role, behind the required reviewers of a GitHub
-> `environment:` — which is the approval §8.6 asks for and a non-interactive
-> run cannot seek for itself. Measured with 0.3.2: "the deploy environment
-> carries no source tree" does not extend to the configuration file. `apply
-> --plan` reads a `pgpushy.toml`, because `--env <name>` names a block in one
-> (§10.2), so the deploy job carries one — a file holding nothing but that
-> `[env.<name>]` block is enough — and nothing else of the tree.
+> `environment:`. Those reviewers stand in for **step 5** of §8.6 — the
+> prompt, which a non-interactive run cannot seek for itself. Steps 1 through
+> 4 run as they do anywhere: the plans presented together, the counts, the
+> destructive changes called out, the empty-desired-state warnings and the
+> seed statement counts. What the reviewers read is that material as the plan
+> job published it — a pull request comment or a step summary — since GitHub's
+> approval dialog shows none of it. `--auto-approve` skips that step alone:
+> every check this section's own list runs before it still runs. On the
+> configuration file this section says what §10.1 already requires
+> unconditionally: `apply --plan` reads no source tree, but it does read a
+> `pgpushy.toml`, because `--env <name>` names a block in one (§10.1, §10.2),
+> so the deploy job carries that file — one holding nothing but the
+> `[env.<name>]` block is enough — and nothing else of the tree. Confirmed
+> with 0.3.2: artifact apply refuses without it, exactly as §10.1 says it
+> must.
 
 ## 9. Failure Handling
 
@@ -1950,8 +1962,10 @@ work (§14).
 
 ## 15. Decision Log
 
-All decisions identified for 0.1 are resolved. Decisions marked **[0.2]** were
-made after draft 2 of v0.1.
+All decisions identified for 0.1 are resolved. A bracketed version marks the
+spec version a decision landed in — **[0.2]** is one made after draft 2 of
+v0.1 — and a bracketed version inside an entry marks an amendment to the
+decision it sits in, landing in that version.
 
 - **Object scope** — tables, indexes, table constraints, foreign keys,
   and comments. **[0.2]** Anything else is **rejected** with a diagnostic
@@ -2255,7 +2269,7 @@ made after draft 2 of v0.1.
   (§4.5)
 - **[0.7] The plan artifact** — the four decisions of 2026-08-19, now built
   as §8.9: the apply order lives in the manifest, never re-derived, so the
-  deploy environment carries no checkout; the §6.2 check re-runs at apply
+  deploy environment needs no checkout; the §6.2 check re-runs at apply
   against a fresh inspection, because the per-schema fingerprint cannot see a
   relationship between two schemas; the artifact records `system_identifier`
   and database name and apply refuses a different target, since the
@@ -2264,7 +2278,9 @@ made after draft 2 of v0.1.
   earned since: the manifest carries each plan's SHA-256, and it carries the
   checked **seed statements** verbatim — seeds are part of the reviewed unit
   (§8.8), and an artifact that applied the schemas but not the rows would
-  deliver half of what was approved. (§8.9)
+  deliver half of what was approved. **[0.8]** No *source tree*; a sparse
+  checkout of `pgpushy.toml` remains, because `--env` names a block in one
+  (§10.1, §10.2). (§8.9)
 - **[0.7] The ignore file is part of a plan's identity** — measured at
   1.12.3: `pgschema apply --plan` refuses the very plan it wrote when run
   from a directory without the `.pgschemaignore` it was planned under, because
@@ -2309,14 +2325,25 @@ made after draft 2 of v0.1.
   means libclang, `bindgen` and libpg_query's C sources on every run. §8.9's
   artifact flow is then served by
   [`pgpushy-action`](https://github.com/arcanyx-pub/pgpushy-action), in a
-  repository of its own so `@v1` tagging works the way consumers expect. The
-  approval is GitHub's: required reviewers on the job's `environment:` have
-  answered before the job starts, so artifact apply there always passes
-  `--auto-approve`. The destructive opt-out stays `allow_destructive` per
+  repository of its own so `@v1` tagging works the way consumers expect; it
+  is worth the second repository because the CLI alone is not where teams
+  meet a schema tool — Atlas's `ariga/atlas-action` is a large part of why
+  Atlas is adoptable. It is a **composite** action, not Docker and not
+  JavaScript: fetching one binary and running it is not worth a container
+  pull, and a Rust CLI's consumers should not be made to carry a Node
+  runtime. The approval is GitHub's: required reviewers on the job's
+  `environment:` stand in for §8.6's **step 5**, the prompt — steps 1 through
+  4 still run, presenting the plans, the counts, the destructive callouts,
+  the empty-desired-state warnings and the seed statement counts, and what
+  those reviewers read is the plan job's pull request comment or step
+  summary, since GitHub's approval dialog shows none of it. The action passes
+  `--auto-approve` on every `apply`, artifact or not, and that flag skips
+  step 5 alone. The destructive opt-out stays `allow_destructive` per
   environment (§10.2) and the action offers no input for it, since a flag
   disabling a safety check per invocation is the hazard configuration exists
-  to prevent. One point measured rather than assumed (0.3.2): the deploy job
-  carries no source tree, but it does carry a `pgpushy.toml`, because `--env
-  <name>` names a block in one. The action's own CI exercises the artifact
-  path end to end, the wrong-target refusal included — the failure this whole
-  shape exists to prevent. (§8.5, §8.9, §9.1, §10.2)
+  to prevent. §8.9's prose is reconciled with §10.1's unconditional MUST:
+  artifact apply reads no source tree, but a `pgpushy.toml` is required there
+  as everywhere, because `--env <name>` names a block in one (§10.1, §10.2) —
+  confirmed with 0.3.2. The action's own CI exercises the artifact path end
+  to end, the wrong-target refusal included — the failure this whole shape
+  exists to prevent. (§8.5, §8.6, §8.9, §9.1, §10.1, §10.2)

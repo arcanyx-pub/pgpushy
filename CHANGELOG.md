@@ -15,10 +15,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   role, upload the artifact, apply exactly it behind an environment's required
   reviewers, which is where the approval lives. Spec §15 records the decision
   as **[0.8]**.
-- **The apply end of an artifact needs a `pgpushy.toml`** (spec §8.9), measured
-  with 0.3.2 and now written down: it reads no source tree, but `--env <name>`
-  names a block in a configuration file, so the deploy job carries one — a file
-  holding nothing but that `[env.<name>]` block is enough.
+- **The apply end of an artifact needs a `pgpushy.toml`** (spec §8.9): it reads
+  no source tree, but `--env <name>` names a block in a configuration file, so
+  the deploy job carries one — a file holding nothing but that `[env.<name>]`
+  block is enough. §10.1 requires the file unconditionally; §8.9 now says so
+  too, confirmed with 0.3.2.
+- **Documentation: what the action's approval gate does and does not cover.**
+  Spec §8.9, §15 and the README now say that an environment's required
+  reviewers stand in for step 5 of §8.6 — the prompt — and that what they
+  review is the plan job's comment or step summary, since GitHub's approval
+  dialog shows neither the plans nor the destructive callouts. The README's
+  `## In CI` section points at the action's README for the canonical workflow
+  rather than carrying a copy of it.
 
 ## [0.3.2] - 2026-09-06
 
