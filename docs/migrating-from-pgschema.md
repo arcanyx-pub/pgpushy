@@ -486,7 +486,7 @@ Notes for someone arriving from pgschema's flags:
   loudly when the password it used came from the file instead.
 - **All five libpq `sslmode` values work**, including `verify-ca` and
   `verify-full`, which pgpushy interprets itself.
-- **pgschema is downloaded by default** — pinned to 1.12.3, verified against a
+- **pgschema is downloaded by default** — pinned to 1.13.0, verified against a
   SHA-256 pgpushy ships, and cached. Set `backend = "byo"` or a `path` to use
   your own; a BYO binary must be 1.12.3 or newer.
 - **Unknown keys are rejected**, because a mistyped key is otherwise invisible
@@ -597,7 +597,7 @@ $ pgpushy plan --env local
 
   managed schemas (declared): billing, shop
 
-  pgschema 1.12.3 (/home/joe/.cache/pgpushy/pgschema/1.12.3/linux-amd64/pgschema)
+  pgschema 1.13.0 (/home/joe/.cache/pgpushy/pgschema/1.13.0/linux-amd64/pgschema)
   env local: shop_dev on 172.17.0.2:5432 (cluster 7668031834611146801)
 
 ── shop ──
@@ -628,7 +628,7 @@ $ pgpushy apply --env local
 
   managed schemas (declared): billing, shop
 
-  pgschema 1.12.3 (/home/joe/.cache/pgpushy/pgschema/1.12.3/linux-amd64/pgschema)
+  pgschema 1.13.0 (/home/joe/.cache/pgpushy/pgschema/1.13.0/linux-amd64/pgschema)
   env local: shop_dev on 172.17.0.2:5432 (cluster 7668031834611146801)
 
 ── shop ──

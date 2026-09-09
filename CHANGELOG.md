@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The managed backend downloads pgschema 1.13.0** (was 1.12.5), with all
+  four platform hashes computed from the release assets and cross-checked
+  against GitHub's per-asset digests. Re-verified before pinning: the full
+  live integration suite passes against 1.13.0, and the external
+  plan-database accumulation the §10.4 check is calibrated to is unchanged —
+  a cross-schema project still leaves its closure member behind as a real
+  table and the second run against the same plan database is still refused
+  by name, while a single-schema project still re-plans against one
+  indefinitely. 1.13.0 is a fixes-only release, all of it dependency
+  ordering and sequence modelling, and it moves none of the flags, version
+  reporting or plan JSON pgpushy reads. The floor stays at 1.12.3, and the
+  CI matrix now runs the two ends alone — 1.12.3 and 1.13.0 — since a
+  version between them tests nothing the ends do not.
 ## [0.3.2] - 2026-09-06
 
 ### Added
