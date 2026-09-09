@@ -57,11 +57,11 @@ impl Step {
 }
 
 /// Every step type pgpushy's model can produce, measured against pgschema
-/// 1.12.3 (impl-plan §1). A step outside this list is a change to something
-/// the source tree cannot describe, which §8.4 forbids pgpushy to touch —
-/// the enforcement behind the `.pgschemaignore` suppression, and the net
-/// that catches an upstream ignore-section rename loudly instead of letting
-/// it re-arm the drops.
+/// 1.13.0 (2026-09-08, impl-plan §1). A step outside this list is a change
+/// to something the source tree cannot describe, which §8.4 forbids pgpushy
+/// to touch — the enforcement behind the `.pgschemaignore` suppression, and
+/// the net that catches an upstream ignore-section rename loudly instead of
+/// letting it re-arm the drops.
 const MODEL_KINDS: &[&str] = &[
     "table",
     "table.column",
